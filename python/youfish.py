@@ -39,21 +39,11 @@ import urllib.parse
 import urllib.request
 import uuid
 
-YTDLP = "yt-dlp"
-
 _BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
 
-# yt-dlp may live outside the (sandbox-trimmed) PATH, so check common spots too.
-_CANDIDATE_PATHS = (
-    os.path.expanduser("~/.local/bin/yt-dlp"),
-    "/usr/local/bin/yt-dlp",
-    "/usr/bin/yt-dlp",
-    "/usr/share/harbour-youfish/bin/yt-dlp",  # future bundled location
-)
-
-# Flags applied to every network-facing yt-dlp call. -4 forces IPv4: on-device IPv6
-# can stall each TCP connect for ~80s before falling back, so skip it up front.
+# Flags applied to every network-facing yt-dlp call. -4 forces IPv4: dual-stack connects
+# can hang when a network advertises IPv6 routes it can't actually carry.
 # (This is where PO-token / player-client args will accrue in M2.)
 _COMMON_ARGS = ("-4",)
 
@@ -64,7 +54,7 @@ _COMMON_ARGS = ("-4",)
 # (e.g. it's how the 1080p30 pair 137/248 got dropped while only the 1080p60 pair was listed).
 # Selecting by property covers every fps/resolution automatically.
 #
-# Codec rules for this device:
+# Codec rules (target hardware):
 #  - AV1 (av01): excluded everywhere — no AV1 decoder at all.
 #  - H.264 (avc1): software-decodes smoothly → preferred when hw decode is OFF.
 #  - VP9 (vp9/vp09): ~25-30% leaner and hardware-decoded when droidvdec works → preferred when
@@ -178,11 +168,11 @@ _ipv4_forced = False
 def _force_ipv4():
     """Make this process's socket lookups return IPv4 addresses only.
 
-    googlevideo publishes AAAA records, but this device's IPv6 path is a black hole:
-    each connect stalls ~30s before falling back to IPv4. That is longer than
-    souphttpsrc's read timeout, so the pipeline errors out ("Socket I/O timed out")
-    before the proxy — stuck in that same stall — can answer. This is the in-process
-    equivalent of the `-4` flag we already pass yt-dlp. yt-dlp runs in a separate
+    googlevideo publishes AAAA records, but when a network advertises IPv6 it can't route,
+    each connect stalls before falling back to IPv4 — longer than souphttpsrc's read timeout,
+    so the pipeline errors out ("Socket I/O timed out") before the proxy, stuck in the same
+    stall, can answer. This is the in-process equivalent of the `-4` flag passed to yt-dlp.
+    yt-dlp runs in a separate
     process, and QtMultimedia's networking lives in the C++/Qt side, so patching
     getaddrinfo here only affects the proxy's own urllib fetches.
     """
@@ -493,15 +483,13 @@ def _managed_ytdlp():
 
 
 def _ytdlp_path():
+    """The app-managed yt-dlp under our data dir, or None. We deliberately do NOT fall back to a
+    system/PATH yt-dlp: the app can only update and verify a copy it installed itself (the 'Update'
+    button runs `yt-dlp -U` on OUR binary), so a stray unmanaged copy would just create states the
+    app can't control. Missing → the UI prompts a download."""
     managed = _managed_ytdlp()
     if os.path.isfile(managed) and os.access(managed, os.X_OK):
         return managed
-    found = shutil.which(YTDLP)
-    if found:
-        return found
-    for p in _CANDIDATE_PATHS:
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
     return None
 
 
@@ -519,7 +507,7 @@ def ytdlp_version():
 
 
 def ytdlp_update():
-    """Run yt-dlp's own self-updater (-U) and report the result.
+    """Run yt-dlp's own self-updater and report the result, on the settings-chosen channel.
 
     This works for the standalone binary the user installed (it downloads the latest
     release from GitHub and replaces itself in place); a pip/package install refuses
@@ -529,14 +517,16 @@ def ytdlp_update():
     path = _ytdlp_path()
     if not path:
         return {"ok": False, "error": "yt-dlp not found", "version": ""}
+    channel = "nightly" if (get_settings().get("ytdlp_channel") == "nightly") else "stable"
     try:
-        # -U can pull ~30 MB over a phone link, so allow generous time.
-        proc = subprocess.run([path, *_COMMON_ARGS, "-U"],
+        # --update-to <channel>@latest is unambiguous whichever channel the binary is on now;
+        # it can pull ~30 MB over a phone link, so allow generous time.
+        proc = subprocess.run([path, *_COMMON_ARGS, "--update-to", channel + "@latest"],
                               capture_output=True, text=True, timeout=300)
         out = (proc.stdout + proc.stderr).strip()
         return {"ok": proc.returncode == 0,
                 "output": (out[-400:] if out else "yt-dlp reported nothing"),
-                "version": ytdlp_version()}
+                "version": ytdlp_version(), "channel": channel}
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "update timed out", "version": ytdlp_version()}
     except Exception as ex:
@@ -585,7 +575,7 @@ def install_ytdlp():
     def run():
         tmp = None
         try:
-            _force_ipv4()  # skip the ~80s IPv6 connect stall seen on-device
+            _force_ipv4()  # pin IPv4 — avoid a stalled connect on unroutable-IPv6 networks
             ctx = ssl.create_default_context()  # verifies the server certificate
             expected = _expected_sha256(ctx)    # None if the sums file can't be parsed
             dest_dir = os.path.join(_data_dir(), "bin")
@@ -651,12 +641,13 @@ def _managed_ffmpeg():
 
 
 def _ffmpeg_path():
-    """App-managed ffmpeg first (our bin/), then anything on PATH — sandboxing is off, so a
-    Chum/zypper ffmpeg is usable too. None if nothing runnable is found."""
+    """The app-managed ffmpeg under our bin/, or None. No system/PATH fallback (same reasoning as
+    _ytdlp_path — the app manages and updates its own copy; an unmanaged system ffmpeg it can't
+    control would only confuse). None → the UI offers a Download/Update button."""
     managed = _managed_ffmpeg()
     if os.path.isfile(managed) and os.access(managed, os.X_OK):
         return managed
-    return shutil.which("ffmpeg") or None
+    return None
 
 
 def _ffmpeg_dir():
@@ -695,8 +686,8 @@ _FFMPEG_MD5_URL = _FFMPEG_URL + ".md5"
 # tampered archive serves a matching .md5. When THIS pin is set it's the AUTHORITATIVE integrity
 # check on the actual executable we run (a host/supply-chain compromise can't forge it). Empty =
 # fall back to the corruption-only MD5. NOTE: this is the hash of the `ffmpeg` binary itself
-# (sha256sum ~/.local/share/<app>/bin/ffmpeg), so upgrading ffmpeg means re-pinning. Pinned to the
-# known-good build running on the developer's device (2026-08).
+# (sha256sum ~/.local/share/<app>/bin/ffmpeg), so upgrading ffmpeg means re-pinning. Set to a
+# known-good build; a download that doesn't match is treated as a newer build, not rejected.
 _FFMPEG_SHA256 = "6bb182d0d75d23028db82e9e4f723ca69b853d055698486e6984ddb2c06fb8ce"
 
 
@@ -724,7 +715,7 @@ def install_ffmpeg():
     def run():
         tmp = None
         try:
-            _force_ipv4()  # skip the ~80s IPv6 connect stall seen on-device
+            _force_ipv4()  # pin IPv4 — avoid a stalled connect on unroutable-IPv6 networks
             ctx = ssl.create_default_context()
             expected = _expected_ffmpeg_md5(ctx)
             dest_dir = os.path.join(_data_dir(), "bin")
@@ -834,23 +825,39 @@ def update_ffmpeg():
 # the capabilities an npm supply-chain worm would need. See install_pot_provider().
 # --------------------------------------------------------------------------- #
 _POT_REPO = "https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git"
-_POT_TAG = "1.3.2"          # pinned KNOWN-GOOD release (matches the plugin validated on-device).
+_POT_TAG = "1.3.2"          # pinned KNOWN-GOOD release (matches the bundled yt-dlp bgutil plugin).
                             # The EFFECTIVE tag (see _pot_effective_tag) can be updated to the
                             # latest release from inside the app, with no rebuild.
 _POT_PORT = 4416            # bgutil's default HTTP port; the plugin probes 127.0.0.1:4416
 
 _DENO_CANDIDATES = (
     os.path.expanduser("~/.deno/bin/deno"),  # default deno install location
+    os.path.expanduser("~/.local/bin/deno"),  # common user-local spot (a launcher's PATH omits it)
     "/usr/local/bin/deno",
     "/usr/bin/deno",
 )
+
+# Deno ships as a single self-contained binary (aarch64/glibc) from its GitHub releases, so — like
+# yt-dlp — the app can fetch it into its own bin/ instead of needing a manual system install.
+_DENO_ASSET = "deno-aarch64-unknown-linux-gnu.zip"
+_DENO_DOWNLOAD_URL = "https://github.com/denoland/deno/releases/latest/download/" + _DENO_ASSET
+_DENO_SUMS_URL = _DENO_DOWNLOAD_URL + ".sha256sum"
+
+
+def _managed_deno():
+    return os.path.join(_data_dir(), "bin", "deno")
+
 
 _pot_proc = None
 _pot_lock = threading.Lock()
 
 
 def _deno_path():
-    """Deno binary, or None. The app's PATH is trimmed, so check ~/.deno/bin explicitly."""
+    """Deno binary, or None. Prefers the app-managed copy (install_deno) in our own bin/; then a
+    launcher's trimmed PATH; then ~/.deno/bin + ~/.local/bin."""
+    managed = _managed_deno()
+    if os.path.isfile(managed) and os.access(managed, os.X_OK):
+        return managed
     found = shutil.which("deno")
     if found:
         return found
@@ -864,10 +871,107 @@ def _git_path():
     found = shutil.which("git")
     if found:
         return found
-    for p in ("/usr/bin/git", "/usr/local/bin/git"):
+    for p in ("/usr/bin/git", "/usr/local/bin/git", os.path.expanduser("~/.local/bin/git")):
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
     return None
+
+
+def deno_version():
+    """Installed Deno version string, or '' if missing/broken."""
+    path = _deno_path()
+    if not path:
+        return ""
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=15)
+        first = (out.stdout or "").splitlines()[0] if out.stdout else ""
+        m = re.search(r"deno (\S+)", first)
+        return m.group(1) if m else (first[:40] if first else "")
+    except Exception:
+        return ""
+
+
+def install_deno():
+    """Download Deno (the PO-token provider's runtime) into our bin/ — a single self-contained
+    binary, fetched + verified like yt-dlp, so the provider needs no manual runtime install.
+    Background thread; progress + result via pyotherside (deno_install_progress / deno_install_done)."""
+    import pyotherside
+    import zipfile
+
+    def run():
+        tmp = None
+        try:
+            _force_ipv4()
+            ctx = ssl.create_default_context()
+            expected = None
+            try:   # verify against the release's per-asset .sha256sum when present; else HTTPS-only
+                with _https_open(_DENO_SUMS_URL, ctx, timeout=30) as resp:
+                    parts = resp.read().decode("utf-8", "replace").split()
+                    expected = parts[0].strip().lower() if parts else None
+            except Exception:
+                expected = None
+            dest_dir = os.path.join(_data_dir(), "bin")
+            os.makedirs(dest_dir, exist_ok=True)
+            tmp = os.path.join(dest_dir, "deno-dl.zip.part")
+            h = hashlib.sha256()
+            with _https_open(_DENO_DOWNLOAD_URL, ctx) as resp:
+                total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
+                last = -1
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        h.update(chunk)
+                        done += len(chunk)
+                        if total > 0:
+                            pct = done * 100.0 / total
+                            if int(pct) != last:
+                                last = int(pct)
+                                pyotherside.send("deno_install_progress", pct)
+            if expected and h.hexdigest().lower() != expected:
+                os.remove(tmp)
+                pyotherside.send("deno_install_done", False,
+                                 "Checksum mismatch — download discarded, nothing installed", "")
+                return
+            # The archive holds a single `deno` binary; extract just that (by basename) into bin/.
+            dest = _managed_deno()
+            got = False
+            with zipfile.ZipFile(tmp) as zf:
+                for name in zf.namelist():
+                    if os.path.basename(name) == "deno" and not name.endswith("/"):
+                        with zf.open(name) as src, open(dest, "wb") as out:
+                            shutil.copyfileobj(src, out)
+                        os.chmod(dest, 0o755)
+                        got = True
+                        break
+            os.remove(tmp)
+            tmp = None
+            if not got:
+                pyotherside.send("deno_install_done", False,
+                                 "Archive didn't contain a deno binary", "")
+                return
+            ver = deno_version()   # exercises the binary — confirms it actually runs
+            if ver:
+                note = "Installed Deno " + ver
+                if not expected:
+                    note += " (checksum unavailable, not verified)"
+                pyotherside.send("deno_install_done", True, note, ver)
+            else:
+                pyotherside.send("deno_install_done", False,
+                                 "Downloaded, but the binary won't run here", "")
+        except Exception as ex:
+            try:
+                if tmp and os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            pyotherside.send("deno_install_done", False, str(ex), "")
+
+    threading.Thread(target=run, daemon=True).start()
+    return {"ok": True}
 
 
 def _pot_dir():
@@ -911,7 +1015,7 @@ def _canvas_node_path():
 
 
 def _pot_server_flags():
-    """Deno argv for the token server — least privilege, validated on-device.
+    """Deno argv for the token server — least privilege.
 
     Denied outright: write, run (subprocess), and blanket ffi — the powers a compromised
     npm dependency would need to steal files, plant a backdoor, or run native code. Reads
@@ -976,7 +1080,7 @@ def _pot_bind_localhost():
 def _pot_disable_webgpu():
     """Neutralize Deno's WebGPU in the cloned server before BotGuard can touch it.
 
-    Deno exposes navigator.gpu, but on this device's libhybris/Mali GL stack the native
+    Deno exposes navigator.gpu, but on the libhybris/Mali GL stack the native
     GPU.requestAdapter() SEGFAULTS the whole process (YouTube's newer webpage-challenge flow
     fingerprints the GPU; a headless x86 server just gets a null adapter and moves on). We prepend
     a one-liner to src/main.ts that makes requestAdapter() return null — the normal 'no WebGPU'
@@ -1721,6 +1825,9 @@ def _subs_path():
 # --------------------------------------------------------------------------- #
 _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
                       "player_client": "", "po_token": "", "visitor_data": "",
+                      # yt-dlp update channel: "stable" (default) or "nightly" (YouTube fixes
+                      # land days sooner, less tested). Drives ytdlp_update()'s --update-to target.
+                      "ytdlp_channel": "stable",
                       # default_quality caps the auto-selected video height (px); "0" = best
                       # available. 720 is a comfortable software-decode HD default.
                       "default_quality": "720",
@@ -1740,7 +1847,7 @@ _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
                       "keep_display_on": False,
                       # PO-token provider (bgutil): opt-in, user-installed. pot_needs_ffi
                       # stays False unless a build genuinely needs node-canvas's native addon
-                      # (validated on-device that it does not — jsdom degrades gracefully).
+                      # (jsdom degrades gracefully without it).
                       "pot_provider": False, "pot_needs_ffi": False}
 
 # Widened client net, tried in ONE extra yt-dlp pass when the primary (web_embedded) comes
@@ -1835,7 +1942,7 @@ def _is_members_only(e):
     """Best-effort: a members-only ('subscriber_only') or premium video, which can't be played
     without the membership, so we hide it from results. yt-dlp sets `availability` from the
     'Members only' badge on flat search/playlist entries — not always populated in flat mode,
-    hence best-effort (the `filtered_members` count in search() lets us verify on-device)."""
+    hence best-effort (the `filtered_members` count in search() surfaces how many were dropped)."""
     av = (e.get("availability") or "").lower()
     return av in ("subscriber_only", "premium_only", "needs_auth")
 
@@ -2388,7 +2495,7 @@ def download(video_id, title, kind):
         fmt, ext = "140", "m4a"
     elif _ffmpeg_dir():
         # ffmpeg present → merge best separate video+audio. Cap by the Default-quality setting;
-        # exclude AV1 (no decoder on this device). mkv holds any codec combo (VP9/opus or
+        # exclude AV1 (no hardware decoder on the target). mkv holds any codec combo (VP9/opus or
         # H.264/m4a) cleanly, and GStreamer plays it back fine.
         try:
             cap = int(get_settings().get("default_quality") or 0)

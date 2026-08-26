@@ -55,7 +55,7 @@ int main(int argc, char *argv[])
     redirectMediaBufferToFlash();
     gst_init(&argc, &argv);
 
-    // droidvdec (hardware H.264) on this device can't load its codec libs
+    // droidvdec (hardware H.264) can't load its codec libs on this hardware
     // (libandroidicu / apexcodecs) and stalls without ever producing a frame.
     // Demote it so auto-plugging falls back to software avdec_h264 everywhere.
     GstPluginFeature *droidvdec =

@@ -181,6 +181,36 @@ class ResolveSmoke(unittest.TestCase):
         self.assertIn("Sign in", res.get("error", ""))
 
 
+class NoPathFallback(unittest.TestCase):
+    """Managed-only resolution: with no app-managed binary present, _ytdlp_path/_ffmpeg_path return
+    None and NEVER consult PATH — locks in the 'we only run copies we installed' invariant so it
+    can't quietly regress to picking up a system yt-dlp/ffmpeg."""
+    def setUp(self):
+        self._mo, self._mf, self._which = (youfish._managed_ytdlp, youfish._managed_ffmpeg,
+                                           youfish.shutil.which)
+        youfish._managed_ytdlp = lambda: "/nonexistent/yt-dlp"
+        youfish._managed_ffmpeg = lambda: "/nonexistent/ffmpeg"
+        self.which_calls = []
+
+        def _spy(name):
+            self.which_calls.append(name)
+            return "/usr/bin/" + name   # a decoy on PATH that MUST be ignored
+
+        youfish.shutil.which = _spy
+
+    def tearDown(self):
+        youfish._managed_ytdlp, youfish._managed_ffmpeg, youfish.shutil.which = (
+            self._mo, self._mf, self._which)
+
+    def test_ytdlp_managed_only(self):
+        self.assertIsNone(youfish._ytdlp_path())
+        self.assertNotIn("yt-dlp", self.which_calls)   # PATH never consulted
+
+    def test_ffmpeg_managed_only(self):
+        self.assertIsNone(youfish._ffmpeg_path())
+        self.assertNotIn("ffmpeg", self.which_calls)
+
+
 class PotTag(unittest.TestCase):
     """The PO-token provider version is no longer a hardcoded dead-end: a stored override wins,
     else the pinned known-good default. (The GitHub 'latest' lookup needs the network, so it

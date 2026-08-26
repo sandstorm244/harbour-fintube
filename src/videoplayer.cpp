@@ -326,7 +326,7 @@ void VideoPlayer::buildPipeline()
     if (m_hwDecode) {
         // Explicit hardware chain (matches the proven standalone pipeline): uridecodebin stops
         // at the parsed encoded stream, then WE plug droidvdec -> droideglsink. This sidesteps
-        // decodebin's autoplug, which on this device won't reliably pick droidvdec even though
+        // decodebin's autoplug, which won't reliably pick droidvdec even though
         // it outranks the software decoder (257 > 256) and works when instantiated directly.
         {
             QMutexLocker hwLock(&m_hwMutex);        // publish m_hw under the same lock paint() reads
