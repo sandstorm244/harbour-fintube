@@ -43,21 +43,20 @@ FinTune, its sibling YouTube **Music** client, shares this engine
 
 ## Prerequisites (on the device)
 
-**The app installs its third-party helpers for you** — `yt-dlp` and `ffmpeg` on first
-use, and `Deno` on request (for the PO-token provider) — each downloaded into its own
-data dir on your confirmation. No packages to hunt down, no RPM dependencies to satisfy.
+**Nothing to install by hand.** The app fetches every helper below itself — it just
+asks you to confirm each download, then installs it into its own data dir. There are
+no packages to hunt down and no RPM dependencies to satisfy first.
 
-- **`yt-dlp`** *(app-installed)* — *not* bundled or depended-on; the app downloads and
-  updates it into its own data dir — **the only copy it uses.** A system/PATH `yt-dlp`
-  is intentionally ignored (the app can only update/verify one it installed itself).
-  Extraction breaks every few weeks, so keep it current — the app exposes `yt-dlp -U`.
-- **ffmpeg** *(app-installed · optional)* — only for **HD downloads** (merging separate
-  video + audio); one tap in Settings fetches a static build. Playback doesn't need it.
-- **Deno 2.x** *(app-installed · optional)* — required only for the **PO-token provider**,
-  which unlocks **HD playback**. Tap *Download Deno* in Settings (a ~40 MB one-time fetch
-  of Deno's standalone binary into the app's data dir) — or point the app at one you've
-  installed yourself (`pkcon install deno`, Chum, or `~/.local/bin`; all auto-detected).
-  Then *Set up provider* does the rest. Without it, playback is capped at 360p.
+- **`yt-dlp`** — *not* bundled or depended-on; the app checks for it at launch and,
+  on your confirmation, installs/updates it into its own data dir. Extraction breaks
+  every few weeks, so keeping it current matters — the app exposes `yt-dlp -U` (a
+  one-tap update). *(Advanced: it will also reuse the SailfishOS\:Chum package or a
+  `yt-dlp_linux_aarch64` already on PATH, but you don't need either.)*
+- **Deno 2.x** *(optional)* — only for the PO-token provider (Settings → *Set up
+  provider*, one confirm-to-install step). Without a token, some videos return "no
+  playable format".
+- **ffmpeg** *(optional)* — only for downloads; the app fetches a static build on
+  confirmation.
 
 ## Staying current (no app rebuilds)
 
@@ -107,4 +106,8 @@ python3 python/test_youfish.py
 
 ## License
 
-GPLv3.
+GNU Public License Version 3
+
+## Notice
+
+This appplication has been vibecoded, if you dont like that feel free to not install the application.
