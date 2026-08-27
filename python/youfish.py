@@ -851,6 +851,8 @@ def _managed_deno():
 
 _pot_proc = None
 _pot_lock = threading.Lock()
+_pot_last_error = ""     # human-readable reason the sidecar last failed to start/answer (diagnostics)
+_pot_log_rotated = False  # server.log is rotated once per app launch (see _pot_rotate_log)
 
 
 def _deno_path():
@@ -1132,6 +1134,39 @@ def _pot_ready_on_port(timeout=0.25):
         return False
 
 
+def _pot_http_ping(timeout=1.5):
+    """Confirm the token server is actually ANSWERING HTTP, not just holding the port open — a
+    wedged Deno process can keep the socket bound while replying to nothing, which a bare TCP
+    connect (_pot_ready_on_port) can't tell apart from healthy. Hits the bgutil server's /ping
+    route; any HTTP reply (even an error status) means it's alive and processing. Returns
+    {ok, version} — version comes from /ping's JSON when present, else ''."""
+    try:
+        req = urllib.request.Request("http://127.0.0.1:%d/ping" % _POT_PORT,
+                                     headers={"User-Agent": "youfish"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(8192)
+        try:
+            ver = str(json.loads(body.decode("utf-8", "replace")).get("version") or "")
+        except Exception:
+            ver = ""
+        return {"ok": True, "version": ver}
+    except urllib.error.HTTPError:
+        return {"ok": True, "version": ""}   # server answered with an HTTP error → it IS alive
+    except Exception:
+        return {"ok": False, "version": ""}
+
+
+def _pot_server_log_tail(n=30):
+    """Last n non-empty lines of the provider server's log (potprovider/server.log), or '' if
+    there's none. This is where a Deno crash / NotCapable / OOM prints its reason."""
+    try:
+        with open(os.path.join(_pot_dir(), "server.log"), "r", errors="replace") as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        return "\n".join(lines[-max(1, int(n)):])
+    except Exception:
+        return ""
+
+
 def _set_pdeathsig():
     """Ask the kernel to SIGKILL the Deno child if FinTube dies, so the sidecar can never be
     left orphaned (Linux PR_SET_PDEATHSIG = 1). Best-effort; runs in the forked child."""
@@ -1150,13 +1185,21 @@ def _ensure_pot_server():
         return False
     if _pot_ready_on_port():
         return True
+    global _pot_proc, _pot_last_error
     with _pot_lock:
         if _pot_ready_on_port():
             return True
         if not _deno_path():
+            _pot_last_error = "Deno runtime not found — install it from Providers → Download Deno."
             return False
-        global _pot_proc
         if not (_pot_proc and _pot_proc.poll() is None):
+            if _pot_proc is not None:   # a tracked child died — record its exit code so the log tail
+                try:                    # (and diagnostics) show WHY, e.g. -11 SIGSEGV / -9 SIGKILL(OOM)
+                    with open(os.path.join(_pot_dir(), "server.log"), "a") as _lf:
+                        _lf.write("[youfish] previous provider server exited (code %s)\n"
+                                  % _pot_proc.poll())
+                except Exception:
+                    pass
             _pot_bind_localhost()   # ensure a fresh spawn binds 127.0.0.1, not all interfaces
             _pot_disable_webgpu()   # stub WebGPU — its native requestAdapter segfaults on Mali/libhybris
             env = dict(os.environ)
@@ -1170,7 +1213,8 @@ def _ensure_pot_server():
                     _pot_server_flags(), cwd=_pot_server_dir(), env=env,
                     stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
                     preexec_fn=_set_pdeathsig)
-            except Exception:
+            except Exception as ex:
+                _pot_last_error = "Couldn't launch the Deno server: " + str(ex)
                 return False
             atexit.register(stop_pot_server)
         # The server LISTENS quickly; the BotGuard VM warms on the first token request,
@@ -1178,11 +1222,33 @@ def _ensure_pot_server():
         deadline = time.time() + 25
         while time.time() < deadline:
             if _pot_ready_on_port():
+                _pot_last_error = ""
                 return True
             if _pot_proc.poll() is not None:
+                _pot_last_error = ("Provider server exited (code %s) just after starting — see the "
+                                   "server log in the diagnostics below." % _pot_proc.poll())
                 return False   # died during startup — see potprovider/server.log
             time.sleep(0.3)
+        _pot_last_error = "Provider server didn't open port %d within 25s." % _POT_PORT
         return _pot_ready_on_port()
+
+
+def _pot_rotate_log():
+    """Start each app launch with a fresh server.log so it doesn't accumulate stale 'Started POT
+    server' lines across runs (the log is otherwise append-only and never trimmed). Keeps exactly
+    ONE previous log as server.log.prev, so the last session is still inspectable. Idempotent per
+    process (guarded) and best-effort. os.replace is atomic; any process still holding the old fd
+    keeps writing to the renamed inode, so this is safe even if a server were mid-write."""
+    global _pot_log_rotated
+    if _pot_log_rotated:
+        return
+    _pot_log_rotated = True
+    try:
+        log = os.path.join(_pot_dir(), "server.log")
+        if os.path.isfile(log):
+            os.replace(log, log + ".prev")   # overwrites an older .prev
+    except Exception:
+        pass
 
 
 def prewarm():
@@ -1190,6 +1256,7 @@ def prewarm():
     the ~2s Deno startup on its critical path. No-op unless the provider is installed + enabled.
     Runs on its OWN daemon thread so the PyOtherSide worker (and the UI behind it) never blocks on
     the port wait — fire-and-forget from QML at startup."""
+    _pot_rotate_log()   # fresh server.log per launch (keeps the previous one as server.log.prev)
     if not _pot_active():
         return
     def _bg():
@@ -1218,15 +1285,107 @@ def stop_pot_server():
 
 
 def pot_status():
-    """Provider state for the Settings UI."""
+    """Provider state for the Providers UI. `running` = the port is open; `responding` = the
+    server actually answers HTTP (the real 'it's working' signal — a wedged process can hold the
+    port without replying). `last_error` carries the reason it isn't working, when there is one."""
+    deno = _deno_path()
+    running = _pot_ready_on_port()
+    ping = _pot_http_ping() if running else {"ok": False, "version": ""}
     return {
         "installed": _pot_installed(),
         "enabled": bool(get_settings().get("pot_provider", False)),
-        "deno": bool(_deno_path()),
-        "running": _pot_ready_on_port(),
+        "deno": bool(deno),
+        "deno_path": deno or "",
+        "running": running,
+        "responding": bool(ping["ok"]),
+        "server_version": ping["version"],
         "tag": _pot_effective_tag(),
         "default_tag": _POT_TAG,
         "updated": bool((get_settings().get("pot_tag") or "").strip()),
+        "last_error": _pot_last_error,
+    }
+
+
+def pot_diagnostics():
+    """A copy-pasteable health report for the PO-token provider and everything it depends on —
+    for the Providers 'Run diagnostics' action, so a stuck user (or someone helping them) can see
+    at a glance which piece is missing. Reports the resolved binaries + versions, the provider's
+    install/enable state, whether the Deno server is alive and answering, and the tail of its log.
+    Returns {report: <multiline text>, ...structured flags}."""
+    installed = _pot_installed()
+    enabled = bool(get_settings().get("pot_provider", False))
+    # Snapshot the tracked child BEFORE any restart below, so a prior crash's exit code isn't masked
+    # by a fresh spawn. poll() is None while alive, an int once exited (0 clean; negative = signal).
+    prev = _pot_proc
+    prev_code = prev.poll() if prev is not None else None
+    # Actively TRY to (re)start when enabled + installed but nothing is listening — so "Run diagnostics"
+    # reflects a real start ATTEMPT (and populates _pot_last_error when the server can't come up at all),
+    # instead of a passive snapshot that can't tell "won't start" from "not tried".
+    restart_tried = False
+    restart_ok = None
+    if enabled and installed and not _pot_ready_on_port():
+        restart_tried = True
+        restart_ok = _ensure_pot_server()
+
+    deno = _deno_path()
+    git = _git_path()
+    ytdlp = _ytdlp_path()
+    ffmpeg = _ffmpeg_path()
+    running = _pot_ready_on_port()
+    ping = _pot_http_ping() if running else {"ok": False, "version": ""}
+
+    L = []
+    L.append("FinTube / FinTune — PO-token provider diagnostics")
+    L.append("app data dir: " + _data_dir())
+    L.append("")
+    L.append("Deno   : " + ((deno + "  (v" + (deno_version() or "?") + ")") if deno else "NOT FOUND"))
+    L.append("git    : " + (git or "NOT FOUND"))
+    L.append("yt-dlp : " + ((ytdlp + "  (" + (ytdlp_version() or "?") + ")") if ytdlp else "NOT FOUND"))
+    L.append("ffmpeg : " + ((ffmpeg + "  (" + (ffmpeg_version() or "?") + ")") if ffmpeg
+                            else "not installed (HD merge unavailable)"))
+    L.append("")
+    L.append("provider installed : " + (("yes (" + _pot_effective_tag() + ")") if installed else "no"))
+    L.append("provider enabled   : " + ("yes" if enabled else "no"))
+    # Distinguish a server that STARTED-THEN-DIED (with its exit code) from one never started this
+    # session — the key clue, since the sidecar can open its port fine and only crash later on the
+    # first token mint (BotGuard warmup), which leaves the status "on" but nothing listening.
+    if prev is not None and prev_code is None:
+        L.append("server process     : alive (started by this app)")
+    elif prev is not None:
+        L.append("server process     : STARTED, then EXITED (code %s) — it opened its port, then the "
+                 "process ended (negative = fatal signal: -11 SIGSEGV, -9 SIGKILL/OOM); see the log "
+                 "below" % prev_code)
+    else:
+        L.append("server process     : not started in this app session")
+    if restart_tried:
+        L.append("restart attempt    : " + ("server came up" if restart_ok
+                                             else "FAILED — " + (_pot_last_error or "unknown reason")))
+    L.append("port %d listening  : %s" % (_POT_PORT, "yes" if running else "no"))
+    L.append("answering HTTP     : " + ("yes" + (" (server v" + ping["version"] + ")"
+                                                 if ping["version"] else "")
+                                        if ping["ok"] else "no"))
+    verdict = ("working" if (enabled and ping["ok"])
+               else "NOT working" if enabled else "installed but switched off" if installed
+               else "not set up")
+    L.append("verdict            : " + verdict)
+    if _pot_last_error:
+        L.append("last error         : " + _pot_last_error)
+    L.append("")
+    L.append("note: /ping only proves the HTTP server answers; the real proof is a token mint — look "
+             "for 'Generating POT' / 'poToken:' in the log below, which means it's genuinely working.")
+    tail = _pot_server_log_tail(30)
+    if tail:
+        L.append("")
+        L.append("--- server.log (last lines) ---")
+        L.append(tail)
+
+    return {
+        "report": "\n".join(L),
+        "deno": bool(deno), "git": bool(git), "ytdlp": bool(ytdlp), "ffmpeg": bool(ffmpeg),
+        "installed": installed, "enabled": enabled,
+        "running": running, "responding": bool(ping["ok"]),
+        "prev_exit": prev_code,
+        "last_error": _pot_last_error,
     }
 
 
@@ -1274,15 +1433,18 @@ def install_pot_provider(tag=None):
     import pyotherside
 
     def run():
+        global _pot_last_error
         the_tag = tag or _pot_effective_tag()
         try:
             deno = _deno_path()
             if not deno:
+                _pot_last_error = "Deno runtime not found — install it from Providers → Download Deno."
                 pyotherside.send("pot_install_done", False,
-                                 "Deno runtime not found. Install deno 2.x, then retry.")
+                                 "Deno runtime not found. Tap Download Deno, then retry.")
                 return
             git = _git_path()
             if not git:
+                _pot_last_error = "git not found on device (needed to clone the provider)."
                 pyotherside.send("pot_install_done", False, "git not found on device.")
                 return
             os.makedirs(_pot_dir(), exist_ok=True)
@@ -1295,6 +1457,7 @@ def install_pot_provider(tag=None):
                  _POT_REPO, repo],
                 capture_output=True, text=True, timeout=240)
             if cp.returncode != 0:
+                _pot_last_error = "Clone failed: " + (cp.stderr.strip()[-200:] or "git error")
                 pyotherside.send("pot_install_done", False,
                                  "Clone failed: " + (cp.stderr.strip()[-200:] or "git error"))
                 return
@@ -1309,6 +1472,7 @@ def install_pot_provider(tag=None):
             if dp.returncode != 0 and "--frozen" in cmd:   # lock mismatch? retry unlocked
                 dp = subprocess.run(base, cwd=server, capture_output=True, text=True, timeout=900)
             if dp.returncode != 0:
+                _pot_last_error = "Dependency install failed: " + (dp.stderr.strip()[-200:] or "deno error")
                 pyotherside.send("pot_install_done", False,
                                  "Dependency install failed: " + (dp.stderr.strip()[-200:] or "deno error"))
                 return
@@ -1866,6 +2030,10 @@ _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
                       # (off by default — costs battery). Also sidesteps the display-off/on GL
                       # corruption during playback since the screen never blanks.
                       "keep_display_on": False,
+                      # download_dir: where completed downloads are written. "" = the app's own
+                      # downloads folder (default); a picked folder (e.g. ~/Videos, an SD card)
+                      # overrides it, validated writable before use (see _downloads_dir).
+                      "download_dir": "",
                       # PO-token provider (bgutil): opt-in, user-installed. pot_needs_ffi
                       # stays False unless a build genuinely needs node-canvas's native addon
                       # (jsdom degrades gracefully without it).
@@ -2457,12 +2625,55 @@ def comments(video_id, limit=50):
 # pyotherside.send events. Metadata is tracked in downloads.json.
 # --------------------------------------------------------------------------- #
 def _downloads_dir():
+    """Where completed downloads are written. Defaults to a 'downloads' folder in the app's data
+    dir; a user-set download_dir (Settings) overrides it when that folder exists and is writable —
+    so media can land in ~/Videos, ~/Music, an SD card, etc. Falls back to the default if the chosen
+    folder can't be created/written (e.g. an unmounted card), so a download never goes nowhere."""
+    custom = (get_settings().get("download_dir") or "").strip()
+    if custom:
+        p = os.path.expanduser(custom)
+        try:
+            os.makedirs(p, exist_ok=True)
+            if os.access(p, os.W_OK):
+                return p
+        except Exception:
+            pass
     d = os.path.join(_data_dir(), "downloads")
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
         pass
     return d
+
+
+def download_location():
+    """Where downloads go, for the Settings UI: the configured value ('' = app default), the
+    effective absolute dir actually in use, and whether a custom dir is set."""
+    configured = (get_settings().get("download_dir") or "").strip()
+    return {"configured": configured, "effective": _downloads_dir(),
+            "custom": bool(configured)}
+
+
+def set_download_dir(path):
+    """Choose the download folder (Settings → folder picker). '' resets to the app's own folder.
+    Validates that the folder can be created + written and REFUSES (keeps the previous value) if
+    not, so a bad pick can't silently send downloads nowhere. Accepts a plain path or a file:// URL.
+    Returns download_location() plus {ok, error?}."""
+    p = (path or "").strip()
+    if p.startswith("file://"):
+        p = p[len("file://"):]
+    p = os.path.expanduser(p)
+    if not p:
+        set_setting("download_dir", "")
+        return dict(download_location(), ok=True)
+    try:
+        os.makedirs(p, exist_ok=True)
+        if not os.access(p, os.W_OK):
+            return dict(download_location(), ok=False, error="That folder isn't writable.")
+    except Exception as ex:
+        return dict(download_location(), ok=False, error=str(ex))
+    set_setting("download_dir", p)
+    return dict(download_location(), ok=True)
 
 
 def _downloads_path():

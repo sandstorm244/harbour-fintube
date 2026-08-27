@@ -47,6 +47,15 @@ Item {
     property bool potInstalling: false   // clone + deno install in progress
     property string potStatusMsg: ""     // latest setup progress / result line
     property string potTag: ""           // pinned provider version
+    property bool potResponding: false   // server actually ANSWERS HTTP → "working" (vs just port-open)
+    property string potServerVersion: "" // version the running provider reports (from its /ping)
+    property string potLastError: ""     // why the provider last failed to start / respond (diagnostics)
+    property string potDenoPath: ""      // where Deno was found ("" = not found)
+
+    // Download folder — where completed downloads are written. downloadDir is the configured value
+    // ("" = the app's own folder); downloadDirEffective is the absolute path actually in use.
+    property string downloadDir: ""
+    property string downloadDirEffective: ""
 
     signal resolved(var info)
     signal resolveError(string message)
@@ -277,6 +286,24 @@ Item {
             if (res && res.downloads) backend.downloads = res.downloads
         })
     }
+    // Where downloads are written: load the current folder, or set/reset it (folder picker in
+    // Settings). setDownloadDir validates writability in Python and reports {ok, error?}.
+    function loadDownloadLocation() {
+        py.call("youfish.download_location", [], function(r) {
+            if (!r) return
+            backend.downloadDir = r.configured || ""
+            backend.downloadDirEffective = r.effective || ""
+        })
+    }
+    function setDownloadDir(path, callback) {
+        py.call("youfish.set_download_dir", [path || ""], function(r) {
+            if (r) {
+                backend.downloadDir = r.configured || ""
+                backend.downloadDirEffective = r.effective || ""
+            }
+            if (callback) callback(r || {})
+        })
+    }
 
     // --- Playlists (local library + saved YouTube playlists) ---
     function loadPlaylists() {
@@ -393,8 +420,21 @@ Item {
             backend.potInstalled = !!s.installed
             backend.potEnabled = !!s.enabled
             backend.potDeno = !!s.deno
+            backend.potDenoPath = s.deno_path || ""
             backend.potRunning = !!s.running
+            backend.potResponding = !!s.responding
+            backend.potServerVersion = s.server_version || ""
+            backend.potLastError = s.last_error || ""
             backend.potTag = s.tag || ""
+        })
+    }
+    // Full copy-pasteable health report for the provider + its deps → caller callback. The report
+    // action actively (re)starts the server, so refresh the status props afterward — otherwise the
+    // top status line stays stale ("server not started") while the report already says "working".
+    function potDiagnostics(callback) {
+        py.call("youfish.pot_diagnostics", [], function(res) {
+            backend.loadPotStatus()
+            if (callback) callback(res || {})
         })
     }
     function installPotProvider() {
@@ -417,6 +457,8 @@ Item {
             backend.potInstalled = !!s.installed
             backend.potEnabled = !!s.enabled
             backend.potRunning = !!s.running
+            backend.potResponding = !!s.responding
+            backend.potLastError = s.last_error || ""
         })
     }
     // Best-effort clean shutdown of the sidecar on app exit (a kernel PDEATHSIG backstops it).
@@ -435,6 +477,7 @@ Item {
                 backend.loadSubscriptions()
                 backend.loadSettings()
                 backend.loadDownloads()
+                backend.loadDownloadLocation()
                 backend.loadPlaylists()
                 backend.loadWatchState()
                 backend.loadPotStatus()

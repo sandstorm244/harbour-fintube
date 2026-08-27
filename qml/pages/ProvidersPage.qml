@@ -8,11 +8,38 @@ Page {
     id: page
     allowedOrientations: Orientation.All
 
+    // Re-read provider status each time the page is shown. prewarm() brings the server up on a
+    // background thread ~after launch, so the value cached at startup can be stale ("server not
+    // started") by the time you open this page; refreshing here keeps the status line honest.
+    onStatusChanged: if (status === PageStatus.Active) app.backend.loadPotStatus()
+
     property string ytdlpStatus: ""
 
     Connections {
         target: app.backend
         onUpdateFinished: page.ytdlpStatus = message
+    }
+
+    // PO-provider status line — kept as functions so the many states stay readable. Both read the
+    // backend properties directly, so QML re-binds them whenever the status refreshes.
+    function potStateText() {
+        var b = app.backend
+        if (b.potInstalling) return b.potStatusMsg || "Setting up…"
+        if (!b.potDeno) return "Deno runtime not found. Tap Download Deno below."
+        if (!b.potInstalled) return "Not installed."
+        if (!b.potEnabled) return "Installed · off"
+        if (b.potResponding)
+            return "Installed · working" + (b.potServerVersion ? " (v" + b.potServerVersion + ")" : "")
+        if (b.potRunning) return "Installed · on — server not answering yet"
+        return "Installed · on — server not started"
+    }
+    function potStateColor() {
+        var b = app.backend
+        if (b.potInstalling) return Theme.secondaryColor
+        if (!b.potDeno) return Theme.errorColor
+        if (b.potEnabled && b.potResponding) return Theme.secondaryHighlightColor
+        if (b.potEnabled && !b.potResponding) return Theme.errorColor
+        return Theme.secondaryColor
     }
 
     SilicaFlickable {
@@ -192,22 +219,28 @@ Page {
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
 
+            // Status line. "running" means the port is open; "working" is the stronger signal that
+            // the server actually answered an HTTP probe — that's the state that unlocks full quality.
             Label {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
-                text: app.backend.potInstalling
-                      ? (app.backend.potStatusMsg || "Setting up…")
-                      : (!app.backend.potDeno
-                         ? "Deno runtime not found. Tap Download Deno below, or install it yourself."
-                         : (app.backend.potInstalled
-                            ? ("Installed" + (app.backend.potEnabled
-                                 ? (app.backend.potRunning ? " · running" : " · on") : " · off"))
-                            : "Not installed."))
-                color: app.backend.potInstalled && app.backend.potEnabled
-                       ? Theme.secondaryHighlightColor
-                       : (!app.backend.potDeno ? Theme.errorColor : Theme.secondaryColor)
+                text: page.potStateText()
+                color: page.potStateColor()
                 font.pixelSize: Theme.fontSizeSmall
+            }
+
+            // The reason it isn't working, when the app knows one (Deno missing, server crashed,
+            // clone/deps failed…). Hidden when the provider is healthy.
+            Label {
+                visible: app.backend.potLastError.length > 0 && !app.backend.potInstalling
+                         && !(app.backend.potEnabled && app.backend.potResponding)
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                text: app.backend.potLastError
+                color: Theme.errorColor
+                font.pixelSize: Theme.fontSizeExtraSmall
             }
 
             Label {
@@ -240,6 +273,19 @@ Page {
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
 
+            // Confirm WHICH Deno is in use — the launcher trims PATH, so this reassures the user
+            // that their ~/.local/bin (or the app-managed) Deno was actually found.
+            Label {
+                visible: app.backend.potDeno && app.backend.potDenoPath.length > 0
+                         && !app.backend.denoInstalling
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                text: "Deno found: " + app.backend.potDenoPath
+                color: Theme.secondaryColor
+                font.pixelSize: Theme.fontSizeExtraSmall
+            }
+
             TextSwitch {
                 visible: app.backend.potInstalled
                 text: "Use PO token provider"
@@ -264,6 +310,48 @@ Page {
                 text: "Update to latest"
                 enabled: !app.backend.potInstalling && app.backend.potDeno
                 onClicked: app.backend.updatePotProvider()
+            }
+
+            SectionHeader { text: "Diagnostics" }
+
+            Label {
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                text: "A full report of what the app can see: which binaries were found, whether the "
+                      + "token server is alive and answering, and the tail of its log. Copy it if you "
+                      + "need help getting the provider working."
+                color: Theme.secondaryColor
+                font.pixelSize: Theme.fontSizeExtraSmall
+            }
+
+            Button {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "Run diagnostics"
+                onClicked: {
+                    diagArea.text = "Running…"
+                    app.backend.potDiagnostics(function(res) {
+                        diagArea.text = (res && res.report) ? res.report : "No report."
+                    })
+                }
+            }
+
+            TextArea {
+                id: diagArea
+                visible: text.length > 0
+                width: parent.width
+                readOnly: true
+                label: "Provider report"
+                font.pixelSize: Theme.fontSizeExtraSmall
+                font.family: "monospace"
+                text: ""
+            }
+
+            Button {
+                visible: diagArea.text.length > 0 && diagArea.text !== "Running…"
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "Copy report"
+                onClicked: Clipboard.text = diagArea.text
             }
         }
     }
