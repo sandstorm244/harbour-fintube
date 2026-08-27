@@ -487,6 +487,7 @@ def _ytdlp_path():
     system/PATH yt-dlp: the app can only update and verify a copy it installed itself (the 'Update'
     button runs `yt-dlp -U` on OUR binary), so a stray unmanaged copy would just create states the
     app can't control. Missing → the UI prompts a download."""
+    _ensure_deno_on_path()  # yt-dlp's bundled EJS challenge-solver needs Deno reachable on PATH
     managed = _managed_ytdlp()
     if os.path.isfile(managed) and os.access(managed, os.X_OK):
         return managed
@@ -865,6 +866,26 @@ def _deno_path():
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
     return None
+
+
+_deno_ejs_logged = False
+
+
+def _ensure_deno_on_path():
+    """Put the JS runtime on PATH for yt-dlp's child processes. yt-dlp solves YouTube's signature /
+    `n` challenges by running its bundled yt-dlp-ejs scripts through a JS runtime (Deno); a launcher's
+    trimmed PATH hides our managed/user Deno, so prepend its folder. Idempotent; a no-op when there's
+    no Deno (yt-dlp still falls back to its built-in Python interpreter while that path survives)."""
+    global _deno_ejs_logged
+    deno = _deno_path()
+    if not deno:
+        return
+    d = os.path.dirname(deno)
+    if d and d not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+    if _DEBUG and not _deno_ejs_logged:   # confirm the EJS runtime wiring once (YOUFISH_DEBUG)
+        _deno_ejs_logged = True
+        print("[youfish] EJS: yt-dlp will use Deno at " + deno)
 
 
 def _git_path():

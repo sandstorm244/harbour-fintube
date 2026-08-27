@@ -45,6 +45,7 @@ DISTFILES += \
     qml/pages/ChannelPage.qml \
     qml/pages/SettingsPage.qml \
     qml/pages/DownloadsPage.qml \
+    qml/pages/MorePage.qml \
     qml/pages/LocalPlayerPage.qml \
     qml/pages/PlaylistsPage.qml \
     qml/pages/PlaylistPage.qml \

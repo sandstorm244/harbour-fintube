@@ -61,6 +61,25 @@ Page {
 
     Component.onCompleted: loadFeed(false)
 
+    // Attach the "More" launcher as a forward (right-to-left swipe) sibling of Home, so the
+    // secondary destinations no longer crowd the pull-down. The back swipe returns here.
+    property bool _moreAttached: false
+    onStatusChanged: {
+        if (status === PageStatus.Active && !_moreAttached) {
+            _moreAttached = true
+            pageStack.pushAttached(Qt.resolvedUrl("MorePage.qml"), {
+                heading: "More",
+                entries: [
+                    { title: "Downloads", desc: "Saved videos for offline", page: "DownloadsPage.qml" },
+                    { title: "Playlists", desc: "Your local playlists", page: "PlaylistsPage.qml" },
+                    { title: "History", desc: "Recently watched", page: "HistoryPage.qml" },
+                    { title: "Channels", desc: "Manage subscriptions", page: "SubscriptionsPage.qml" },
+                    { title: "Settings", desc: "yt-dlp, provider, audio, account", page: "SettingsPage.qml" }
+                ]
+            })
+        }
+    }
+
     // Rebuild when the subscription set actually changes (subscribe/unsubscribe, or the
     // list finishing its initial load), not on every return to the page.
     Connections {
@@ -88,26 +107,6 @@ Page {
                     app.backend.installYtdlp()
                     pageStack.push(Qt.resolvedUrl("SettingsPage.qml"))
                 }
-            }
-            MenuItem {
-                text: "Settings"
-                onClicked: pageStack.push(Qt.resolvedUrl("SettingsPage.qml"))
-            }
-            MenuItem {
-                text: "Channels"
-                onClicked: pageStack.push(Qt.resolvedUrl("SubscriptionsPage.qml"))
-            }
-            MenuItem {
-                text: "Downloads"
-                onClicked: pageStack.push(Qt.resolvedUrl("DownloadsPage.qml"))
-            }
-            MenuItem {
-                text: "History"
-                onClicked: pageStack.push(Qt.resolvedUrl("HistoryPage.qml"))
-            }
-            MenuItem {
-                text: "Playlists"
-                onClicked: pageStack.push(Qt.resolvedUrl("PlaylistsPage.qml"))
             }
             MenuItem {
                 text: "Search"
