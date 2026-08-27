@@ -74,7 +74,8 @@ Page {
                     { title: "Playlists", desc: "Your local playlists", page: "PlaylistsPage.qml" },
                     { title: "History", desc: "Recently watched", page: "HistoryPage.qml" },
                     { title: "Channels", desc: "Manage subscriptions", page: "SubscriptionsPage.qml" },
-                    { title: "Settings", desc: "yt-dlp, provider, audio, account", page: "SettingsPage.qml" }
+                    { title: "Settings", desc: "Playback + content", page: "SettingsPage.qml" },
+                    { title: "Providers", desc: "yt-dlp, ffmpeg, PO-token provider", page: "ProvidersPage.qml" }
                 ]
             })
         }

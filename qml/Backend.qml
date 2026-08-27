@@ -27,8 +27,6 @@ Item {
     property bool sponsorBlock: true     // auto-skip SponsorBlock segments during playback
     property string playerClient: ""     // yt-dlp youtube player_client ("" = auto)
     property string ytdlpChannel: "stable" // yt-dlp update channel: "stable" | "nightly"
-    property string poToken: ""          // manual PO token (advanced)
-    property string visitorData: ""      // manual visitor_data (advanced)
     property string defaultQuality: "720" // baseline video height cap ("1080"/"720"/…/"0"=best)
     property bool hwDecode: false        // hardware video decode (droidvdec); experimental
     property bool keepDisplayOn: false   // hold the display awake while a video plays
@@ -101,8 +99,6 @@ Item {
             backend.sponsorBlock = !!s.sponsorblock
             backend.playerClient = s.player_client || ""
             backend.ytdlpChannel = s.ytdlp_channel || "stable"
-            backend.poToken = s.po_token || ""
-            backend.visitorData = s.visitor_data || ""
             backend.defaultQuality = s.default_quality || "720"
             backend.hwDecode = !!s.hw_decode
             backend.keepDisplayOn = !!s.keep_display_on
@@ -164,15 +160,12 @@ Item {
         })
     }
 
-    // Generic string setting (player_client / po_token / visitor_data). Mirrors the
-    // saved value back onto the matching property.
+    // Generic string setting (player_client). Mirrors the saved value back onto the property.
     function setSetting(key, value) {
         py.call("youfish.set_setting", [key, value], function(s) {
             if (!s) return
             backend.playerClient = s.player_client || ""
             backend.ytdlpChannel = s.ytdlp_channel || "stable"
-            backend.poToken = s.po_token || ""
-            backend.visitorData = s.visitor_data || ""
         })
     }
 

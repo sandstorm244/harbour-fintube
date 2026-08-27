@@ -1845,7 +1845,7 @@ def _subs_path():
 # Settings (a small JSON file the app owns) + Shorts filtering.
 # --------------------------------------------------------------------------- #
 _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
-                      "player_client": "", "po_token": "", "visitor_data": "",
+                      "player_client": "",
                       # yt-dlp update channel: "stable" (default) or "nightly" (YouTube fixes
                       # land days sooner, less tested). Drives ytdlp_update()'s --update-to target.
                       "ytdlp_channel": "stable",
@@ -1905,7 +1905,7 @@ def set_setting(key, value):
         path = _settings_path()
         with open(path, "w") as f:
             json.dump(s, f)
-        os.chmod(path, 0o600)     # holds po_token / visitor_data — owner-only
+        os.chmod(path, 0o600)     # owner-only (privacy)
     except Exception:
         pass
     return get_settings()
@@ -1928,21 +1928,13 @@ def _default_client():
 def _yt_extractor_args(client_override=None):
     """`--extractor-args` for yt-dlp built from settings (or []).
 
-    player_client picks a YouTube client; po_token + visitor_data are the manual escape
-    hatch (superseded by the provider). client_override lets resolve() widen the client set
+    player_client picks a YouTube client. client_override lets resolve() widen the client set
     on a retry without touching the saved preference.
     """
-    s = get_settings()
     parts = []
     client = client_override if client_override is not None else _default_client()
     if client and client.lower() != "auto":
         parts.append("player_client=" + client)
-    pot = (s.get("po_token") or "").strip()
-    if pot:
-        parts.append("po_token=" + pot)
-    vd = (s.get("visitor_data") or "").strip()
-    if vd:
-        parts.append("visitor_data=" + vd)
     return ["--extractor-args", "youtube:" + ";".join(parts)] if parts else []
 
 
