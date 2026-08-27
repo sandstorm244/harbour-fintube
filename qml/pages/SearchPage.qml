@@ -106,9 +106,35 @@ Page {
         }
     }
 
+    // Search controls live OUTSIDE the ListView. As a list header the SearchField lost active focus
+    // every time results arrived (the view re-lays-out its header), which dropped the keyboard;
+    // keeping it out lets it hold focus and auto-raise the keyboard on open (matches FinTune).
+    Column {
+        id: topArea
+        anchors { top: parent.top; left: parent.left; right: parent.right }
+        z: 2
+
+        PageHeader { title: "Search" }
+
+        SearchField {
+            id: searchField
+            width: parent.width
+            placeholderText: page.searchKind === "channel" ? "Search channels" : "Search YouTube"
+            EnterKey.iconSource: "image://theme/icon-m-enter-accept"
+            EnterKey.onClicked: page.runSearch(text)
+            onTextChanged: {
+                page.queryText = text
+                if (text.length === 0) { page.suggestions = []; suggestTimer.stop() }
+                else suggestTimer.restart()
+            }
+            Component.onCompleted: forceActiveFocus()   // raise the keyboard when the page opens
+        }
+    }
+
     SilicaListView {
         id: listView
-        anchors.fill: parent
+        anchors { top: topArea.bottom; bottom: parent.bottom
+                  left: parent.left; right: parent.right }
         model: resultsModel
 
         // Page in more results when scrolled to the end (mirrors ChannelPage).
@@ -131,21 +157,6 @@ Page {
 
         header: Column {
             width: listView.width
-
-            PageHeader { title: "Search" }
-
-            SearchField {
-                id: searchField
-                width: parent.width
-                placeholderText: page.searchKind === "channel" ? "Search channels" : "Search YouTube"
-                EnterKey.iconSource: "image://theme/icon-m-enter-accept"
-                EnterKey.onClicked: page.runSearch(text)
-                onTextChanged: {
-                    page.queryText = text
-                    if (text.length === 0) { page.suggestions = []; suggestTimer.stop() }
-                    else suggestTimer.restart()
-                }
-            }
 
             // Autocomplete suggestions (tap to search that term).
             Column {

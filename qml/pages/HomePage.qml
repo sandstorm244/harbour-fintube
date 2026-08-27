@@ -75,7 +75,9 @@ Page {
                     { title: "History", desc: "Recently watched", page: "HistoryPage.qml" },
                     { title: "Channels", desc: "Manage subscriptions", page: "SubscriptionsPage.qml" },
                     { title: "Settings", desc: "Playback + content", page: "SettingsPage.qml" },
-                    { title: "Providers", desc: "yt-dlp, ffmpeg, PO-token provider", page: "ProvidersPage.qml" }
+                    { title: "Providers", desc: "yt-dlp, ffmpeg, PO-token provider", page: "ProvidersPage.qml" },
+                    { title: "Import subscriptions", desc: "From a NewPipe / PipePipe backup",
+                      action: "import-newpipe" }
                 ]
             })
         }

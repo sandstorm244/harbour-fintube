@@ -2356,6 +2356,91 @@ def toggle_subscription(channel_id, name="", url="", thumbnail=""):
     return {"ok": True, "subscribed": subscribed, "subscriptions": subs}
 
 
+def import_newpipe(path):
+    """Import YouTube channel subscriptions from a NewPipe / PipePipe backup.
+
+    `path` is the exported .zip (which contains newpipe.db) or a raw newpipe.db. We read the SQLite
+    `subscriptions` table, keep YouTube rows (service_id 0), pull each channel's UC id out of its URL,
+    and merge them into our subscriptions (dedup by id; existing ones untouched). No network — a
+    handle/@ URL that carries no channel id is reported as skipped rather than resolved. Returns
+    {ok, added, skipped, total, count, error?}."""
+    import zipfile
+    import sqlite3
+    p = (path or "").strip()
+    if p.startswith("file://"):
+        p = p[len("file://"):]
+    p = os.path.expanduser(p)
+    if not os.path.isfile(p):
+        return {"ok": False, "error": "File not found."}
+    tmp_db = None
+    try:
+        if zipfile.is_zipfile(p):
+            with zipfile.ZipFile(p) as zf:
+                name = None
+                for n in zf.namelist():
+                    b = os.path.basename(n).lower()
+                    if b == "newpipe.db" or (b.endswith(".db") and not n.endswith("/")):
+                        name = n
+                        break
+                if not name:
+                    return {"ok": False, "error": "No newpipe.db inside that backup zip."}
+                tmp_db = os.path.join(_data_dir(), "newpipe-import.db")
+                with zf.open(name) as src, open(tmp_db, "wb") as out:
+                    shutil.copyfileobj(src, out)
+            db_path = tmp_db
+        else:
+            db_path = p                       # a raw .db handed over directly
+        con = sqlite3.connect(db_path)
+        try:
+            try:
+                rows = con.execute(
+                    "SELECT service_id, url, name, avatar_url FROM subscriptions").fetchall()
+            except sqlite3.OperationalError:  # a very old export without avatar_url
+                rows = [(r[0], r[1], r[2], "") for r in
+                        con.execute("SELECT service_id, url, name FROM subscriptions").fetchall()]
+        finally:
+            con.close()
+    except sqlite3.DatabaseError:
+        return {"ok": False, "error": "That file isn't a NewPipe/PipePipe database."}
+    except Exception as ex:
+        return {"ok": False, "error": str(ex)}
+    finally:
+        if tmp_db:
+            try:
+                os.remove(tmp_db)
+            except Exception:
+                pass
+
+    existing = list_subscriptions()
+    have = set(s.get("id") for s in existing if s.get("id"))
+    ch_re = re.compile(r"/channel/(UC[0-9A-Za-z_-]{20,})")
+    added = skipped = total = 0
+    for row in rows:
+        service_id, url, name = row[0], row[1], row[2]
+        avatar = row[3] if len(row) > 3 else ""
+        if service_id not in (0, None):       # 0 = YouTube; skip SoundCloud/PeerTube/Bandcamp/…
+            continue
+        total += 1
+        m = ch_re.search(url or "")
+        if not m:
+            skipped += 1                      # a handle/@ URL we can't map to a channel id offline
+            continue
+        cid = m.group(1)
+        if cid in have:
+            continue
+        have.add(cid)
+        existing.append({"id": cid, "name": name or cid,
+                         "url": "https://www.youtube.com/channel/%s" % cid,
+                         "thumbnail": avatar or ""})
+        added += 1
+    if added:
+        _save_subscriptions(existing)
+        _feed_cache["ts"] = 0.0
+        _feed_durations_cache["ts"] = 0.0
+    return {"ok": True, "added": added, "skipped": skipped, "total": total,
+            "count": len(existing)}
+
+
 _avatar_cache = {}         # channel -> {"ts": epoch, "res": {...}}
 _avatar_cache_lock = threading.Lock()
 _AVATAR_CACHE_TTL = 86400  # avatars rarely change; a day avoids re-running yt-dlp per view

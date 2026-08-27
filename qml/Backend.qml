@@ -250,6 +250,15 @@ Item {
         })
     }
 
+    // Import channel subscriptions from a NewPipe / PipePipe backup (.zip or raw newpipe.db).
+    // Refreshes the list on success; result {ok, added, skipped, total, error?} → caller callback.
+    function importNewpipe(path, callback) {
+        py.call("youfish.import_newpipe", [path || ""], function(res) {
+            if (res && res.added > 0) backend.loadSubscriptions()
+            if (callback) callback(res || {})
+        })
+    }
+
     // A page of a channel's uploads → the caller's callback (page-scoped, and drives the
     // scroll-to-load-more paging in ChannelPage). `start` is the 1-based first index.
     function channelVideos(channel, start, callback) {

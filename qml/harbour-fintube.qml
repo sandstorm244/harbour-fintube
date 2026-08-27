@@ -1,6 +1,7 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
 import Nemo.DBus 2.0
+import Sailfish.Pickers 1.0
 import "pages"
 import "cover"
 
@@ -40,6 +41,44 @@ ApplicationWindow {
         onEqBandsChanged: app.applyAudioFx()
         onBoostGainChanged: app.applyAudioFx()
     }
+
+    // Dispatch a More-page ACTION row (see MorePage.qml) — entries carry a string `action` key
+    // (functions can't survive the var-array model), which MorePage routes here.
+    function moreAction(key) {
+        if (key === "import-newpipe") importNewpipe()
+    }
+
+    // --- NewPipe / PipePipe subscription import (Home → More → "Import subscriptions") ---
+    // Opens a file picker; the chosen .zip/newpipe.db is parsed by the engine and its YouTube
+    // channel subscriptions merged in. A brief toast reports the result.
+    function importNewpipe() {
+        pageStack.push(newpipePicker)
+    }
+    Component {
+        id: newpipePicker
+        FilePickerPage {
+            title: "Choose a NewPipe / PipePipe backup"
+            nameFilters: [ "*.zip", "*.db" ]
+            onSelectedContentPropertiesChanged: {
+                app.showToast("Importing…")
+                app.backend.importNewpipe(selectedContentProperties.filePath, function(res) {
+                    if (!res || !res.ok) {
+                        app.showToast((res && res.error) ? res.error : "Import failed")
+                        return
+                    }
+                    var msg = "Imported " + res.added + " channel" + (res.added === 1 ? "" : "s")
+                    if (res.skipped > 0)
+                        msg += " · " + res.skipped + " skipped"
+                    app.showToast(msg)
+                })
+            }
+        }
+    }
+
+    // Transient status toast (used by the import; reusable for any brief app-wide feedback).
+    property string toastText: ""
+    function showToast(msg) { app.toastText = msg || ""; toastTimer.restart() }
+    Timer { id: toastTimer; interval: 3000; onTriggered: app.toastText = "" }
 
     initialPage: Component { HomePage { } }
 
@@ -203,6 +242,32 @@ ApplicationWindow {
             }
             icon.source: "image://theme/icon-m-clear"
             onClicked: app.lastVideo = null
+        }
+    }
+
+    // Transient toast banner — floats at the bottom, above the resume bar when it's showing.
+    Rectangle {
+        z: 2000
+        visible: app.toastText.length > 0
+        anchors {
+            horizontalCenter: parent.horizontalCenter
+            bottom: parent.bottom
+            bottomMargin: (resumeBar.visible ? resumeBar.height : 0) + Theme.paddingLarge
+        }
+        width: Math.min(app.width - 2 * Theme.horizontalPageMargin,
+                        toastLabel.implicitWidth + 2 * Theme.paddingLarge)
+        height: toastLabel.paintedHeight + 2 * Theme.paddingMedium
+        radius: Theme.paddingMedium
+        color: "#E6000000"
+        Label {
+            id: toastLabel
+            anchors.centerIn: parent
+            width: Math.min(implicitWidth, app.width - 4 * Theme.horizontalPageMargin)
+            text: app.toastText
+            wrapMode: Text.Wrap
+            horizontalAlignment: Text.AlignHCenter
+            color: "white"
+            font.pixelSize: Theme.fontSizeSmall
         }
     }
 }
