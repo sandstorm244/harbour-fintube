@@ -482,16 +482,33 @@ def _managed_ytdlp():
     return os.path.join(_data_dir(), "bin", "yt-dlp")
 
 
+def _system_binary(name):
+    """A user/system copy of `name` to fall back on when the app has no managed copy of its own. A
+    GUI-launched SFOS app runs with a TRIMMED PATH (no ~/.local/bin), so we consult PATH via `which`
+    AND the standard user-local / system spots explicitly — the same approach as _DENO_CANDIDATES.
+    Lets a user who keeps their own yt-dlp/ffmpeg (e.g. in ~/.local/bin, shared with other apps) skip
+    a second app-managed copy. A managed copy still WINS when present, so Install/Update always put the
+    app back in control of exactly what it runs. Returns an executable path, or None."""
+    found = shutil.which(name)
+    if found and os.access(found, os.X_OK):
+        return found
+    for p in (os.path.expanduser("~/.local/bin/" + name),
+              "/usr/local/bin/" + name, "/usr/bin/" + name):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
 def _ytdlp_path():
-    """The app-managed yt-dlp under our data dir, or None. We deliberately do NOT fall back to a
-    system/PATH yt-dlp: the app can only update and verify a copy it installed itself (the 'Update'
-    button runs `yt-dlp -U` on OUR binary), so a stray unmanaged copy would just create states the
-    app can't control. Missing → the UI prompts a download."""
+    """yt-dlp for the app to run. Prefers the app-managed copy in our own bin/ (so Install/Update stay
+    in control of what runs); otherwise falls back to a user/system yt-dlp (PATH, ~/.local/bin,
+    /usr/local/bin, /usr/bin — see _system_binary) so a user who keeps their own copy needn't have the
+    app fetch a second one. Missing entirely → the UI prompts a download."""
     _ensure_deno_on_path()  # yt-dlp's bundled EJS challenge-solver needs Deno reachable on PATH
     managed = _managed_ytdlp()
     if os.path.isfile(managed) and os.access(managed, os.X_OK):
         return managed
-    return None
+    return _system_binary("yt-dlp")
 
 
 def ytdlp_version():
@@ -642,13 +659,14 @@ def _managed_ffmpeg():
 
 
 def _ffmpeg_path():
-    """The app-managed ffmpeg under our bin/, or None. No system/PATH fallback (same reasoning as
-    _ytdlp_path — the app manages and updates its own copy; an unmanaged system ffmpeg it can't
-    control would only confuse). None → the UI offers a Download/Update button."""
+    """ffmpeg for the app (HD download merging). Prefers the app-managed copy in our bin/; otherwise
+    falls back to a user/system ffmpeg (PATH, ~/.local/bin, /usr/local/bin, /usr/bin — see
+    _system_binary) so a user's own copy is reused instead of fetching a second. None → the UI offers
+    a Download/Update button."""
     managed = _managed_ffmpeg()
     if os.path.isfile(managed) and os.access(managed, os.X_OK):
         return managed
-    return None
+    return _system_binary("ffmpeg")
 
 
 def _ffmpeg_dir():

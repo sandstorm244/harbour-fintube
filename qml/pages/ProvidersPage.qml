@@ -28,7 +28,7 @@ Page {
         var b = app.backend
         if (b.potInstalling) return b.potStatusMsg || "Setting up…"
         if (!b.potDeno) return "Deno runtime not found. Tap Download Deno below."
-        if (!b.potInstalled) return "Not installed."
+        if (!b.potInstalled) return "Provider not installed."
         if (!b.potEnabled) return "Installed · off"
         if (b.potResponding)
             return "Installed · working" + (b.potServerVersion ? " (v" + b.potServerVersion + ")" : "")
