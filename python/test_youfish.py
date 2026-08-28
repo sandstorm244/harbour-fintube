@@ -12,7 +12,10 @@ covered so it can't come back. youfish.py imports `pyotherside` only inside func
 
 import json
 import os
+import shutil
+import sqlite3
 import sys
+import tempfile
 import types
 import unittest
 
@@ -181,34 +184,143 @@ class ResolveSmoke(unittest.TestCase):
         self.assertIn("Sign in", res.get("error", ""))
 
 
-class NoPathFallback(unittest.TestCase):
-    """Managed-only resolution: with no app-managed binary present, _ytdlp_path/_ffmpeg_path return
-    None and NEVER consult PATH — locks in the 'we only run copies we installed' invariant so it
-    can't quietly regress to picking up a system yt-dlp/ffmpeg."""
+class BinaryResolution(unittest.TestCase):
+    """Binary resolution after the 2026-08-28 reversal: a managed copy WINS, but with none present
+    the app DOES fall back to a user/system yt-dlp/ffmpeg (PATH / ~/.local/bin / … via
+    _system_binary) — it is no longer managed-only. Both halves are pinned so neither regresses.
+    The extra FinTune-only candidate layers (_CANDIDATE_PATHS / _FINTUBE_DATA_DIR) are neutralised
+    so the same test is deterministic in both apps."""
     def setUp(self):
         self._mo, self._mf, self._which = (youfish._managed_ytdlp, youfish._managed_ffmpeg,
                                            youfish.shutil.which)
-        youfish._managed_ytdlp = lambda: "/nonexistent/yt-dlp"
-        youfish._managed_ffmpeg = lambda: "/nonexistent/ffmpeg"
+        self._tmp = tempfile.mkdtemp(prefix="binres-")
+        self._sys = {}
+        for name in ("yt-dlp", "ffmpeg"):               # a discoverable user/system copy
+            p = os.path.join(self._tmp, name)
+            with open(p, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(p, 0o755)
+            self._sys[name] = p
         self.which_calls = []
 
         def _spy(name):
             self.which_calls.append(name)
-            return "/usr/bin/" + name   # a decoy on PATH that MUST be ignored
+            return self._sys.get(name)                  # only yt-dlp/ffmpeg resolve; deno → None
 
         youfish.shutil.which = _spy
+        youfish._managed_ytdlp = lambda: os.path.join(self._tmp, "absent", "yt-dlp")
+        youfish._managed_ffmpeg = lambda: os.path.join(self._tmp, "absent", "ffmpeg")
+        # Neutralise FinTune's extra fallback layers so both apps go straight managed → system.
+        self._cand = getattr(youfish, "_CANDIDATE_PATHS", None)
+        if self._cand is not None:
+            youfish._CANDIDATE_PATHS = ()
+        self._fdd = getattr(youfish, "_FINTUBE_DATA_DIR", None)
+        if self._fdd is not None:
+            youfish._FINTUBE_DATA_DIR = os.path.join(self._tmp, "no-fintube")
 
     def tearDown(self):
         youfish._managed_ytdlp, youfish._managed_ffmpeg, youfish.shutil.which = (
             self._mo, self._mf, self._which)
+        if self._cand is not None:
+            youfish._CANDIDATE_PATHS = self._cand
+        if self._fdd is not None:
+            youfish._FINTUBE_DATA_DIR = self._fdd
+        shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def test_ytdlp_managed_only(self):
-        self.assertIsNone(youfish._ytdlp_path())
-        self.assertNotIn("yt-dlp", self.which_calls)   # PATH never consulted
+    def test_ytdlp_falls_back_to_system(self):
+        # No managed copy, but a user/system copy is discoverable → resolved (NOT None), and the
+        # system-fallback path was actually taken (which consulted for yt-dlp).
+        self.assertEqual(youfish._ytdlp_path(), self._sys["yt-dlp"])
+        self.assertIn("yt-dlp", self.which_calls)
 
-    def test_ffmpeg_managed_only(self):
-        self.assertIsNone(youfish._ffmpeg_path())
-        self.assertNotIn("ffmpeg", self.which_calls)
+    def test_ffmpeg_falls_back_to_system(self):
+        self.assertEqual(youfish._ffmpeg_path(), self._sys["ffmpeg"])
+
+    def test_managed_wins_over_system(self):
+        managed = os.path.join(self._tmp, "managed-yt-dlp")
+        with open(managed, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(managed, 0o755)
+        youfish._managed_ytdlp = lambda: managed
+        self.assertEqual(youfish._ytdlp_path(), managed)
+        self.assertNotIn("yt-dlp", self.which_calls)    # managed short-circuits the fallback
+
+
+class NewPipeImport(unittest.TestCase):
+    """import_newpipe against a synthetic NewPipe backup: subscriptions, watch history + resume,
+    local playlists, and bookmarked YouTube playlists — YouTube-only, merged, idempotent. The
+    watch-history section is store-guarded, so this also passes in FinTune (no history store)."""
+    def setUp(self):
+        self._dd = youfish._data_dir
+        self._tmp = tempfile.mkdtemp(prefix="npimp-")
+        youfish._data_dir = lambda: self._tmp
+        self.db = os.path.join(self._tmp, "newpipe.db")
+        self._build(self.db)
+
+    def tearDown(self):
+        youfish._data_dir = self._dd
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _build(self, path):
+        con = sqlite3.connect(path)
+        c = con.cursor()
+        c.execute("CREATE TABLE streams(uid INTEGER PRIMARY KEY, service_id INTEGER, url TEXT, "
+                  "title TEXT, duration INTEGER, uploader TEXT, thumbnail_url TEXT)")
+        c.execute("CREATE TABLE subscriptions(uid INTEGER PRIMARY KEY, service_id INTEGER, "
+                  "url TEXT, name TEXT, avatar_url TEXT)")
+        c.execute("CREATE TABLE stream_history(stream_id INTEGER, access_date INTEGER, "
+                  "repeat_count INTEGER)")
+        c.execute("CREATE TABLE stream_state(stream_id INTEGER PRIMARY KEY, progress_time INTEGER)")
+        c.execute("CREATE TABLE playlists(uid INTEGER PRIMARY KEY, name TEXT, display_index INTEGER)")
+        c.execute("CREATE TABLE playlist_stream_join(playlist_id INTEGER, stream_id INTEGER, "
+                  "join_index INTEGER)")
+        c.execute("CREATE TABLE remote_playlists(uid INTEGER PRIMARY KEY, service_id INTEGER, "
+                  "name TEXT, url TEXT)")
+        c.executemany("INSERT INTO streams(uid,service_id,url,title,duration,uploader,thumbnail_url)"
+                      " VALUES(?,?,?,?,?,?,?)", [
+                          (1, 0, "https://www.youtube.com/watch?v=AAAAAAAAAAA", "One", 600, "A", ""),
+                          (2, 0, "https://youtu.be/BBBBBBBBBBB", "Two", 300, "B", ""),
+                          (3, 1, "https://soundcloud.com/x", "SC", 100, "SC", ""),   # non-YT → dropped
+                      ])
+        c.executemany("INSERT INTO subscriptions(uid,service_id,url,name,avatar_url) "
+                      "VALUES(?,?,?,?,?)", [
+                          (1, 0, "https://www.youtube.com/channel/UC11111111111111111111", "A", ""),
+                          (2, 0, "https://www.youtube.com/@handle", "H", ""),  # no id → skipped
+                          (3, 1, "https://soundcloud.com/c", "SC", ""),        # non-YT → dropped
+                      ])
+        c.execute("INSERT INTO stream_state VALUES(1, 120000)")               # 20% → resume point
+        c.execute("INSERT INTO stream_history VALUES(1, 1700000000000, 0)")
+        c.execute("INSERT INTO playlists VALUES(1, 'Mix', 0)")
+        c.executemany("INSERT INTO playlist_stream_join VALUES(?,?,?)", [(1, 2, 0), (1, 1, 1)])
+        c.execute("INSERT INTO remote_playlists VALUES"
+                  "(1, 0, 'Cool', 'https://www.youtube.com/playlist?list=PLxyz')")
+        con.commit()
+        con.close()
+
+    def test_full_import_and_idempotent(self):
+        res = youfish.import_newpipe(self.db)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["added"], 1)         # UC1 only (@handle skipped, SoundCloud dropped)
+        self.assertEqual(res["skipped"], 1)
+        self.assertEqual(res["resume"], 1)        # stream 1 at 20%
+        self.assertEqual(res["playlists"], 1)     # local "Mix"
+        self.assertEqual(res["remote"], 1)        # bookmarked "Cool"
+        has_history = hasattr(youfish, "_load_watch_history")
+        self.assertEqual(res["history"], 1 if has_history else 0)
+        pls = json.load(open(os.path.join(self._tmp, "playlists.json")))
+        mix = next(p for p in pls if p["title"] == "Mix")
+        self.assertEqual([it["id"] for it in mix["items"]], ["BBBBBBBBBBB", "AAAAAAAAAAA"])  # join order
+        cool = next(p for p in pls if p["title"] == "Cool")
+        self.assertEqual((cool["kind"], cool["yt_id"], len(cool["items"])), ("youtube", "PLxyz", 0))
+        res2 = youfish.import_newpipe(self.db)    # nothing new on a second run
+        self.assertEqual((res2["added"], res2["resume"], res2["playlists"], res2["remote"]),
+                         (0, 0, 0, 0))
+
+    def test_rejects_non_database(self):
+        junk = os.path.join(self._tmp, "junk.db")
+        with open(junk, "wb") as f:
+            f.write(b"not a database")
+        self.assertFalse(youfish.import_newpipe(junk)["ok"])
 
 
 class PotTag(unittest.TestCase):

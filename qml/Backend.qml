@@ -255,6 +255,8 @@ Item {
     function importNewpipe(path, callback) {
         py.call("youfish.import_newpipe", [path || ""], function(res) {
             if (res && res.added > 0) backend.loadSubscriptions()
+            if (res && (res.playlists > 0 || res.remote > 0)) backend.loadPlaylists()
+            if (res && res.history > 0) backend.loadWatchState()
             if (callback) callback(res || {})
         })
     }

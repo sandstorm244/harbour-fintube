@@ -2374,14 +2374,36 @@ def toggle_subscription(channel_id, name="", url="", thumbnail=""):
     return {"ok": True, "subscribed": subscribed, "subscriptions": subs}
 
 
-def import_newpipe(path):
-    """Import YouTube channel subscriptions from a NewPipe / PipePipe backup.
+def _np_query(con, sql):
+    """Run a SELECT against a NewPipe/PipePipe backup DB, returning [] when the table or a column
+    is absent — the schema varies across NewPipe versions and PipePipe forks, so a missing piece
+    should skip its section, not abort the whole import."""
+    import sqlite3
+    try:
+        return con.execute(sql).fetchall()
+    except sqlite3.OperationalError:
+        return []
 
-    `path` is the exported .zip (which contains newpipe.db) or a raw newpipe.db. We read the SQLite
-    `subscriptions` table, keep YouTube rows (service_id 0), pull each channel's UC id out of its URL,
-    and merge them into our subscriptions (dedup by id; existing ones untouched). No network — a
-    handle/@ URL that carries no channel id is reported as skipped rather than resolved. Returns
-    {ok, added, skipped, total, count, error?}."""
+
+def _np_video_id(url):
+    """Extract an 11-char YouTube video id from a streams.url (watch?v= / youtu.be/ / shorts/ /
+    embed/). Returns "" for a non-YouTube or malformed row."""
+    if not url:
+        return ""
+    m = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/)([0-9A-Za-z_-]{11})", url)
+    return m.group(1) if m else ""
+
+
+def import_newpipe(path):
+    """Import a NewPipe / PipePipe backup: subscriptions, watch history + resume points, local
+    playlists, and bookmarked YouTube playlists.
+
+    `path` is the exported .zip (which contains newpipe.db) or a raw newpipe.db. Everything is read
+    offline (no network) and YouTube-only (service_id 0 — SoundCloud/PeerTube/etc. rows are dropped).
+    Imported data is MERGED into the existing stores without clobbering anything already local.
+    Returns {ok, added, skipped, total, count, history, resume, playlists, remote, summary, error?};
+    added/skipped/total/count are the subscription figures (kept for back-compat) and `summary` is a
+    ready-to-show sentence."""
     import zipfile
     import sqlite3
     p = (path or "").strip()
@@ -2410,12 +2432,7 @@ def import_newpipe(path):
             db_path = p                       # a raw .db handed over directly
         con = sqlite3.connect(db_path)
         try:
-            try:
-                rows = con.execute(
-                    "SELECT service_id, url, name, avatar_url FROM subscriptions").fetchall()
-            except sqlite3.OperationalError:  # a very old export without avatar_url
-                rows = [(r[0], r[1], r[2], "") for r in
-                        con.execute("SELECT service_id, url, name FROM subscriptions").fetchall()]
+            return _import_newpipe_db(con)
         finally:
             con.close()
     except sqlite3.DatabaseError:
@@ -2429,34 +2446,221 @@ def import_newpipe(path):
             except Exception:
                 pass
 
-    existing = list_subscriptions()
-    have = set(s.get("id") for s in existing if s.get("id"))
+
+def _import_newpipe_db(con):
+    """Read every supported table from an open NewPipe backup connection and merge it into our
+    stores. Split out from import_newpipe so the zip/tempfile handling stays readable. Feature-
+    guarded so the identical code also runs in FinTune (no watch-history store): the history
+    section self-skips there rather than erroring."""
+    # streams is the join hub: history / resume / playlist rows carry only a stream_id pointing
+    # here, and this is where the title/uploader/duration/thumbnail actually live.
+    streams = {}
+    for row in _np_query(
+            con, "SELECT uid, service_id, url, title, duration, uploader, thumbnail_url "
+                 "FROM streams"):
+        uid, service_id, url, title, duration, uploader, thumb = row
+        if service_id not in (0, None):
+            continue
+        vid = _np_video_id(url)
+        if not vid:
+            continue
+        try:
+            dur = int(duration or 0)
+        except (TypeError, ValueError):
+            dur = 0
+        streams[uid] = {"id": vid, "title": title or vid, "uploader": uploader or "",
+                        "duration": dur, "thumbnail": thumb or _video_thumb(vid)}
+
+    # ---- subscriptions ------------------------------------------------------
+    subs = list_subscriptions()
+    have_sub = set(s.get("id") for s in subs if s.get("id"))
     ch_re = re.compile(r"/channel/(UC[0-9A-Za-z_-]{20,})")
-    added = skipped = total = 0
-    for row in rows:
+    sub_rows = _np_query(con, "SELECT service_id, url, name, avatar_url FROM subscriptions")
+    if not sub_rows:                          # a very old export without avatar_url
+        sub_rows = [(r[0], r[1], r[2], "") for r in
+                    _np_query(con, "SELECT service_id, url, name FROM subscriptions")]
+    subs_added = subs_skipped = subs_total = 0
+    for row in sub_rows:
         service_id, url, name = row[0], row[1], row[2]
         avatar = row[3] if len(row) > 3 else ""
         if service_id not in (0, None):       # 0 = YouTube; skip SoundCloud/PeerTube/Bandcamp/…
             continue
-        total += 1
+        subs_total += 1
         m = ch_re.search(url or "")
         if not m:
-            skipped += 1                      # a handle/@ URL we can't map to a channel id offline
+            subs_skipped += 1                 # a handle/@ URL we can't map to a channel id offline
             continue
         cid = m.group(1)
-        if cid in have:
+        if cid in have_sub:
             continue
-        have.add(cid)
-        existing.append({"id": cid, "name": name or cid,
-                         "url": "https://www.youtube.com/channel/%s" % cid,
-                         "thumbnail": avatar or ""})
-        added += 1
-    if added:
-        _save_subscriptions(existing)
+        have_sub.add(cid)
+        subs.append({"id": cid, "name": name or cid,
+                     "url": "https://www.youtube.com/channel/%s" % cid,
+                     "thumbnail": avatar or ""})
+        subs_added += 1
+    if subs_added:
+        _save_subscriptions(subs)
         _feed_cache["ts"] = 0.0
         _feed_durations_cache["ts"] = 0.0
-    return {"ok": True, "added": added, "skipped": skipped, "total": total,
-            "count": len(existing)}
+
+    # ---- watch history + resume points --------------------------------------
+    # stream_state.progress_time is the resume position in MILLISECONDS; NewPipe clears it once a
+    # video finishes, so a stream that's in history with no state row is treated as fully watched.
+    # stream_history has one row per access (composite PK stream_id+access_date): keep the latest
+    # access_date (epoch ms) and sum repeat_count.
+    state = {}
+    for sid, pt in _np_query(con, "SELECT stream_id, progress_time FROM stream_state"):
+        state[sid] = pt
+    hist = {}
+    for sid, access_date, repeat in _np_query(
+            con, "SELECT stream_id, access_date, repeat_count FROM stream_history"):
+        h = hist.setdefault(sid, {"access": 0, "repeat": 0})
+        try:
+            ad = int(access_date or 0)
+        except (TypeError, ValueError):
+            ad = 0
+        if ad > h["access"]:
+            h["access"] = ad
+        try:
+            h["repeat"] += int(repeat or 0)
+        except (TypeError, ValueError):
+            pass
+
+    watched_thresh = globals().get("_WATCHED_FRACTION", 0.8)
+    imported = []                             # (ts, video_id, entry), sorted oldest→newest below
+    for sid in (set(state) | set(hist)):
+        meta = streams.get(sid)
+        if not meta:
+            continue                          # unresolved / non-YouTube stream
+        dur = meta["duration"]
+        pos_ms = state.get(sid)
+        try:
+            pos = int(int(pos_ms) / 1000) if pos_ms else 0
+        except (TypeError, ValueError):
+            pos = 0
+        h = hist.get(sid) or {}
+        ts = int((h.get("access") or 0) / 1000)
+        frac = (pos / dur) if dur > 0 else 0.0
+        frac = max(0.0, min(1.0, frac))
+        near_end = dur > 0 and pos > dur - 15
+        finished = sid in hist and sid not in state   # state cleared on finish ≈ fully watched
+        watched = frac >= watched_thresh or near_end or finished
+        imported.append((ts, meta["id"], {
+            "p": pos, "d": dur, "f": round(frac, 4), "w": 1 if watched else 0,
+            "t": ts, "ti": meta["title"], "ch": meta["uploader"]}))
+    imported.sort(key=lambda x: x[0])
+
+    hist_added = 0
+    has_history = ("_load_watch_history" in globals() and "_watch_history_path" in globals())
+    if has_history and imported:
+        existing_hist = _load_watch_history()
+        merged = {}
+        for ts, vid, entry in imported:
+            if vid in existing_hist:
+                continue                      # keep the user's own, fresher record
+            merged[vid] = entry
+            hist_added += 1
+        for vid, e in existing_hist.items():  # local history appended last = stays newest
+            merged.pop(vid, None)
+            merged[vid] = e
+        if len(merged) > 500:
+            merged = dict(list(merged.items())[-500:])
+        if hist_added:
+            try:
+                with open(_watch_history_path(), "w") as f:
+                    json.dump(merged, f)
+            except Exception:
+                pass
+
+    pos_added = 0
+    if imported:
+        positions = _load_positions()
+        for ts, vid, entry in imported:
+            if vid in positions:
+                continue                      # don't overwrite a local resume point
+            pp, dd = entry["p"], entry["d"]
+            if pp > 10 and not (dd > 0 and pp > dd - 15):
+                positions[vid] = pp
+                pos_added += 1
+        if pos_added:
+            if len(positions) > 300:
+                positions = dict(list(positions.items())[-300:])
+            try:
+                with open(_positions_path(), "w") as f:
+                    json.dump(positions, f)
+            except Exception:
+                pass
+
+    # ---- local playlists ----------------------------------------------------
+    playlists = _load_playlists()
+    have_local = set((p.get("title") or "").strip().lower()
+                     for p in playlists if p.get("kind", "local") == "local")
+    have_yt = set(p.get("yt_id") for p in playlists if p.get("yt_id"))
+    members = {}                              # playlist uid -> [stream_id, ...] in join order
+    for pl_id, sid, join_index in _np_query(
+            con, "SELECT playlist_id, stream_id, join_index FROM playlist_stream_join "
+                 "ORDER BY playlist_id, join_index"):
+        members.setdefault(pl_id, []).append(sid)
+    pl_added = 0
+    for uid, name in _np_query(con, "SELECT uid, name FROM playlists ORDER BY display_index"):
+        title = (name or "Playlist").strip()[:100] or "Playlist"
+        if title.lower() in have_local:
+            continue                          # a same-named local list already exists
+        items, seen = [], set()
+        for sid in members.get(uid, []):
+            meta = streams.get(sid)
+            if not meta or meta["id"] in seen:
+                continue
+            seen.add(meta["id"])
+            items.append({"id": meta["id"], "title": meta["title"],
+                          "uploader": meta["uploader"], "duration": meta["duration"],
+                          "thumbnail": meta["thumbnail"]})
+        playlists.append({"id": uuid.uuid4().hex[:12], "title": title,
+                          "kind": "local", "items": items})
+        have_local.add(title.lower())
+        pl_added += 1
+
+    # ---- bookmarked YouTube playlists ---------------------------------------
+    # Only the metadata is in the backup (not the video list), so store the list id with empty
+    # items; opening it in the library fetches the contents through the normal refresh path.
+    list_re = re.compile(r"[?&]list=([0-9A-Za-z_-]+)")
+    rp_added = 0
+    for row in _np_query(con, "SELECT service_id, name, url FROM remote_playlists"):
+        service_id, name, url = row[0], row[1], row[2]
+        if service_id not in (0, None):
+            continue
+        m = list_re.search(url or "")
+        if not m:
+            continue
+        yt_id = m.group(1)
+        if yt_id in have_yt:
+            continue
+        have_yt.add(yt_id)
+        playlists.append({"id": uuid.uuid4().hex[:12],
+                          "title": (name or "Playlist").strip()[:100] or "Playlist",
+                          "kind": "youtube", "yt_id": yt_id, "items": []})
+        rp_added += 1
+    if pl_added or rp_added:
+        _save_playlists(playlists)
+
+    # ---- summary ------------------------------------------------------------
+    def _n(n, one, many=None):
+        return "%d %s" % (n, one if n == 1 else (many or one + "s"))
+    parts = []
+    if subs_added:
+        parts.append(_n(subs_added, "subscription"))
+    if hist_added:
+        parts.append(_n(hist_added, "watched video"))
+    if pos_added:
+        parts.append(_n(pos_added, "resume point"))
+    if pl_added:
+        parts.append(_n(pl_added, "playlist"))
+    if rp_added:
+        parts.append(_n(rp_added, "saved playlist"))
+    summary = ("Imported " + ", ".join(parts) + ".") if parts else "Nothing new to import."
+    return {"ok": True, "added": subs_added, "skipped": subs_skipped, "total": subs_total,
+            "count": len(subs), "history": hist_added, "resume": pos_added,
+            "playlists": pl_added, "remote": rp_added, "summary": summary}
 
 
 _avatar_cache = {}         # channel -> {"ts": epoch, "res": {...}}

@@ -70,9 +70,8 @@ ApplicationWindow {
                         win.showToast((res && res.error) ? res.error : "Import failed")
                         return
                     }
-                    var msg = "Imported " + res.added + " channel" + (res.added === 1 ? "" : "s")
-                    if (res.skipped > 0)
-                        msg += " · " + res.skipped + " skipped"
+                    var msg = res.summary || ("Imported " + res.added + " channel"
+                                              + (res.added === 1 ? "" : "s"))
                     win.showToast(msg)
                 })
             }
