@@ -60,16 +60,20 @@ ApplicationWindow {
             title: "Choose a NewPipe / PipePipe backup"
             nameFilters: [ "*.zip", "*.db" ]
             onSelectedContentPropertiesChanged: {
-                app.showToast("Importing…")
-                app.backend.importNewpipe(selectedContentProperties.filePath, function(res) {
+                // Capture the ApplicationWindow as a plain JS reference: the pyotherside callback
+                // below is invoked from Backend's QML context (QJSValue.call), where the `app` ID
+                // won't resolve — but a captured object reference the closure holds still works.
+                var win = app
+                win.showToast("Importing…")
+                win.backend.importNewpipe(selectedContentProperties.filePath, function(res) {
                     if (!res || !res.ok) {
-                        app.showToast((res && res.error) ? res.error : "Import failed")
+                        win.showToast((res && res.error) ? res.error : "Import failed")
                         return
                     }
                     var msg = "Imported " + res.added + " channel" + (res.added === 1 ? "" : "s")
                     if (res.skipped > 0)
                         msg += " · " + res.skipped + " skipped"
-                    app.showToast(msg)
+                    win.showToast(msg)
                 })
             }
         }
@@ -189,7 +193,10 @@ ApplicationWindow {
         z: 1000
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
         height: Theme.itemSizeMedium
+        // Hidden on pages that opt out (More + its utility pages set hideDock) so it can't cover
+        // their fixed bottom controls; still shows over scrollable list pages, which scroll clear.
         visible: lastVideo && lastVideo.id && lastVideo.id.length > 0
+                 && !(pageStack.currentPage && pageStack.currentPage.hideDock === true)
 
         Rectangle {
             anchors.fill: parent

@@ -18,6 +18,12 @@ Page {
                              || page.orientation === Orientation.LandscapeInverted
     property bool controlsShown: true
 
+    // Portrait-only drop below the physical camera cutout (OS geometry), matching the online player.
+    // Guarded — Screen.hasCutouts / Screen.topCutout only exist on newer Silica.
+    property real notchOffset: (typeof Screen !== "undefined" && Screen.hasCutouts && Screen.topCutout)
+                               ? (Screen.topCutout.y + Screen.topCutout.height)
+                               : 0
+
     property int positionMs: mediaPlayer.position
     property int durationMs: mediaPlayer.duration
     property bool isPlaying: mediaPlayer.playbackState === MediaPlayer.PlayingState
@@ -71,10 +77,20 @@ Page {
         mediaPlayer.stop()
     }
 
+    // Notch spacer (portrait only): a black strip so the camera cutout sits over black, with the
+    // video dropped below it rather than clipped.
+    Rectangle {
+        visible: !page.landscape && page.notchOffset > 0
+        color: "black"
+        anchors { top: parent.top; left: parent.left; right: parent.right }
+        height: page.notchOffset
+    }
+
     Rectangle {
         id: videoBox
         color: "black"
-        anchors { top: parent.top; left: parent.left; right: parent.right }
+        anchors { top: parent.top; left: parent.left; right: parent.right
+                  topMargin: page.landscape ? 0 : page.notchOffset }
         height: page.landscape ? page.height : Math.round(width * 9 / 16)
 
         VideoOutput {

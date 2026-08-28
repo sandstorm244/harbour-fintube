@@ -8,6 +8,8 @@ Page {
     id: page
     allowedOrientations: Orientation.All
 
+    property bool hideDock: true   // hide the now-playing dock / resume bar over Providers
+
     // Re-read provider status each time the page is shown. prewarm() brings the server up on a
     // background thread ~after launch, so the value cached at startup can be stale ("server not
     // started") by the time you open this page; refreshing here keeps the status line honest.

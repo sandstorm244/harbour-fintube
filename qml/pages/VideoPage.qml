@@ -86,13 +86,20 @@ Page {
                              || page.orientation === Orientation.LandscapeInverted
     property bool controlsShown: true
 
-    // In landscape the player must cover the WHOLE screen — under the camera cutout too — so the
-    // app background never peeks through around the notch. FullScreen draws the page edge-to-edge
-    // under the cutout; there's no inset. Guarded — cutoutMode/CutoutMode only exist on newer Silica.
+    // The page draws edge-to-edge under the camera cutout (FullScreen) so landscape is immersive and
+    // no app background peeks around the notch. In portrait that would let the notch clip the top of
+    // the video strip, so we simply push the video box DOWN by notchOffset (see videoBox) and fill
+    // the freed strip with black. Guarded — cutoutMode/CutoutMode only exist on newer Silica.
     function updateCutout() {
         if (typeof page.cutoutMode !== "undefined")
             page.cutoutMode = CutoutMode.FullScreen
     }
+    // Portrait-only drop below the physical camera cutout, taken from the OS cutout geometry
+    // (Screen.topCutout) so it fits ANY device's notch — 0 where there is none. Guarded:
+    // Screen.hasCutouts / Screen.topCutout only exist on newer Silica; typeof avoids a ReferenceError.
+    property real notchOffset: (typeof Screen !== "undefined" && Screen.hasCutouts && Screen.topCutout)
+                               ? (Screen.topCutout.y + Screen.topCutout.height)
+                               : 0
 
     // One view over whichever backend is actually playing.
     property int positionMs: page.useGst ? gplayer.position : mediaPlayer.position
@@ -551,11 +558,21 @@ Page {
         })
     }
 
+    // ---- Notch spacer (portrait only): a black strip so the physical camera cutout sits over black,
+    // with the video dropped below it rather than clipped. ----
+    Rectangle {
+        visible: !page.landscape && page.notchOffset > 0
+        color: "black"
+        anchors { top: parent.top; left: parent.left; right: parent.right }
+        height: page.notchOffset
+    }
+
     // ---- Video surface (top strip in portrait, whole screen in landscape) ----
     Rectangle {
         id: videoBox
         color: "black"
-        anchors { top: parent.top; left: parent.left; right: parent.right }
+        anchors { top: parent.top; left: parent.left; right: parent.right
+                  topMargin: page.landscape ? 0 : page.notchOffset }
         height: page.landscape ? page.height : Math.round(width * 9 / 16)
 
         VideoPlayer {

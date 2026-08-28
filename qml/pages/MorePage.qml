@@ -17,6 +17,7 @@ Page {
     id: page
     allowedOrientations: Orientation.All
 
+    property bool hideDock: true   // hide the now-playing dock / resume bar over the More hub
     property var entries: []
     property string heading: "More"
 

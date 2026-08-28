@@ -8,6 +8,7 @@ Page {
     id: page
     allowedOrientations: Orientation.All
 
+    property bool hideDock: true   // hide the now-playing dock / resume bar over Settings
     property string dlError: ""   // last download-folder error (e.g. not writable), shown inline
 
     SilicaFlickable {

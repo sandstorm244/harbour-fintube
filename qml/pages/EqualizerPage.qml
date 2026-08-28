@@ -8,6 +8,8 @@ Page {
     id: page
     allowedOrientations: Orientation.All
 
+    property bool hideDock: true   // hide the now-playing dock / resume bar over the equalizer
+
     readonly property var freqLabels: ["29 Hz", "59 Hz", "119 Hz", "237 Hz", "474 Hz",
                                        "947 Hz", "1.9 kHz", "3.8 kHz", "7.5 kHz", "15 kHz"]
     // Preset curves (dB per band). "Flat" (all zero) is index 0.
