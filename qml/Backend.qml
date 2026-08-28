@@ -439,6 +439,11 @@ Item {
             backend.potTag = s.tag || ""
         })
     }
+    function startPotProvider() {
+        // Nudge the PO-token sidecar up if it isn't already listening. prewarm() is idempotent
+        // (a no-op when the server is up) and starts it on a persistent background thread.
+        py.call("youfish.prewarm", [], function() {})
+    }
     // Full copy-pasteable health report for the provider + its deps → caller callback. The report
     // action actively (re)starts the server, so refresh the status props afterward — otherwise the
     // top status line stays stale ("server not started") while the report already says "working".

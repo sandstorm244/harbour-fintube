@@ -1278,8 +1278,21 @@ def prewarm():
     if not _pot_active():
         return
     def _bg():
+        # PR_SET_PDEATHSIG on the Deno child is armed against the THREAD that spawns it — on Linux
+        # the parent-death signal is tied to the creating task, not the process. If this short-lived
+        # thread returned right after the server came up, the kernel would SIGKILL the child the
+        # instant the thread ends. THAT is why the sidecar only stayed up when a played video or the
+        # diagnostics started it (both run on the long-lived PyOtherSide worker thread) and silently
+        # died when prewarm started it at launch. So: skip if it's already listening, otherwise start
+        # it and PARK on the child for its whole life here — keeping pdeathsig correctly armed to fire
+        # when this daemon thread is torn down at app exit.
         try:
+            if _pot_ready_on_port():
+                return
             _ensure_pot_server()
+            proc = _pot_proc
+            if proc is not None and proc.poll() is None:
+                proc.wait()
         except Exception:
             pass
     threading.Thread(target=_bg, daemon=True).start()

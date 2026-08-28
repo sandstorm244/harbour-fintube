@@ -10,10 +10,27 @@ Page {
 
     property bool hideDock: true   // hide the now-playing dock / resume bar over Providers
 
-    // Re-read provider status each time the page is shown. prewarm() brings the server up on a
-    // background thread ~after launch, so the value cached at startup can be stale ("server not
-    // started") by the time you open this page; refreshing here keeps the status line honest.
-    onStatusChanged: if (status === PageStatus.Active) app.backend.loadPotStatus()
+    // Re-read provider status each time the page is shown, and nudge the sidecar up if it isn't
+    // answering yet — so the line goes from "starting…" to "working" on its own, without needing a
+    // played video or a diagnostics run to kick it. (The startup-cached status is often stale here.)
+    onStatusChanged: {
+        if (status === PageStatus.Active) {
+            app.backend.loadPotStatus()
+            if (app.backend.potEnabled && !app.backend.potResponding)
+                app.backend.startPotProvider()
+        }
+    }
+
+    // While the provider is enabled but not answering (and hasn't reported an error), poll so
+    // "starting…" flips to "working" the moment the sidecar comes up. The binding stops it as soon
+    // as it responds or a real error appears, so it never spins indefinitely.
+    Timer {
+        interval: 1200
+        repeat: true
+        running: page.status === PageStatus.Active && app.backend.potEnabled
+                 && !app.backend.potResponding && app.backend.potLastError.length === 0
+        onTriggered: app.backend.loadPotStatus()
+    }
 
     property string ytdlpStatus: ""
 
@@ -32,16 +49,18 @@ Page {
         if (!b.potEnabled) return "Installed · off"
         if (b.potResponding)
             return "Installed · working" + (b.potServerVersion ? " (v" + b.potServerVersion + ")" : "")
-        if (b.potRunning) return "Installed · on — server not answering yet"
-        return "Installed · on — server not started"
+        // A real failure sets potLastError (shown in full just below) → say so and colour it red.
+        // Otherwise the server is simply still coming up: a calm "starting…", not an alarming error.
+        if (b.potLastError) return "Installed · on — not working (see below)"
+        return "Installed · on — starting…"
     }
     function potStateColor() {
         var b = app.backend
         if (b.potInstalling) return Theme.secondaryColor
         if (!b.potDeno) return Theme.errorColor
         if (b.potEnabled && b.potResponding) return Theme.secondaryHighlightColor
-        if (b.potEnabled && !b.potResponding) return Theme.errorColor
-        return Theme.secondaryColor
+        if (b.potEnabled && b.potLastError) return Theme.errorColor   // red only on a genuine error
+        return Theme.secondaryColor                                    // "starting…" etc.: neutral
     }
 
     SilicaFlickable {
