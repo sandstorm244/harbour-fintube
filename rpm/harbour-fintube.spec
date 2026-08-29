@@ -9,6 +9,7 @@ Source0:    %{name}-%{version}.tar.bz2
 Requires:   sailfishsilica-qt5 >= 0.10.9
 Requires:   pyotherside-qml-plugin-python3-qt5
 Requires:   qt5-qtdeclarative-import-multimedia
+Requires:	git
 # NOTE: yt-dlp is intentionally NOT a dependency. The app checks for it at launch
 # and the user installs / updates it themselves (see README).
 
