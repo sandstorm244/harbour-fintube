@@ -575,5 +575,157 @@ class HistoryLimitSetting(unittest.TestCase):
         self.assertEqual(youfish._history_limit(), 50)           # clamp lower
 
 
+class CaptionTracks(unittest.TestCase):
+    """_caption_tracks splits yt-dlp caption data into the short real list + the big
+    auto-translate set; the ASR base (no tlang) is a real track, tlang entries are not."""
+    def _fmts(self, url, name=None, ext="json3"):
+        f = {"ext": ext, "url": url}
+        if name is not None:
+            f["name"] = name
+        return [f]
+
+    def test_manual_and_asr_are_tracks_translations_are_split(self):
+        data = {
+            "subtitles": {"en": self._fmts("http://x/en.json3?fmt=json3", "English")},
+            "automatic_captions": {
+                "en": self._fmts("http://x/asr.json3?fmt=json3&kind=asr", "English (auto)"),
+                "de": self._fmts("http://x/t.json3?fmt=json3&tlang=de", "German"),
+                "fr": self._fmts("http://x/t.json3?fmt=json3&tlang=fr", "French"),
+            },
+        }
+        tracks, translations = youfish._caption_tracks(data)
+        kinds = {t["lang"]: t["kind"] for t in tracks}
+        self.assertEqual(kinds, {"en": "manual"})                    # manual wins the 'en' slot
+        self.assertEqual({t["lang"] for t in translations}, {"de", "fr"})
+        self.assertTrue(all("tlang=" in t["url"] for t in translations))
+
+    def test_asr_kept_when_no_manual_for_that_lang(self):
+        data = {"automatic_captions": {
+            "es": self._fmts("http://x/asr.json3?fmt=json3", "Spanish"),        # ASR, no tlang
+            "en": self._fmts("http://x/t.json3?fmt=json3&tlang=en", "English"), # translation
+        }}
+        tracks, translations = youfish._caption_tracks(data)
+        self.assertEqual([(t["lang"], t["kind"]) for t in tracks], [("es", "asr")])
+        self.assertEqual([t["lang"] for t in translations], ["en"])
+
+    def test_non_json3_and_live_chat_ignored(self):
+        data = {
+            "subtitles": {
+                "en": self._fmts("http://x/en.vtt", "English", ext="vtt"),   # no json3 -> skip
+                "live_chat": self._fmts("http://x/lc.json3?fmt=json3"),      # not a subtitle
+            },
+            "automatic_captions": {},
+        }
+        tracks, translations = youfish._caption_tracks(data)
+        self.assertEqual(tracks, [])
+        self.assertEqual(translations, [])
+
+    def test_translation_dropped_when_a_real_track_covers_that_lang(self):
+        # YouTube offers auto-translate to EVERY language, so a manual 'ja' still gets a
+        # translated 'ja' — the real track wins and the translation is dropped (real-data case).
+        data = {
+            "subtitles": {"ja": self._fmts("http://x/ja.json3?fmt=json3", "Japanese")},
+            "automatic_captions": {
+                "ja": self._fmts("http://x/t.json3?fmt=json3&tlang=ja", "Japanese"),
+                "de": self._fmts("http://x/t.json3?fmt=json3&tlang=de", "German"),
+            },
+        }
+        tracks, translations = youfish._caption_tracks(data)
+        self.assertEqual([t["lang"] for t in tracks], ["ja"])
+        self.assertEqual([t["lang"] for t in translations], ["de"])   # 'ja' translation dropped
+
+    def test_translations_sorted_by_name(self):
+        data = {"automatic_captions": {
+            "z": self._fmts("http://x?tlang=z", "Zulu"),
+            "a": self._fmts("http://x?tlang=a", "Afrikaans"),
+        }}
+        _, translations = youfish._caption_tracks(data)
+        self.assertEqual([t["name"] for t in translations], ["Afrikaans", "Zulu"])
+
+
+class ParseJson3(unittest.TestCase):
+    """_parse_json3 turns json3 events into non-overlapping cues and tames rolling ASR."""
+    def test_empty_and_whitespace_events_dropped(self):
+        data = {"events": [
+            {"tStartMs": 0, "dDurationMs": 1000, "segs": [{"utf8": "\n"}]},
+            {"tStartMs": 1000, "dDurationMs": 1000, "segs": [{"utf8": "hi"}]},
+        ]}
+        cues = youfish._parse_json3(data)
+        self.assertEqual([c["text"] for c in cues], ["hi"])
+
+    def test_multiple_segs_joined_and_newlines_collapsed(self):
+        data = {"events": [{"tStartMs": 0, "dDurationMs": 2000,
+                            "segs": [{"utf8": "hello"}, {"utf8": "\nworld"}]}]}
+        cues = youfish._parse_json3(data)
+        self.assertEqual(cues[0]["text"], "hello world")
+
+    def test_overlapping_cues_clamped_to_next_start(self):
+        data = {"events": [
+            {"tStartMs": 0, "dDurationMs": 5000, "segs": [{"utf8": "a"}]},   # would run to 5s
+            {"tStartMs": 2000, "dDurationMs": 2000, "segs": [{"utf8": "b"}]},
+        ]}
+        cues = youfish._parse_json3(data)
+        self.assertAlmostEqual(cues[0]["dur"], 2.0, places=2)               # clamped 5->2s
+        self.assertAlmostEqual(cues[1]["start"], 2.0, places=2)
+
+    def test_non_dict_body_returns_empty_not_crash(self):
+        # A valid-JSON but non-object timedtext body (null / [] / a number) must not raise.
+        for body in (None, [], 42, "text"):
+            self.assertEqual(youfish._parse_json3(body), [])
+
+    def test_repeated_line_merged_not_stacked(self):
+        data = {"events": [
+            {"tStartMs": 0, "dDurationMs": 1000, "segs": [{"utf8": "same"}]},
+            {"tStartMs": 1000, "dDurationMs": 1000, "segs": [{"utf8": "same"}]},
+            {"tStartMs": 2000, "dDurationMs": 1000, "segs": [{"utf8": "next"}]},
+        ]}
+        cues = youfish._parse_json3(data)
+        self.assertEqual([c["text"] for c in cues], ["same", "next"])       # one 'same', extended
+        self.assertAlmostEqual(cues[0]["start"], 0.0, places=2)
+        self.assertAlmostEqual(cues[0]["dur"], 2.0, places=2)               # 0->2s merged
+
+
+class CaptionCuesCache(unittest.TestCase):
+    """caption_cues fetches once, caches on success, and leaves failures retryable."""
+    def setUp(self):
+        youfish._caption_cache.clear()
+        self._open = youfish.urllib.request.urlopen
+        self.calls = 0
+
+    def tearDown(self):
+        youfish.urllib.request.urlopen = self._open
+        youfish._caption_cache.clear()
+
+    def _mock(self, payload, fail=False):
+        import io
+        def fake(req, timeout=0):
+            self.calls += 1
+            if fail:
+                raise youfish.urllib.error.URLError("boom")
+            class R(io.BytesIO):
+                def __enter__(s): return s
+                def __exit__(s, *a): return False
+            return R(json.dumps(payload).encode())
+        youfish.urllib.request.urlopen = fake
+
+    def test_success_is_cached(self):
+        self._mock({"events": [{"tStartMs": 0, "dDurationMs": 1000, "segs": [{"utf8": "hi"}]}]})
+        r1 = youfish.caption_cues("http://x/a")
+        r2 = youfish.caption_cues("http://x/a")
+        self.assertTrue(r1["ok"] and r2["ok"])
+        self.assertEqual(r1["cues"], r2["cues"])
+        self.assertEqual(self.calls, 1)                 # second call served from cache
+
+    def test_failure_not_cached_and_retryable(self):
+        self._mock(None, fail=True)
+        r = youfish.caption_cues("http://x/b")
+        self.assertFalse(r["ok"])
+        self.assertNotIn("http://x/b", youfish._caption_cache)
+        self.assertEqual(self.calls, 1)                 # a later call would try again
+
+    def test_empty_url(self):
+        self.assertEqual(youfish.caption_cues(""), {"ok": False, "cues": []})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

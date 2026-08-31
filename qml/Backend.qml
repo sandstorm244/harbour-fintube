@@ -105,6 +105,7 @@ Item {
     // --- Settings (persisted by Python) ---
     property real playbackRate: 1.0      // remembered playback speed, carried to each new video
     property int historyLimit: 500       // max watch-history entries kept (Settings → Content)
+    property string captionLang: ""      // preferred caption language, carried to each new video ("" = off)
     function loadSettings() {
         py.call("youfish.get_settings", [], function(s) {
             if (!s) return
@@ -123,6 +124,7 @@ Item {
                 backend.eqBands = s.eq_bands
             backend.boostGain = s.boost_gain || 1.0
             backend.historyLimit = s.history_limit || 500
+            backend.captionLang = s.caption_lang || ""
         })
     }
 
@@ -250,6 +252,22 @@ Item {
     function sponsorSegments(videoId, callback) {
         py.call("youfish.sponsor_segments", [videoId], function(res) {
             callback(res && res.ok ? (res.segments || []) : [])
+        })
+    }
+
+    // Fetch + parse one caption track (json3 URL from resolve()'s tracks/translations) into
+    // [{start,dur,text}] seconds. The player caches per (video,lang), so this runs once per pick.
+    function captionCues(url, callback) {
+        py.call("youfish.caption_cues", [url], function(res) {
+            callback(res && res.ok ? (res.cues || []) : [])
+        })
+    }
+
+    // Remember the caption language across videos ("" = off). The player auto-selects a matching
+    // track on the next video if one exists — most people pick one language and stick with it.
+    function setCaptionLang(lang) {
+        py.call("youfish.set_setting", ["caption_lang", lang || ""], function(s) {
+            if (s) backend.captionLang = s.caption_lang || ""
         })
     }
 

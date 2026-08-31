@@ -1647,6 +1647,54 @@ def search_suggestions(query):
         return {"ok": False, "suggestions": []}
 
 
+def _caption_pick_json3(fmts):
+    """From a yt-dlp caption format list, the json3 entry (has per-cue timing we can
+    parse), or None. json3 is preferred over srv1/2/3/vtt/ttml for its clean segments."""
+    for f in fmts or []:
+        if (f.get("ext") or "").lower() == "json3" and f.get("url"):
+            return f
+    return None
+
+
+def _caption_tracks(data):
+    """Split yt-dlp caption data into the short real-track list and the big auto-translate
+    list — returns (tracks, translations).
+
+    tracks: creator-uploaded subtitles (kind="manual") + the ONE genuine auto-generated
+            (ASR) track per language (kind="asr"). Almost always <=6 rows.
+    translations: every machine-translated auto-caption — auto_caption entries whose URL
+            carries &tlang=. This is the ~100-language set, kept separate so the UI can
+            demote it behind an opt-in, filterable list instead of dumping it inline."""
+    tracks, translations = [], []
+    seen = set()
+    for code, fmts in (data.get("subtitles") or {}).items():
+        if code.startswith("live_chat"):
+            continue
+        fmt = _caption_pick_json3(fmts)
+        if not fmt:
+            continue
+        tracks.append({"lang": code, "name": fmt.get("name") or code,
+                       "kind": "manual", "url": fmt["url"]})
+        seen.add(code)
+    for code, fmts in (data.get("automatic_captions") or {}).items():
+        fmt = _caption_pick_json3(fmts)
+        if not fmt:
+            continue
+        name = fmt.get("name") or code
+        if "tlang=" in fmt["url"]:
+            translations.append({"lang": code, "name": name, "url": fmt["url"]})
+        elif code not in seen:
+            # base ASR for this language (no tlang) — a genuine "auto-generated" track
+            tracks.append({"lang": code, "name": name, "kind": "asr", "url": fmt["url"]})
+            seen.add(code)
+    # Drop a machine-translation for any language we already have a real track for (YouTube offers
+    # auto-translate to EVERY language, so e.g. a video with manual Japanese still lists a
+    # translated Japanese — the real track wins, so it doesn't belong in the translate list).
+    translations = [t for t in translations if t["lang"] not in seen]
+    translations.sort(key=lambda t: (t["name"] or t["lang"]).lower())
+    return tracks, translations
+
+
 def resolve(video_id):
     """Resolve a video to playable stream URLs.
 
@@ -1750,6 +1798,9 @@ def resolve(video_id):
             })
         chapters = [{"start": c.get("start_time") or 0, "title": c.get("title") or ""}
                     for c in (data.get("chapters") or []) if c.get("start_time") is not None]
+        # Captions ride along in the same dump — no extra yt-dlp spawn. `tracks` is the short
+        # real list (Off + manual + one ASR/lang); `translations` is the big auto-translate set.
+        tracks, translations = _caption_tracks(data)
         _tlog("resolve TOTAL %.2fs" % (time.time() - _t0))
         return {"ok": True, "info": {
             "title": data.get("title", ""),
@@ -1767,6 +1818,8 @@ def resolve(video_id):
             "video_url": _proxied(video["url"], video_id, video.get("format_id"), http_ua) if video else "",
             "audio_url": _proxied(audio["url"], video_id, audio.get("format_id"), http_ua) if audio else "",
             "qualities": qualities,
+            "tracks": tracks,
+            "translations": translations,
             "http_ua": http_ua,
             "muxed_itag": muxed.get("format_id", "") if muxed else "",
             "muxed_proto": muxed.get("protocol", "") if muxed else "",
@@ -2052,6 +2105,9 @@ _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
                       "portrait_fullscreen": False,
                       # Playback speed remembered across videos (applied to each new one).
                       "playback_rate": 1.0,
+                      # Preferred caption language code, remembered across videos ("" = off).
+                      # On load the player auto-selects a matching track/translation if one exists.
+                      "caption_lang": "",
                       "player_client": "",
                       # yt-dlp update channel: "stable" (default) or "nightly" (YouTube fixes
                       # land days sooner, less tested). Drives ytdlp_update()'s --update-to target.
@@ -2491,6 +2547,69 @@ def sponsor_segments(video_id):
                          "category": s.get("category", "")})
     segs.sort(key=lambda x: x["start"])
     return {"ok": True, "segments": segs}
+
+
+def _parse_json3(data):
+    """json3 caption events -> display cues [{start, dur, text}] (seconds).
+
+    Tames the auto-caption 'rolling' footgun: ASR json3 emits overlapping, partially
+    repeated events (the word-by-word scroll). We drop empty/whitespace events, merge a
+    line that's re-emitted back-to-back (extend it rather than stack a duplicate), then
+    clamp each cue's end to the next cue's start so nothing overlaps on screen. Residual:
+    a genuine append-style scroll still shows the line growing word-by-word — acceptable."""
+    if not isinstance(data, dict):        # a valid-JSON but non-object body (null/[]/42) -> no cues
+        return []
+    rough = []
+    for ev in (data.get("events") or []):
+        text = "".join(s.get("utf8", "") for s in (ev.get("segs") or []))
+        text = " ".join(text.split())   # collapse newlines / runs of whitespace
+        if not text:
+            continue
+        start = (ev.get("tStartMs") or 0) / 1000.0
+        dur = (ev.get("dDurationMs") or 0) / 1000.0
+        rough.append([start, start + dur if dur > 0 else start + 4.0, text])
+    rough.sort(key=lambda c: c[0])
+    merged = []
+    for start, end, text in rough:
+        if merged and merged[-1][2] == text and start <= merged[-1][1] + 0.05:
+            merged[-1][1] = max(merged[-1][1], end)   # same line re-emitted -> extend it
+        else:
+            merged.append([start, end, text])
+    cues = []
+    for i, (start, end, text) in enumerate(merged):
+        if i + 1 < len(merged) and end > merged[i + 1][0]:
+            end = merged[i + 1][0]                     # no two cues on screen at once
+        if end - start < 0.05:
+            continue
+        cues.append({"start": round(start, 3), "dur": round(end - start, 3), "text": text})
+    return cues
+
+
+_caption_cache = {}   # url -> parsed cues. Session-lived; caption URLs are stable per resolve, so
+                      # re-selecting a track (or toggling off->on) is instant and skips the network
+                      # — which also avoids YouTube's timedtext rate limit under quick switching.
+
+
+def caption_cues(url):
+    """Fetch + parse one json3 caption track (URL from resolve()'s tracks/translations)
+    into {"ok", "cues":[{start,dur,text}]}. Public timedtext, no cookies/PO-token needed."""
+    if not url:
+        return {"ok": False, "cues": []}
+    if url in _caption_cache:
+        return {"ok": True, "cues": _caption_cache[url]}
+    _force_ipv4()
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return {"ok": False, "cues": []}   # not cached — a transient 429/timeout stays retryable
+    cues = _parse_json3(data)
+    _caption_cache[url] = cues
+    if len(_caption_cache) > 12:           # cap; evict oldest insertions
+        for k in list(_caption_cache)[:len(_caption_cache) - 12]:
+            del _caption_cache[k]
+    return {"ok": True, "cues": cues}
 
 
 def list_subscriptions():

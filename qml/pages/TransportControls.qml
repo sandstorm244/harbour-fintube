@@ -21,12 +21,54 @@ Item {
     property bool qualityEnabled: true // only when the switchable (GStreamer/DASH) path is live
     property bool qualityMenuOpen: false // parent reads this to hold the controls open
 
+    // Captions. tracks = the short real list (Off + manual + one ASR/lang); translations = the
+    // big auto-translate set, demoted behind the "Translate…" drill-in so the menu never explodes.
+    property var captionTracks: []          // [{lang,name,kind,url}]
+    property var captionTranslations: []    // [{lang,name,url}]
+    property string currentCaptionLang: ""  // lang of the active track ("" = off)
+    property bool captionMenuOpen: false    // parent reads this to hold the controls open
+    property bool captionTranslateOpen: false // menu is on the translate (level-2) list
+    property string captionFilter: ""       // live filter over the translate list
+
     signal seekRequested(int ms)
     signal togglePlay()
     signal cycleSpeed()
     signal qualitySelected(var q)
+    // Chosen caption: a track object {lang,name,url,...}, or null for "Off".
+    signal captionChosen(var track)
     signal toggleFullscreen()
     signal interacted()
+
+    property bool captionAvailable: captionTracks.length > 0 || captionTranslations.length > 0
+    // Only one pill menu open at a time — opening one closes the other. Closing the caption menu
+    // also drops it back to level 1.
+    onCaptionMenuOpenChanged: {
+        if (captionMenuOpen) root.qualityMenuOpen = false
+        else root.captionTranslateOpen = false
+    }
+    onQualityMenuOpenChanged: if (qualityMenuOpen) root.captionMenuOpen = false
+    // Leaving the translate list (back, or the whole menu closing) resets the filter + field so
+    // the search always reopens empty and in sync with the (now-cleared) filter.
+    onCaptionTranslateOpenChanged: if (!captionTranslateOpen) {
+        root.captionFilter = ""
+        captionSearch.text = ""
+    }
+
+    // Translations matching the live filter (by display name or language code). Referenced from
+    // the Repeater's model so it re-runs whenever the filter or the translation set changes.
+    function filteredTranslations() {
+        var f = root.captionFilter.toLowerCase()
+        if (f === "")
+            return root.captionTranslations
+        var out = []
+        for (var i = 0; i < root.captionTranslations.length; i++) {
+            var t = root.captionTranslations[i]
+            if ((t.name || "").toLowerCase().indexOf(f) >= 0
+                    || (t.lang || "").toLowerCase().indexOf(f) >= 0)
+                out.push(t)
+        }
+        return out
+    }
 
     // A Canvas drops its buffer when the app is backgrounded, so the drawn glyphs come back
     // blank. Repaint them when the app returns to the foreground and when the controls are
@@ -150,6 +192,48 @@ Item {
             anchors.leftMargin: -Theme.paddingSmall
             onClicked: {
                 root.qualityMenuOpen = !root.qualityMenuOpen
+                root.interacted()
+            }
+        }
+    }
+
+    // Caption (CC) pill in the TOP-LEFT corner — the opposite side from the speed/quality
+    // cluster so the four pills never crowd one finger. Tapping opens the two-tier menu.
+    Rectangle {
+        id: ccButton
+        visible: root.captionAvailable
+        // Inset EXTRA from the left edge: the top-left corner is SailfishOS's back-gesture hot
+        // corner (Lipstick lights it + can steal the tap), so keep the pill clear of it. Vertical
+        // position unchanged (level with the top-right pills).
+        anchors {
+            left: parent.left; top: parent.top
+            leftMargin: Theme.horizontalPageMargin + Theme.paddingLarge
+            topMargin: Theme.paddingMedium
+        }
+        radius: Theme.paddingSmall
+        color: root.captionMenuOpen ? "#B0000000" : "#80000000"
+        width: ccLabel.width + 2 * Theme.paddingMedium
+        height: ccLabel.height + 2 * Theme.paddingMedium
+        Label {
+            id: ccLabel
+            anchors.centerIn: parent
+            // "CC" when off; "CC · EN" (the base language) when a track is active.
+            text: root.currentCaptionLang.length > 0
+                  ? "CC · " + root.currentCaptionLang.split("-")[0].toUpperCase()
+                  : "CC"
+            font.pixelSize: Theme.fontSizeSmall
+            font.bold: root.currentCaptionLang.length > 0
+            color: root.currentCaptionLang.length > 0 || root.captionMenuOpen
+                   ? Theme.highlightColor : "white"
+        }
+        // Forgiving hit area, but grown AWAY from the top-left corner (down + right, into the
+        // video) — never up/left toward the OS edge-gesture bands, which would re-contest the tap.
+        MouseArea {
+            anchors.fill: parent
+            anchors.bottomMargin: -Theme.paddingSmall
+            anchors.rightMargin: -Theme.paddingSmall
+            onClicked: {
+                root.captionMenuOpen = !root.captionMenuOpen
                 root.interacted()
             }
         }
@@ -361,6 +445,190 @@ Item {
                     }
                 }
                 VerticalScrollDecorator {}
+            }
+        }
+    }
+
+    // Caption menu — two tiers. Level 1: Off + the short real-track list + a "Translate…"
+    // drill-in. Level 2: a filtered search over the ~100 auto-translations, so the list never
+    // explodes. Anchored under the top-LEFT CC pill; declared LAST so it draws over everything.
+    Item {
+        id: captionMenu
+        anchors.fill: parent
+        visible: root.captionMenuOpen
+
+        MouseArea {                                  // scrim: tap outside to dismiss
+            anchors.fill: parent
+            onClicked: { root.captionMenuOpen = false; root.interacted() }
+        }
+        Rectangle { anchors.fill: parent; color: "#40000000" }
+
+        Rectangle {
+            id: captionPanel
+            // ccButton is an uncle (lives under root, not captionMenu), so it can't be an anchor
+            // target — but captionMenu fills root, so plain bindings place the panel under it (and
+            // aligned to its inset-from-the-corner left edge).
+            anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin + Theme.paddingLarge }
+            y: ccButton.y + ccButton.height + Theme.paddingSmall
+            radius: Theme.paddingSmall
+            color: "#E6000000"
+            width: Math.min(root.width - 2 * Theme.horizontalPageMargin, root.width * 0.66)
+            // Level 1 sizes to its content; level 2 (search) fills the room below the pill so the
+            // language list has space to scroll. Both are CAPPED at that room (never taller) — in
+            // portrait the video is a short strip, and any overflow would render below videoBox
+            // where the dismiss MouseArea swallows the taps (a row there couldn't be selected).
+            height: root.captionTranslateOpen
+                    ? root.height - y - Theme.paddingMedium
+                    : Math.min(mainColumn.height + 2 * Theme.paddingSmall,
+                               root.height - y - Theme.paddingMedium)
+            clip: true
+
+            // --- Level 1: Off + real tracks + Translate… ---
+            SilicaFlickable {
+                id: mainView
+                visible: !root.captionTranslateOpen
+                anchors.fill: parent
+                anchors.topMargin: Theme.paddingSmall
+                anchors.bottomMargin: Theme.paddingSmall
+                contentHeight: mainColumn.height
+                Column {
+                    id: mainColumn
+                    width: captionPanel.width
+                    Rectangle {                              // Off
+                        width: parent.width; height: Theme.itemSizeExtraSmall
+                        color: offArea.pressed ? "#33FFFFFF" : "transparent"
+                        Label {
+                            anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                      verticalCenter: parent.verticalCenter }
+                            text: "Off"
+                            font.pixelSize: Theme.fontSizeSmall
+                            font.bold: root.currentCaptionLang === ""
+                            color: root.currentCaptionLang === "" ? Theme.highlightColor : "white"
+                        }
+                        MouseArea {
+                            id: offArea; anchors.fill: parent
+                            onClicked: { root.captionMenuOpen = false
+                                         root.captionChosen(null); root.interacted() }
+                        }
+                    }
+                    Repeater {                               // manual + one ASR per language
+                        model: root.captionTracks
+                        delegate: Rectangle {
+                            width: mainColumn.width; height: Theme.itemSizeExtraSmall
+                            color: trackArea.pressed ? "#33FFFFFF" : "transparent"
+                            Label {
+                                anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                          right: parent.right; rightMargin: Theme.paddingMedium
+                                          verticalCenter: parent.verticalCenter }
+                                truncationMode: TruncationMode.Fade
+                                // Flag the auto-generated track unless its name already says so.
+                                text: modelData.name + (modelData.kind === "asr"
+                                      && modelData.name.toLowerCase().indexOf("auto") < 0
+                                      ? "  ·  auto" : "")
+                                font.pixelSize: Theme.fontSizeSmall
+                                font.bold: modelData.lang === root.currentCaptionLang
+                                color: modelData.lang === root.currentCaptionLang
+                                       ? Theme.highlightColor : "white"
+                            }
+                            MouseArea {
+                                id: trackArea; anchors.fill: parent
+                                onClicked: { root.captionMenuOpen = false
+                                             root.captionChosen(modelData); root.interacted() }
+                            }
+                        }
+                    }
+                    Rectangle {                              // Translate… drill-in
+                        visible: root.captionTranslations.length > 0
+                        width: mainColumn.width; height: Theme.itemSizeExtraSmall
+                        color: translateArea.pressed ? "#33FFFFFF" : "transparent"
+                        Rectangle {                          // hairline divider above it
+                            anchors { left: parent.left; right: parent.right; top: parent.top }
+                            height: 1; color: "#22FFFFFF"
+                        }
+                        Label {
+                            anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                      verticalCenter: parent.verticalCenter }
+                            text: "Translate…"
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: "white"
+                        }
+                        Label {
+                            anchors { right: parent.right; rightMargin: Theme.horizontalPageMargin
+                                      verticalCenter: parent.verticalCenter }
+                            text: "›"; font.pixelSize: Theme.fontSizeLarge; color: "#99FFFFFF"
+                        }
+                        MouseArea {
+                            id: translateArea; anchors.fill: parent
+                            onClicked: { root.captionTranslateOpen = true; root.interacted() }
+                        }
+                    }
+                }
+                VerticalScrollDecorator {}
+            }
+
+            // --- Level 2: filtered translation search ---
+            Item {
+                id: translateView
+                visible: root.captionTranslateOpen
+                anchors.fill: parent
+
+                Rectangle {                                  // back + title
+                    id: tHeader
+                    anchors { left: parent.left; right: parent.right; top: parent.top }
+                    height: Theme.itemSizeExtraSmall
+                    color: backArea.pressed ? "#33FFFFFF" : "transparent"
+                    Label {
+                        anchors { left: parent.left; leftMargin: Theme.paddingMedium
+                                  verticalCenter: parent.verticalCenter }
+                        text: "‹  Translate to"
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: "white"
+                    }
+                    MouseArea {
+                        id: backArea; anchors.fill: parent
+                        onClicked: { root.captionTranslateOpen = false; root.interacted() }
+                    }
+                }
+                SearchField {
+                    id: captionSearch
+                    anchors { left: parent.left; right: parent.right; top: tHeader.bottom }
+                    placeholderText: "Language"
+                    onTextChanged: root.captionFilter = text
+                }
+                SilicaFlickable {
+                    anchors { left: parent.left; right: parent.right
+                              top: captionSearch.bottom; bottom: parent.bottom }
+                    clip: true
+                    contentHeight: translateCol.height
+                    Column {
+                        id: translateCol
+                        width: parent.width
+                        Repeater {
+                            model: root.filteredTranslations()
+                            delegate: Rectangle {
+                                width: translateCol.width; height: Theme.itemSizeExtraSmall
+                                color: trArea.pressed ? "#33FFFFFF" : "transparent"
+                                Label {
+                                    anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                              right: parent.right; rightMargin: Theme.paddingMedium
+                                              verticalCenter: parent.verticalCenter }
+                                    truncationMode: TruncationMode.Fade
+                                    text: modelData.name
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    font.bold: modelData.lang === root.currentCaptionLang
+                                    color: modelData.lang === root.currentCaptionLang
+                                           ? Theme.highlightColor : "white"
+                                }
+                                MouseArea {
+                                    id: trArea; anchors.fill: parent
+                                    onClicked: { root.captionMenuOpen = false
+                                                 root.captionChosen(modelData); root.interacted() }
+                                }
+                            }
+                        }
+                    }
+                    VerticalScrollDecorator {}
+                }
             }
         }
     }

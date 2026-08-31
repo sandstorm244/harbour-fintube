@@ -26,6 +26,14 @@ Page {
     property var sponsorSegments: []  // SponsorBlock [{start,end,category}] in seconds
     property string skipHint: ""      // transient "Skipped …" overlay text
 
+    // Captions. captionCues = [{start,dur,text}] for the active track; currentCaption = the line
+    // showing right now, recomputed from positionMs on each tick (same loop SponsorBlock rides).
+    property var captionCues: []
+    property string captionLang: ""   // active track lang for THIS video ("" = off)
+    property string currentCaption: ""
+    property int captionIndex: 0      // cached scan cursor into captionCues
+    property real captionLastT: -1    // last sampled time (s); a drop signals a backward seek
+
     // Double-tap-to-seek: tap a side twice to jump ∓10s, keep tapping to stack.
     property bool seekActive: false
     property string seekZone: ""      // "left" | "right"
@@ -159,6 +167,79 @@ Page {
         gplayer.play()
     }
 
+    // Pick a caption track (or null = Off). `persist` records it as the cross-video preference;
+    // the auto-select on load passes false so it doesn't re-write the same value every video.
+    function selectCaption(track, persist) {
+        page.captionCues = []
+        page.currentCaption = ""
+        page.captionIndex = 0
+        page.captionLastT = -1
+        if (!track || !track.url) {
+            page.captionLang = ""
+            transport.currentCaptionLang = ""
+            if (persist) app.backend.setCaptionLang("")
+            return
+        }
+        page.captionLang = track.lang
+        transport.currentCaptionLang = track.lang
+        if (persist) app.backend.setCaptionLang(track.lang)
+        var want = track.lang
+        app.backend.captionCues(track.url, function(cues) {
+            if (page.captionLang !== want)      // user switched again before this returned
+                return
+            page.captionCues = cues || []
+            page.captionIndex = 0
+            page.captionLastT = -1
+            page.updateCaption()
+        })
+    }
+
+    // Base language code — "pt" from "pt-BR", "es" from "es-419", "en" from "en-orig". Used so a
+    // remembered language still matches the same language labelled at a different granularity.
+    function baseLang(code) {
+        return (code || "").split("-")[0].toLowerCase()
+    }
+
+    // If a caption language is remembered, auto-enable a matching track for the new video —
+    // real tracks first, then the auto-translations. Most people pick one language and keep it.
+    function autoSelectCaption(tracks, translations) {
+        var want = app.backend.captionLang
+        if (!want || want.length === 0)
+            return
+        var i
+        // Exact code match first (real tracks, then translations).
+        for (i = 0; i < tracks.length; i++)
+            if (tracks[i].lang === want) { page.selectCaption(tracks[i], false); return }
+        for (i = 0; i < translations.length; i++)
+            if (translations[i].lang === want) { page.selectCaption(translations[i], false); return }
+        // Fallback: same base language at a different granularity (manual "pt-BR" preference vs an
+        // ASR "pt" track, "en" vs "en-orig", "es-419" vs "es"). The preference is language-level,
+        // so a base match still counts — and persist stays false, so the exact pref is untouched.
+        var base = page.baseLang(want)
+        for (i = 0; i < tracks.length; i++)
+            if (page.baseLang(tracks[i].lang) === base) { page.selectCaption(tracks[i], false); return }
+        for (i = 0; i < translations.length; i++)
+            if (page.baseLang(translations[i].lang) === base) { page.selectCaption(translations[i], false); return }
+    }
+
+    // Recompute the on-screen caption for the current position. Cues are time-sorted, so we keep
+    // a cursor and only advance it; a backward jump in time resets the scan.
+    function updateCaption() {
+        var cues = page.captionCues
+        if (cues.length === 0) {
+            if (page.currentCaption !== "") page.currentCaption = ""
+            return
+        }
+        var t = page.positionMs / 1000
+        var i = page.captionIndex
+        if (i < 0 || t < page.captionLastT) i = 0        // first run or seeked backward → rescan
+        page.captionLastT = t
+        while (i < cues.length && t >= cues[i].start + cues[i].dur) i++
+        page.captionIndex = i
+        var txt = (i < cues.length && t >= cues[i].start) ? cues[i].text : ""
+        if (page.currentCaption !== txt) page.currentCaption = txt
+    }
+
     // Start a background download of this video's audio or muxed video.
     function startDownload(kind) {
         page.downloadKind = kind
@@ -215,6 +296,7 @@ Page {
     // stalled. Bounded, and the budget resets once playback is healthy again (see below).
     function recoverPlayback(message) {
         transport.qualityMenuOpen = false   // don't let an open menu outlive the reload/re-resolve
+        transport.captionMenuOpen = false
         // Backgrounded/locked: the network (and any reload) will just fail again — and the
         // stall was almost certainly caused by the blank itself (WiFi power-save / a frozen
         // fetch). Defer the reload to resume, and don't spend the retry budget on it.
@@ -431,6 +513,12 @@ Page {
             }
             if (page.currentQuality.length === 0 && page.qualities.length > 0)
                 page.currentQuality = page.qualities[0].label
+            // Captions: hand the two lists to the overlay, clear any prior video's track, then
+            // auto-enable the remembered language if this video offers it.
+            transport.captionTracks = info.tracks || []
+            transport.captionTranslations = info.translations || []
+            page.selectCaption(null, false)
+            page.autoSelectCaption(transport.captionTracks, transport.captionTranslations)
             if (page.channelUrl.length > 0 || page.channelId.length > 0)
                 app.backend.fetchChannelAvatar(page.channelUrl || page.channelId,
                     function(res) { if (res && res.thumbnail) page.channelAvatar = res.thumbnail })
@@ -474,6 +562,7 @@ Page {
             page.resolving = false
             page.errorText = message
             transport.qualityMenuOpen = false
+            transport.captionMenuOpen = false
         }
     }
 
@@ -497,7 +586,10 @@ Page {
 
     // The quality menu lives inside the controls overlay, so if the controls hide for any
     // reason, close the menu with them — otherwise the open flag leaves an invisible, dead menu.
-    onControlsShownChanged: if (!page.controlsShown) transport.qualityMenuOpen = false
+    onControlsShownChanged: if (!page.controlsShown) {
+        transport.qualityMenuOpen = false
+        transport.captionMenuOpen = false
+    }
 
     // Position ticks (500ms) drive the SponsorBlock auto-skip check. They also clear the
     // auto-recovery budget: once we've played a few seconds past the last stall, the stream
@@ -506,6 +598,7 @@ Page {
         if (page.playRetries > 0 && page.positionMs > page.recoverAtMs)
             page.playRetries = 0
         page.checkSponsorSkip()
+        page.updateCaption()
     }
 
     Timer {
@@ -579,7 +672,8 @@ Page {
         interval: 250
         // Don't let a single-tap toggle (from a fall-through tap on empty video) hide the
         // controls while the quality menu is open — that would strand the menu invisible.
-        onTriggered: if (!transport.qualityMenuOpen) page.controlsShown = !page.controlsShown
+        onTriggered: if (!transport.qualityMenuOpen && !transport.captionMenuOpen)
+                         page.controlsShown = !page.controlsShown
     }
     // Fire the accumulated seek once the taps settle (avoids a burst of flush-seeks).
     Timer {
@@ -711,6 +805,38 @@ Page {
             }
         }
 
+        // Caption band — the active subtitle line, centred over the lower video. A sibling of
+        // the controls (not a child) so it stays up while the controls auto-hide. Rides above the
+        // scrubber when the controls are showing, drops lower when they're not. Declared BEFORE
+        // the controls so an open pill menu / scrim draws over it.
+        Item {
+            anchors.fill: parent
+            visible: page.currentCaption.length > 0 && page.errorText.length === 0
+            Rectangle {
+                anchors {
+                    horizontalCenter: parent.horizontalCenter
+                    bottom: parent.bottom
+                    bottomMargin: page.controlsShown ? Theme.itemSizeMedium : Theme.paddingLarge
+                }
+                width: Math.min(captionText.implicitWidth + 2 * Theme.paddingMedium,
+                                parent.width - 2 * Theme.paddingLarge)
+                height: captionText.height + Theme.paddingSmall
+                radius: Theme.paddingSmall
+                color: "#B0000000"
+                Label {
+                    id: captionText
+                    anchors.centerIn: parent
+                    width: parent.width - 2 * Theme.paddingMedium
+                    text: page.currentCaption
+                    wrapMode: Text.Wrap
+                    horizontalAlignment: Text.AlignHCenter
+                    color: "white"
+                    font.pixelSize: (page.landscape || page.portraitFull)
+                                    ? Theme.fontSizeMedium : Theme.fontSizeSmall
+                }
+            }
+        }
+
         // Controls overlay the whole video (centred play/pause + bottom scrubber); tap
         // the video to toggle, and they auto-hide while playing (YouTube-style).
         TransportControls {
@@ -735,6 +861,7 @@ Page {
             onTogglePlay: page.togglePlay()
             onCycleSpeed: page.cycleSpeed()
             onQualitySelected: page.switchQuality(q)
+            onCaptionChosen: page.selectCaption(track, true)
             onToggleFullscreen: page.toggleFullscreen()
             onInteracted: page.controlsShown = true
         }
@@ -774,7 +901,8 @@ Page {
     // paused video keeps its controls up; and never while the quality menu is open).
     Timer {
         interval: 3500
-        running: page.controlsShown && page.isPlaying && !transport.qualityMenuOpen
+        running: page.controlsShown && page.isPlaying
+                 && !transport.qualityMenuOpen && !transport.captionMenuOpen
         onTriggered: page.controlsShown = false
     }
 
@@ -1113,15 +1241,18 @@ Page {
     }
 
     // The overlay's own scrim only covers the video surface, so in portrait a tap in the info
-    // area below the video wouldn't dismiss the quality menu. This catches those taps (and
+    // area below the video wouldn't dismiss an open pill menu. This catches those taps (and
     // swallows them, so they don't also trigger the control beneath). Declared last so it sits
-    // above the info flickable; disabled when the menu is closed, so taps pass through normally.
+    // above the info flickable; disabled when no menu is open, so taps pass through normally.
     // Zero-height in landscape/portraitFull (videoBox fills the page), so it's inert there.
     MouseArea {
         anchors { left: parent.left; right: parent.right
                   top: videoBox.bottom; bottom: parent.bottom }
-        enabled: transport.qualityMenuOpen
-        onClicked: transport.qualityMenuOpen = false
+        enabled: transport.qualityMenuOpen || transport.captionMenuOpen
+        onClicked: {
+            transport.qualityMenuOpen = false
+            transport.captionMenuOpen = false
+        }
     }
 
     Component.onDestruction: {
