@@ -24,12 +24,14 @@ Item {
     property string denoStatusMsg: ""
     property var subscriptions: []
     property bool hideShorts: true       // filter Shorts out of results (persisted by Python)
+    property bool hideWatched: false     // hide watched videos from the feed + channel lists
     property bool sponsorBlock: true     // auto-skip SponsorBlock segments during playback
     property string playerClient: ""     // yt-dlp youtube player_client ("" = auto)
     property string ytdlpChannel: "stable" // yt-dlp update channel: "stable" | "nightly"
     property string defaultQuality: "720" // baseline video height cap ("1080"/"720"/…/"0"=best)
     property bool hwDecode: false        // hardware video decode (droidvdec); experimental
     property bool keepDisplayOn: false   // hold the display awake while a video plays
+    property bool portraitFullscreen: false  // fullscreen without rotating to landscape
     property bool eqEnabled: false       // 10-band equalizer on/off
     property var  eqBands: [0,0,0,0,0,0,0,0,0,0]  // per-band gain (dB), applied by the C++ player
     property real boostGain: 1.0         // volume boost (linear, 1.0 = none) above system max
@@ -101,11 +103,15 @@ Item {
     }
 
     // --- Settings (persisted by Python) ---
+    property real playbackRate: 1.0      // remembered playback speed, carried to each new video
     function loadSettings() {
         py.call("youfish.get_settings", [], function(s) {
             if (!s) return
             backend.hideShorts = !!s.hide_shorts
+            backend.hideWatched = !!s.hide_watched
+            backend.portraitFullscreen = !!s.portrait_fullscreen
             backend.sponsorBlock = !!s.sponsorblock
+            backend.playbackRate = s.playback_rate || 1.0
             backend.playerClient = s.player_client || ""
             backend.ytdlpChannel = s.ytdlp_channel || "stable"
             backend.defaultQuality = s.default_quality || "720"
@@ -163,6 +169,25 @@ Item {
         })
     }
 
+    function setHideWatched(on) {
+        py.call("youfish.set_setting", ["hide_watched", !!on], function(s) {
+            if (s) backend.hideWatched = !!s.hide_watched
+        })
+    }
+
+    function setPortraitFullscreen(on) {
+        py.call("youfish.set_setting", ["portrait_fullscreen", !!on], function(s) {
+            if (s) backend.portraitFullscreen = !!s.portrait_fullscreen
+        })
+    }
+
+    // Persist the speed chosen in the player so the next video keeps it.
+    function setPlaybackRate(r) {
+        py.call("youfish.set_setting", ["playback_rate", r], function(s) {
+            if (s) backend.playbackRate = s.playback_rate || 1.0
+        })
+    }
+
     function setSponsorBlock(on) {
         py.call("youfish.set_setting", ["sponsorblock", !!on], function(s) {
             if (s) backend.sponsorBlock = !!s.sponsorblock
@@ -191,6 +216,14 @@ Item {
         if (!videoId) return
         py.call("youfish.record_watch",
                 [videoId, position || 0, duration || 0, title || "", channel || ""],
+                function() { backend.loadWatchState() })
+    }
+    // Mark a video watched / unwatched from a long-press menu (no playback). Writes the same
+    // store, then refreshes watchMap so the thumbnail's WATCHED tag + hide-watched update at once.
+    function setWatched(videoId, watched, title, channel) {
+        if (!videoId) return
+        py.call("youfish.set_watched",
+                [videoId, !!watched, title || "", channel || ""],
                 function() { backend.loadWatchState() })
     }
     function loadWatchState() {

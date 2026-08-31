@@ -232,8 +232,16 @@ Page {
             property real thumbH: Math.round(thumbW * 9 / 16)
             contentHeight: thumbH + 2 * Theme.paddingSmall
 
-            // Long-press → add to a playlist, or download this video (audio or muxed).
+            // Long-press → mark watched, add to a playlist, or download this video (audio or muxed).
             menu: ContextMenu {
+                MenuItem {
+                    text: (app.backend.watchMap && app.backend.watchMap[model.id]
+                           && app.backend.watchMap[model.id].w) ? "Mark as unwatched" : "Mark as watched"
+                    onClicked: {
+                        var e = app.backend.watchMap ? app.backend.watchMap[model.id] : undefined
+                        app.backend.setWatched(model.id, !(e && e.w), model.title, model.uploader || "")
+                    }
+                }
                 MenuItem {
                     text: "Add to playlist"
                     onClicked: pageStack.push(Qt.resolvedUrl("AddToPlaylistPage.qml"),
@@ -275,7 +283,7 @@ Page {
                     asynchronous: true
                     source: model.thumbnail || ""
                 }
-                WatchOverlay { anchors.fill: parent; videoId: model.id || "" }
+                WatchOverlay { anchors.fill: parent; videoId: model.id || ""; live: !!model.live }
                 Rectangle {
                     visible: model.duration > 0
                     anchors {

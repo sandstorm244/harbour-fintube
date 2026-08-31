@@ -2,11 +2,13 @@ import QtQuick 2.0
 import Sailfish.Silica 1.0
 
 // Drop inside a video thumbnail (anchors.fill: parent). Reads Backend.watchMap for `videoId`
-// and draws the YouTube-style watch-progress bar along the bottom edge + a WATCHED badge in
-// the corner. Purely decorative (no MouseArea), so taps pass through to the delegate below.
+// and draws the YouTube-style watch-progress bar along the bottom edge, a WATCHED badge in the
+// corner, and (when `live` is set) a red LIVE badge. Purely decorative (no MouseArea), so taps
+// pass through to the delegate below.
 Item {
     id: overlay
     property string videoId: ""
+    property bool live: false          // a running livestream → red LIVE badge (bottom-left)
     // Look the entry up in the shared map; rebinds whenever watchMap is reassigned (after a save).
     property var entry: (videoId && app.backend.watchMap) ? app.backend.watchMap[videoId] : undefined
     property real fraction: entry ? Math.max(0, Math.min(1, entry.f || 0)) : 0
@@ -22,6 +24,24 @@ Item {
             anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
             width: Math.round(parent.width * overlay.fraction)
             color: "#ff0000"                      // classic watch-progress red
+        }
+    }
+
+    // LIVE badge, bottom-left — a running livestream (red, like YouTube's).
+    Rectangle {
+        visible: overlay.live
+        anchors { bottom: parent.bottom; left: parent.left; margins: Theme.paddingSmall / 2 }
+        radius: 3
+        color: "#ff0000"
+        width: liveLabel.width + Theme.paddingSmall
+        height: liveLabel.height + Theme.paddingSmall / 2
+        Label {
+            id: liveLabel
+            anchors.centerIn: parent
+            text: "LIVE"
+            font.pixelSize: Theme.fontSizeExtraSmall
+            font.bold: true
+            color: "white"
         }
     }
 

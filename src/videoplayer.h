@@ -113,6 +113,7 @@ private:
     qint64 m_position = 0;
     qint64 m_duration = 0;
     qreal m_rate = 1.0;
+    bool m_rateEngaged = false;   // non-default start speed engaged once, during preroll
     bool m_videoActive = true;
     bool m_muxed = false;   // single-source mode: m_videoBin carries both video + audio
     bool m_hwDecode = false;// effective mode this build (m_hwDecodeReq, reset each buildPipeline)

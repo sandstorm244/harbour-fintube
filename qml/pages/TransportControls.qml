@@ -16,10 +16,15 @@ Item {
     property var chapters: []          // [{start,title}] seconds — ticks on the scrubber
     property string currentChapter: ""
     property bool fullscreen: false    // true when the page is in forced-landscape mode
+    property var qualities: []         // [{itag,label,video_url}] highest-first
+    property string currentQuality: "" // label of the track playing now
+    property bool qualityEnabled: true // only when the switchable (GStreamer/DASH) path is live
+    property bool qualityMenuOpen: false // parent reads this to hold the controls open
 
     signal seekRequested(int ms)
     signal togglePlay()
     signal cycleSpeed()
+    signal qualitySelected(var q)
     signal toggleFullscreen()
     signal interacted()
 
@@ -93,20 +98,60 @@ Item {
         }
         radius: Theme.paddingSmall
         color: "#80000000"
-        width: speedLabel.width + 2 * Theme.paddingSmall
-        height: speedLabel.height + Theme.paddingSmall
+        width: speedLabel.width + 2 * Theme.paddingMedium
+        height: speedLabel.height + 2 * Theme.paddingMedium
         Label {
             id: speedLabel
             anchors.centerIn: parent
             text: (root.playbackRate === Math.floor(root.playbackRate)
                    ? root.playbackRate.toFixed(0) : ("" + root.playbackRate)) + "×"
-            font.pixelSize: Theme.fontSizeExtraSmall
+            font.pixelSize: Theme.fontSizeSmall
             font.bold: root.playbackRate !== 1.0
             color: root.playbackRate !== 1.0 ? Theme.highlightColor : "white"
         }
+        // Forgiving hit area: expand outward (up/down + the outer, right edge) but NOT toward
+        // the quality pill, so the two adjacent targets never contest the gap between them.
         MouseArea {
             anchors.fill: parent
+            anchors.topMargin: -Theme.paddingSmall
+            anchors.bottomMargin: -Theme.paddingSmall
+            anchors.rightMargin: -Theme.paddingSmall
             onClicked: { root.cycleSpeed(); root.interacted() }
+        }
+    }
+
+    // Quality pill — sits just LEFT of the speed pill. Unlike speed (a quick cycle), tapping
+    // this opens a small overlay menu of resolutions, so picking 1080p is one deliberate tap
+    // rather than cycling through every step.
+    Rectangle {
+        id: qualityButton
+        visible: root.qualityEnabled && root.qualities.length > 0
+        anchors {
+            right: speedButton.left; rightMargin: Theme.paddingSmall
+            top: speedButton.top
+        }
+        radius: Theme.paddingSmall
+        color: root.qualityMenuOpen ? "#B0000000" : "#80000000"
+        width: qualityLabel.width + 2 * Theme.paddingMedium
+        height: qualityLabel.height + 2 * Theme.paddingMedium
+        Label {
+            id: qualityLabel
+            anchors.centerIn: parent
+            text: root.currentQuality.length > 0 ? root.currentQuality : "Auto"
+            font.pixelSize: Theme.fontSizeSmall
+            color: root.qualityMenuOpen ? Theme.highlightColor : "white"
+        }
+        // Forgiving hit area: expand outward (up/down + the outer, left edge) but NOT toward
+        // the speed pill, so the two adjacent targets never contest the gap between them.
+        MouseArea {
+            anchors.fill: parent
+            anchors.topMargin: -Theme.paddingSmall
+            anchors.bottomMargin: -Theme.paddingSmall
+            anchors.leftMargin: -Theme.paddingSmall
+            onClicked: {
+                root.qualityMenuOpen = !root.qualityMenuOpen
+                root.interacted()
+            }
         }
     }
 
@@ -193,9 +238,13 @@ Item {
                     ctx.stroke()
                 }
             }
+            // Grow the tap target up and to the sides, but NOT down — the seek slider sits just
+            // below, and a hit area that reached into it would steal taps meant for the scrubber.
             MouseArea {
                 anchors.fill: parent
-                anchors.margins: -Theme.paddingSmall
+                anchors.topMargin: -Theme.paddingMedium
+                anchors.leftMargin: -Theme.paddingMedium
+                anchors.rightMargin: -Theme.paddingSmall
                 onClicked: { root.toggleFullscreen(); root.interacted() }
             }
         }
@@ -235,6 +284,84 @@ Item {
         Connections {
             target: root
             onPositionMsChanged: if (!seekSlider.down) seekSlider.value = root.positionMs
+        }
+    }
+
+    // Quality menu — a compact overlay list under the top-right pills, present only while
+    // open. Declared LAST so it draws over the scrubber and buttons; a full-surface scrim
+    // dims the video and swallows the outside tap that closes it (so that same tap does not
+    // also toggle the controls beneath).
+    Item {
+        id: qualityMenu
+        anchors.fill: parent
+        visible: root.qualityMenuOpen
+
+        MouseArea {                                  // scrim: tap outside to dismiss
+            anchors.fill: parent
+            onClicked: { root.qualityMenuOpen = false; root.interacted() }
+        }
+        Rectangle { anchors.fill: parent; color: "#40000000" }   // subtle dim behind the list
+
+        Rectangle {
+            id: qualityPanel
+            // speedButton lives under root, not this panel's parent (qualityMenu), so it can't
+            // be an anchor *target* here — QML only anchors to a parent/sibling. qualityMenu
+            // fills root, so speedButton's geometry is in the same coordinate space: drop the
+            // panel just below the pills with a plain y binding (which may reference any item).
+            anchors { right: parent.right; rightMargin: Theme.horizontalPageMargin }
+            y: speedButton.y + speedButton.height + Theme.paddingSmall
+            radius: Theme.paddingSmall
+            color: "#E6000000"
+            width: qualityColumn.width + 2 * Theme.paddingMedium
+            // Cap to the room below the pills: in portrait the video is only a strip, so a
+            // long resolution list scrolls inside the panel instead of spilling over the
+            // description beneath it. In fullscreen there's ample height and it never scrolls.
+            height: Math.min(qualityColumn.height + 2 * Theme.paddingSmall,
+                             root.height - y - Theme.paddingMedium)
+            clip: true
+            SilicaFlickable {
+                anchors.fill: parent
+                anchors.topMargin: Theme.paddingSmall
+                anchors.bottomMargin: Theme.paddingSmall
+                contentHeight: qualityColumn.height
+                Column {
+                    id: qualityColumn
+                    x: Theme.paddingMedium        // inset both sides (panel adds 2×paddingMedium)
+                    Repeater {
+                        model: root.qualities
+                        delegate: Rectangle {
+                            // min width keeps the short labels (144p) as wide as the long ones,
+                            // so the rows read as a tidy column rather than a ragged one.
+                            width: Math.max(rowLabel.width + 2 * Theme.paddingMedium,
+                                            Theme.itemSizeExtraSmall * 1.6)
+                            height: Theme.itemSizeExtraSmall
+                            color: rowArea.pressed ? "#33FFFFFF" : "transparent"
+                            Label {
+                                id: rowLabel
+                                anchors {
+                                    left: parent.left; leftMargin: Theme.paddingMedium
+                                    verticalCenter: parent.verticalCenter
+                                }
+                                text: modelData.label
+                                font.pixelSize: Theme.fontSizeSmall
+                                font.bold: modelData.label === root.currentQuality
+                                color: modelData.label === root.currentQuality
+                                       ? Theme.highlightColor : "white"
+                            }
+                            MouseArea {
+                                id: rowArea
+                                anchors.fill: parent
+                                onClicked: {
+                                    root.qualityMenuOpen = false
+                                    root.qualitySelected(modelData)
+                                    root.interacted()
+                                }
+                            }
+                        }
+                    }
+                }
+                VerticalScrollDecorator {}
+            }
         }
     }
 

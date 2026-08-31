@@ -47,6 +47,18 @@ Page {
             onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
                 { videoId: model.id, title: model.title })
 
+            // Long-press → toggle watched (these rows ARE the watch store).
+            menu: ContextMenu {
+                MenuItem {
+                    text: (app.backend.watchMap && app.backend.watchMap[model.id]
+                           && app.backend.watchMap[model.id].w) ? "Mark as unwatched" : "Mark as watched"
+                    onClicked: {
+                        var e = app.backend.watchMap ? app.backend.watchMap[model.id] : undefined
+                        app.backend.setWatched(model.id, !(e && e.w), model.title, model.channel || "")
+                    }
+                }
+            }
+
             Rectangle {
                 id: vThumb
                 anchors {

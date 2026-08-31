@@ -1,6 +1,7 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
 import QtMultimedia 5.6
+import Sailfish.Share 1.0
 import FinTube 1.0
 
 Page {
@@ -8,6 +9,7 @@ Page {
     allowedOrientations: Orientation.All
 
     property string videoId: ""
+    readonly property string shareUrl: "https://www.youtube.com/watch?v=" + page.videoId
     property string title: ""
     property bool fromQueue: false    // launched from a playlist → auto-advance to the next on end
     property string channel: ""
@@ -37,7 +39,7 @@ Page {
     property string downloadKind: ""
     property string downloadHint: ""  // transient "Downloaded"/"Failed" text
 
-    property real playbackRate: 1.0
+    property real playbackRate: app.backend.playbackRate || 1.0   // remembered across videos
     property var speedSteps: [1.0, 1.25, 1.5, 2.0, 0.75]
     property var chapters: []         // [{start,title}] in seconds, from yt-dlp
     property string currentChapter: {
@@ -72,6 +74,7 @@ Page {
     property bool resolving: true
     property string errorText: ""
     property bool useGst: false       // true = our GStreamer player, false = MediaPlayer (HLS)
+    property bool isLive: false        // a running livestream (drives the LIVE badge)
 
     // Auto-recovery from a mid-playback stream failure (usually a googlevideo 403 the proxy
     // couldn't refresh in place). Bounded so a genuinely dead video surfaces the error.
@@ -84,6 +87,7 @@ Page {
     // become a tap-to-show overlay.
     property bool landscape: page.orientation === Orientation.Landscape
                              || page.orientation === Orientation.LandscapeInverted
+    property bool portraitFull: false   // fill-screen video in portrait (no rotation), if enabled
     property bool controlsShown: true
 
     // The page draws edge-to-edge under the camera cutout (FullScreen) so landscape is immersive and
@@ -210,6 +214,7 @@ Page {
     // fix it. Do that automatically: re-resolve for fresh URLs and reload, resuming where we
     // stalled. Bounded, and the budget resets once playback is healthy again (see below).
     function recoverPlayback(message) {
+        transport.qualityMenuOpen = false   // don't let an open menu outlive the reload/re-resolve
         // Backgrounded/locked: the network (and any reload) will just fail again — and the
         // stall was almost certainly caused by the blank itself (WiFi power-save / a frozen
         // fetch). Defer the reload to resume, and don't spend the retry budget on it.
@@ -269,6 +274,22 @@ Page {
         var idx = page.speedSteps.indexOf(page.playbackRate)
         page.playbackRate = page.speedSteps[(idx + 1) % page.speedSteps.length]
         gplayer.rate = page.playbackRate
+        app.backend.setPlaybackRate(page.playbackRate)   // remember it for the next video
+    }
+
+    // Video-level quick actions (the action bar under the channel line). "share" fires the
+    // native SFOS share sheet via ShareAction (see shareLink below).
+    function videoAction(act) {
+        if (act === "open")
+            Qt.openUrlExternally(page.shareUrl)
+        else if (act === "copy") {
+            Clipboard.text = page.shareUrl
+            if (typeof app !== "undefined" && app.showToast) app.showToast("Link copied")
+        } else if (act === "share") {
+            shareLink.resources = [{ "type": "text/x-url",
+                                     "linkTitle": page.title, "status": page.shareUrl }]
+            shareLink.trigger()
+        }
     }
 
     // YouTube-style fullscreen: force landscape (and force back to portrait when landscape),
@@ -276,7 +297,14 @@ Page {
     // LandscapeInverted) keeps it landscape-locked but lets the phone flip 180° between the two
     // landscape directions, so "down" can be on either side rather than pinned to one.
     function toggleFullscreen() {
-        page.allowedOrientations = page.landscape ? Orientation.Portrait : Orientation.LandscapeMask
+        if (page.portraitFull)
+            page.portraitFull = false                              // exit portrait fullscreen
+        else if (page.landscape)
+            page.allowedOrientations = Orientation.Portrait        // exit landscape immersive
+        else if (app.backend.portraitFullscreen)
+            page.portraitFull = true                               // fill the screen, stay portrait
+        else
+            page.allowedOrientations = Orientation.LandscapeMask   // classic: rotate to landscape
     }
 
     // SponsorBlock: if the play position lands inside a skip segment, jump past it.
@@ -311,6 +339,8 @@ Page {
         // Route the equalizer / volume-boost settings to this page's GStreamer player.
         app.activePlayer = gplayer
         app.applyAudioFx()
+        // NB: the remembered speed is primed on gplayer before play() (in onResolved) and engaged
+        // by the C++ player during preroll — nothing rate-related happens here.
     }
 
     Connections {
@@ -377,6 +407,12 @@ Page {
         target: page.resolving ? app.backend : null
         onResolved: {
             page.resolving = false
+            page.isLive = !!info.is_live
+            // Prime the remembered speed while the pipeline doesn't exist yet (setRate is a no-op
+            // without a pipeline — no seek). The C++ player then engages it during preroll, before
+            // the first frame, so both the audio and video branches take it together — no flush,
+            // no dark flash, no audio/video rate split.
+            gplayer.rate = page.playbackRate
             page.channel = info.uploader || ""
             page.channelId = info.channel_id || ""
             page.channelUrl = info.channel_url || ""
@@ -437,14 +473,15 @@ Page {
         onResolveError: {
             page.resolving = false
             page.errorText = message
+            transport.qualityMenuOpen = false
         }
     }
 
     Connections {
         target: gplayer
         onErrorOccurred: page.recoverPlayback(message)
-        // Duration becoming known means the rebuilt pipeline has parsed the moov and can
-        // seek — the moment to restore position after a quality switch.
+        // Duration becoming known means the pipeline has prerolled and can seek — the moment to
+        // restore position after a quality switch. (Speed is handled in the C++ player at preroll.)
         onDurationChanged: if (page.pendingSeekMs >= 0 && gplayer.duration > 0)
                                resumeSeekTimer.restart()
     }
@@ -457,6 +494,10 @@ Page {
         if (nowPlayingConn.target)          // keep the cover's play/pause icon in sync
             app.nowPlaying.playing = page.isPlaying
     }
+
+    // The quality menu lives inside the controls overlay, so if the controls hide for any
+    // reason, close the menu with them — otherwise the open flag leaves an invisible, dead menu.
+    onControlsShownChanged: if (!page.controlsShown) transport.qualityMenuOpen = false
 
     // Position ticks (500ms) drive the SponsorBlock auto-skip check. They also clear the
     // auto-recovery budget: once we've played a few seconds past the last stall, the stream
@@ -523,12 +564,22 @@ Page {
             console.log("FinTube: Nemo.KeepAlive unavailable — keep-display-on is inert")
     }
 
+    // Native SFOS share sheet — the "unified menu" (Bluetooth, email, accounts, …). API matches
+    // Opal.LinkHandler's proven usage: set `resources` then call trigger() (see videoAction()).
+    ShareAction {
+        id: shareLink
+        mimeType: "text/x-url"
+        title: "Share link"
+    }
+
     // A lone tap toggles the controls, but only after we're sure it wasn't the first half of
     // a double-tap (which seeks instead).
     Timer {
         id: tapTimer
         interval: 250
-        onTriggered: page.controlsShown = !page.controlsShown
+        // Don't let a single-tap toggle (from a fall-through tap on empty video) hide the
+        // controls while the quality menu is open — that would strand the menu invisible.
+        onTriggered: if (!transport.qualityMenuOpen) page.controlsShown = !page.controlsShown
     }
     // Fire the accumulated seek once the taps settle (avoids a burst of flush-seeks).
     Timer {
@@ -561,7 +612,7 @@ Page {
     // ---- Notch spacer (portrait only): a black strip so the physical camera cutout sits over black,
     // with the video dropped below it rather than clipped. ----
     Rectangle {
-        visible: !page.landscape && page.notchOffset > 0
+        visible: !page.landscape && !page.portraitFull && page.notchOffset > 0
         color: "black"
         anchors { top: parent.top; left: parent.left; right: parent.right }
         height: page.notchOffset
@@ -572,8 +623,8 @@ Page {
         id: videoBox
         color: "black"
         anchors { top: parent.top; left: parent.left; right: parent.right
-                  topMargin: page.landscape ? 0 : page.notchOffset }
-        height: page.landscape ? page.height : Math.round(width * 9 / 16)
+                  topMargin: (page.landscape || page.portraitFull) ? 0 : page.notchOffset }
+        height: (page.landscape || page.portraitFull) ? page.height : Math.round(width * 9 / 16)
 
         VideoPlayer {
             id: gplayer
@@ -663,6 +714,7 @@ Page {
         // Controls overlay the whole video (centred play/pause + bottom scrubber); tap
         // the video to toggle, and they auto-hide while playing (YouTube-style).
         TransportControls {
+            id: transport
             anchors.fill: parent
             visible: !page.resolving && page.errorText.length === 0
             enabled: page.controlsShown
@@ -673,12 +725,16 @@ Page {
             isPlaying: page.isPlaying
             playbackRate: page.playbackRate
             speedEnabled: page.useGst
+            qualities: page.qualities
+            currentQuality: page.currentQuality
+            qualityEnabled: page.useGst
             chapters: page.chapters
             currentChapter: page.currentChapter
-            fullscreen: page.landscape
+            fullscreen: page.landscape || page.portraitFull
             onSeekRequested: page.seekTo(ms)
             onTogglePlay: page.togglePlay()
             onCycleSpeed: page.cycleSpeed()
+            onQualitySelected: page.switchQuality(q)
             onToggleFullscreen: page.toggleFullscreen()
             onInteracted: page.controlsShown = true
         }
@@ -715,17 +771,17 @@ Page {
     }
 
     // Auto-hide the overlay a few seconds after it's shown (only while playing, so a
-    // paused video keeps its controls up).
+    // paused video keeps its controls up; and never while the quality menu is open).
     Timer {
         interval: 3500
-        running: page.controlsShown && page.isPlaying
+        running: page.controlsShown && page.isPlaying && !transport.qualityMenuOpen
         onTriggered: page.controlsShown = false
     }
 
     // ---- Portrait: title + channel + description below the video (scrolls) ----
     SilicaFlickable {
         id: infoFlick
-        visible: !page.landscape
+        visible: !page.landscape && !page.portraitFull
         anchors {
             top: videoBox.bottom; bottom: parent.bottom
             left: parent.left; right: parent.right
@@ -758,15 +814,6 @@ Page {
                 enabled: !page.downloading
                 onClicked: page.startDownload("video")
             }
-            MenuLabel { visible: page.qualities.length > 0; text: "Quality" }
-            Repeater {
-                model: page.qualities
-                MenuItem {
-                    text: modelData.label
-                          + (page.currentQuality === modelData.label ? "  ✓" : "")
-                    onClicked: page.switchQuality(modelData)
-                }
-            }
         }
 
         Column {
@@ -774,6 +821,24 @@ Page {
             y: Theme.paddingMedium
             width: parent.width
             spacing: Theme.paddingMedium
+
+            // LIVE badge — makes it obvious this is a livestream, not a normal video.
+            Rectangle {
+                x: Theme.horizontalPageMargin
+                visible: page.isLive
+                width: liveLabel.width + 2 * Theme.paddingMedium
+                height: liveLabel.height + Theme.paddingSmall
+                radius: Theme.paddingSmall
+                color: "#cc0000"
+                Label {
+                    id: liveLabel
+                    anchors.centerIn: parent
+                    text: "● LIVE"
+                    color: "white"
+                    font.bold: true
+                    font.pixelSize: Theme.fontSizeExtraSmall
+                }
+            }
 
             Label {
                 x: Theme.horizontalPageMargin
@@ -838,6 +903,60 @@ Page {
                     }
                 }
             }
+
+            // Action bar — YouTube-style quick actions under the channel line, kept OUT of the
+            // pulley so they're one tap (not a pull-down). Share opens the native SFOS share sheet.
+            Row {
+                x: Theme.horizontalPageMargin
+                spacing: Theme.paddingLarge
+                visible: page.videoId.length > 0
+
+                Column {
+                    width: Theme.iconSizeMedium + Theme.paddingLarge
+                    IconButton {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        icon.source: "image://theme/icon-m-link"
+                        onClicked: page.videoAction("open")
+                    }
+                    Label {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Open"
+                        font.pixelSize: Theme.fontSizeTiny
+                        color: Theme.secondaryColor
+                    }
+                }
+                Column {
+                    width: Theme.iconSizeMedium + Theme.paddingLarge
+                    IconButton {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        icon.source: "image://theme/icon-m-clipboard"
+                        onClicked: page.videoAction("copy")
+                    }
+                    Label {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Copy"
+                        font.pixelSize: Theme.fontSizeTiny
+                        color: Theme.secondaryColor
+                    }
+                }
+                Column {
+                    width: Theme.iconSizeMedium + Theme.paddingLarge
+                    IconButton {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        icon.source: "image://theme/icon-m-share"
+                        onClicked: page.videoAction("share")
+                    }
+                    Label {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Share"
+                        font.pixelSize: Theme.fontSizeTiny
+                        color: Theme.secondaryColor
+                    }
+                }
+            }
+
+            // (Resolution picker moved into the video overlay — the quality pill, left of
+            //  the speed pill; tapping it opens a menu of resolutions. See TransportControls.)
 
             Label {
                 id: descLabel
@@ -991,6 +1110,18 @@ Page {
         id: mediaPlayer
         autoPlay: false
         onError: page.recoverPlayback(errorString)
+    }
+
+    // The overlay's own scrim only covers the video surface, so in portrait a tap in the info
+    // area below the video wouldn't dismiss the quality menu. This catches those taps (and
+    // swallows them, so they don't also trigger the control beneath). Declared last so it sits
+    // above the info flickable; disabled when the menu is closed, so taps pass through normally.
+    // Zero-height in landscape/portraitFull (videoBox fills the page), so it's inert there.
+    MouseArea {
+        anchors { left: parent.left; right: parent.right
+                  top: videoBox.bottom; bottom: parent.bottom }
+        enabled: transport.qualityMenuOpen
+        onClicked: transport.qualityMenuOpen = false
     }
 
     Component.onDestruction: {

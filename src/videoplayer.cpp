@@ -312,6 +312,7 @@ void VideoPlayer::buildPipeline()
     // droidvdec can't handle) doesn't disable hw for the next. m_hwDecodeReq is the Settings
     // toggle, already OR'd with the YOUFISH_HWDEC env override at construction.
     m_hwDecode = m_hwDecodeReq;
+    m_rateEngaged = false;   // re-engage the remembered speed on this fresh pipeline (at ASYNC_DONE)
 
     m_pipeline = gst_pipeline_new("youfish-player");
     m_videoBin = gst_element_factory_make("uridecodebin", "videosrc");
@@ -785,6 +786,22 @@ gboolean VideoPlayer::onBusMessage(GstBus *, GstMessage *msg, gpointer self)
                 YLOG << "[youfish/t] preroll (build->PLAYING)"
                          << player->m_prerollTimer.elapsed() << "ms";
             }
+        }
+        break;
+    case GST_MESSAGE_ASYNC_DONE:
+        // Preroll finished — both sink branches are ready, but no PLAYING frame has reached the
+        // appsink yet (it only pushes new-sample in PLAYING). If a non-default speed is set, engage
+        // it ONCE here: the flush-seek reaches BOTH branches together (fixing the audio-at-one-rate
+        // / video-at-another split from applying it mid-preroll) and lands before the first visible
+        // frame, so there's no dark flash. The seek's own later ASYNC_DONE is skipped by the flag.
+        if (!player->m_rateEngaged && !qFuzzyCompare(player->m_rate, 1.0)
+                && GST_MESSAGE_SRC(msg) == GST_OBJECT(player->m_pipeline)) {
+            player->m_rateEngaged = true;
+            gint64 pos = 0;
+            if (!gst_element_query_position(player->m_pipeline, GST_FORMAT_TIME, &pos) || pos < 0)
+                pos = 0;
+            player->sendSeek(pos / GST_MSECOND);
+            YLOG << "[youfish] engaged start speed x" << player->m_rate;
         }
         break;
     case GST_MESSAGE_BUFFERING: {

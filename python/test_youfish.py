@@ -346,5 +346,104 @@ class PotTag(unittest.TestCase):
         self.assertEqual(youfish._pot_effective_tag(), youfish._POT_TAG)
 
 
+class HideWatched(unittest.TestCase):
+    """The hide-watched feed filter drops w=1 videos when the setting is on. Guard-aware: FinTune
+    has no watch-history store, so the filter is a safe no-op there (still respects the setting)."""
+    def setUp(self):
+        self._gs = youfish.get_settings
+        self._wh = getattr(youfish, "_load_watch_history", None)
+
+    def tearDown(self):
+        youfish.get_settings = self._gs
+        if self._wh is not None:
+            youfish._load_watch_history = self._wh
+
+    def test_filters_when_on(self):
+        youfish.get_settings = lambda: {"hide_watched": True}
+        items = [{"id": "AAA"}, {"id": "BBB"}, {"id": "CCC"}]
+        if hasattr(youfish, "_load_watch_history"):
+            youfish._load_watch_history = lambda: {"AAA": {"w": 1}, "BBB": {"w": 0}}
+            self.assertEqual(youfish._feed_hide_watched(items), [{"id": "BBB"}, {"id": "CCC"}])
+        else:
+            self.assertEqual(youfish._feed_hide_watched(items), items)   # no store → no-op
+
+    def test_noop_when_off(self):
+        youfish.get_settings = lambda: {"hide_watched": False}
+        items = [{"id": "AAA"}, {"id": "BBB"}]
+        self.assertEqual(youfish._feed_hide_watched(items), items)
+
+
+class SetWatched(unittest.TestCase):
+    """set_watched marks a video watched/unwatched from the long-press menu, writing the same
+    store the History page + hide-watched read. FinTube-only (FinTune has no watch store)."""
+    def setUp(self):
+        if not hasattr(youfish, "set_watched"):
+            self.skipTest("no watch-history store (FinTune)")
+        self._dd = youfish._data_dir
+        self._tmp = tempfile.mkdtemp(prefix="setw-")
+        youfish._data_dir = lambda: self._tmp
+
+    def tearDown(self):
+        if hasattr(self, "_dd"):
+            youfish._data_dir = self._dd
+            shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_mark_watched_creates_entry(self):
+        res = youfish.set_watched("AAAAAAAAAAA", True, "Title", "Chan")
+        self.assertEqual(res, {"ok": True, "watched": 1})
+        e = youfish._load_watch_history()["AAAAAAAAAAA"]
+        self.assertEqual(e["w"], 1)
+        self.assertEqual(e["f"], 1.0)            # no prior progress → reads as fully played
+        self.assertEqual(e["ti"], "Title")
+        self.assertEqual(e["ch"], "Chan")
+
+    def test_explicit_unwatch_clears_sticky_flag(self):
+        youfish.set_watched("BBBBBBBBBBB", True)
+        res = youfish.set_watched("BBBBBBBBBBB", False)
+        self.assertEqual(res["watched"], 0)
+        self.assertEqual(youfish._load_watch_history()["BBBBBBBBBBB"]["w"], 0)
+
+    def test_unwatch_clears_the_progress_bar(self):
+        youfish.record_watch("HHHHHHHHHHH", 300, 600)   # 50% → red bar at 0.5
+        youfish.set_watched("HHHHHHHHHHH", True)         # → f=1.0 (full bar)
+        youfish.set_watched("HHHHHHHHHHH", False)        # → bar cleared
+        e = youfish._load_watch_history()["HHHHHHHHHHH"]
+        self.assertEqual(e["w"], 0)
+        self.assertEqual(e["f"], 0.0)                    # red bar gone
+        self.assertEqual(e["p"], 0)
+
+    def test_unwatch_unknown_is_noop(self):
+        res = youfish.set_watched("CCCCCCCCCCC", False)
+        self.assertEqual(res, {"ok": True, "watched": 0})
+        self.assertNotIn("CCCCCCCCCCC", youfish._load_watch_history())   # no stub entry created
+
+    def test_promote_marks_complete_and_keeps_meta(self):
+        youfish.record_watch("DDDDDDDDDDD", 60, 600, "Vid", "By")        # 10% → not watched
+        self.assertEqual(youfish._load_watch_history()["DDDDDDDDDDD"]["w"], 0)
+        youfish.set_watched("DDDDDDDDDDD", True)                          # promote to watched
+        e = youfish._load_watch_history()["DDDDDDDDDDD"]
+        self.assertEqual(e["w"], 1)
+        self.assertEqual(e["f"], 1.0)           # red bar reads complete
+        self.assertEqual(e["p"], 600)           # position moved to the end
+        self.assertEqual(e["d"], 600)           # duration preserved
+        self.assertEqual(e["ti"], "Vid")        # meta preserved
+        self.assertEqual(e["ch"], "By")
+
+    def test_watched_id_is_hidden_by_hide_watched(self):
+        youfish.set_watched("EEEEEEEEEEE", True)
+        self.assertIn("EEEEEEEEEEE", youfish._watched_ids())
+
+    def test_marking_watched_clears_resume_point(self):
+        youfish.set_position("FFFFFFFFFFF", 120)
+        self.assertEqual(youfish.get_position("FFFFFFFFFFF"), 120)
+        youfish.set_watched("FFFFFFFFFFF", True)
+        self.assertEqual(youfish.get_position("FFFFFFFFFFF"), 0)      # seek memory forgotten
+
+    def test_unwatch_leaves_resume_point(self):
+        youfish.record_watch("GGGGGGGGGGG", 90, 600)                  # entry + resume=90
+        youfish.set_watched("GGGGGGGGGGG", False)                     # unwatch keeps the resume point
+        self.assertEqual(youfish.get_position("GGGGGGGGGGG"), 90)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

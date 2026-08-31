@@ -102,6 +102,14 @@ Page {
 
             menu: ContextMenu {
                 MenuItem {
+                    text: (app.backend.watchMap && app.backend.watchMap[model.id]
+                           && app.backend.watchMap[model.id].w) ? "Mark as unwatched" : "Mark as watched"
+                    onClicked: {
+                        var e = app.backend.watchMap ? app.backend.watchMap[model.id] : undefined
+                        app.backend.setWatched(model.id, !(e && e.w), model.title, model.uploader || "")
+                    }
+                }
+                MenuItem {
                     text: "Download audio"
                     onClicked: {
                         var vid = model.id, t = model.title
@@ -144,7 +152,7 @@ Page {
                     asynchronous: true
                     source: model.thumbnail || ""
                 }
-                WatchOverlay { anchors.fill: parent; videoId: model.id || "" }
+                WatchOverlay { anchors.fill: parent; videoId: model.id || ""; live: !!model.live }
                 Rectangle {
                     visible: model.duration > 0
                     anchors { right: parent.right; bottom: parent.bottom; margins: Theme.paddingSmall / 2 }

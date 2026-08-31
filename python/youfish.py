@@ -1753,6 +1753,7 @@ def resolve(video_id):
         _tlog("resolve TOTAL %.2fs" % (time.time() - _t0))
         return {"ok": True, "info": {
             "title": data.get("title", ""),
+            "is_live": bool(data.get("is_live")) or (data.get("live_status") == "is_live"),
             "uploader": data.get("uploader") or data.get("channel") or "",
             "channel_id": data.get("channel_id") or data.get("uploader_id") or "",
             "channel_url": data.get("channel_url") or data.get("uploader_url") or "",
@@ -1986,6 +1987,8 @@ def _video_entry(e):
         "subscribers": 0,
         "views": e.get("view_count") or 0,
         "posted": _rel_date(e),
+        # 1 when this is a running livestream (yt-dlp flat `live_status`), for a LIVE badge.
+        "live": 1 if (e.get("live_status") == "is_live" or e.get("is_live")) else 0,
     }
 
 
@@ -2040,6 +2043,13 @@ def _subs_path():
 # Settings (a small JSON file the app owns) + Shorts filtering.
 # --------------------------------------------------------------------------- #
 _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
+                      # Hide already-watched videos from the subscription feed + channel lists.
+                      "hide_watched": False,
+                      # Allow fullscreen while staying in portrait (the video fills the screen
+                      # without rotating to landscape).
+                      "portrait_fullscreen": False,
+                      # Playback speed remembered across videos (applied to each new one).
+                      "playback_rate": 1.0,
                       "player_client": "",
                       # yt-dlp update channel: "stable" (default) or "nightly" (YouTube fixes
                       # land days sooner, less tested). Drives ytdlp_update()'s --update-to target.
@@ -2148,6 +2158,30 @@ def _is_short(e):
         return True
     dur = e.get("duration")
     return dur is not None and 0 < dur <= 60
+
+
+def _hide_watched():
+    return bool(get_settings().get("hide_watched", False))
+
+
+def _watched_ids():
+    """Set of video ids marked watched (w=1) in the watch history, or empty when this app has no
+    watch-history store (FinTune) — so the shared filter is a safe no-op there."""
+    loader = globals().get("_load_watch_history")
+    if not loader:
+        return set()
+    try:
+        return set(k for k, v in loader().items() if isinstance(v, dict) and v.get("w"))
+    except Exception:
+        return set()
+
+
+def _feed_hide_watched(items):
+    """Drop watched videos from a feed item list when the setting is on (else unchanged)."""
+    if not _hide_watched():
+        return items
+    watched = _watched_ids()
+    return [it for it in items if it.get("id") not in watched]
 
 
 def _is_members_only(e):
@@ -2314,6 +2348,48 @@ def record_watch(video_id, position, duration, title="", channel=""):
             json.dump(d, f)
     except Exception:
         pass
+
+
+def set_watched(video_id, watched=True, title="", channel=""):
+    """Explicitly mark a video watched (or unwatched) from a long-press menu, without playing
+    it — writes the same watch-history store the History page reads and hide-watched filters on.
+    Marking watched also clears the resume point (positions.json): finished means it shouldn't
+    offer to resume from the middle next time. Unlike record_watch's sticky flag, an explicit
+    unwatch here DOES clear 'w' (the user asked for it), and leaves the resume point alone.
+    Reinserts the entry at the end so it also counts as most-recent."""
+    if not video_id:
+        return {"ok": False}
+    watched = bool(watched)
+    d = _load_watch_history()
+    prev = d.pop(video_id, None)                  # pop + reinsert = most-recent ordering
+    pw = prev if isinstance(prev, dict) else {}
+    if not watched and not pw:
+        return {"ok": True, "watched": 0}         # nothing to clear — don't create a stub entry
+    if watched:
+        set_position(video_id, 0)                 # "watched" = finished → forget the resume point
+    entry = dict(pw)
+    entry["w"] = 1 if watched else 0
+    entry["t"] = int(time.time())
+    entry["ti"] = title or pw.get("ti") or ""
+    entry["ch"] = channel or pw.get("ch") or ""
+    # Watched = complete: fill the fraction so the thumbnail's red progress bar reads as done, and
+    # move the recorded position to the end to match (the resume point itself was cleared above).
+    # Unwatched = fresh: zero the fraction + position so the red bar disappears entirely.
+    if watched:
+        entry["f"] = 1.0
+        entry["p"] = int(entry.get("d") or 0)
+    else:
+        entry["f"] = 0.0
+        entry["p"] = 0
+    d[video_id] = entry
+    if len(d) > 500:
+        d = dict(list(d.items())[-500:])
+    try:
+        with open(_watch_history_path(), "w") as f:
+            json.dump(d, f)
+    except Exception:
+        return {"ok": False}
+    return {"ok": True, "watched": 1 if watched else 0}
 
 
 # Categories we skip. selfpromo + interaction (subscribe/like reminders) go with sponsors.
@@ -2750,6 +2826,9 @@ def channel_videos(channel, start=1, n=30):
         entries = [e for e in raw if not _is_members_only(e)]
         if _hide_shorts():
             entries = [e for e in entries if not _is_short(e)]
+        if _hide_watched():
+            watched = _watched_ids()
+            entries = [e for e in entries if e.get("id") not in watched]
         items = [{
             "id": e.get("id", ""),
             "title": e.get("title", "(untitled)"),
@@ -2759,6 +2838,7 @@ def channel_videos(channel, start=1, n=30):
             "thumbnail": _video_thumb(e.get("id", "")) or _pick_thumb(e),
             "views": e.get("view_count") or 0,
             "posted": _rel_date(e),
+            "live": 1 if (e.get("live_status") == "is_live" or e.get("is_live")) else 0,
         } for e in entries]
         # Flat entries lack dates; fill the recent ones from the channel's RSS feed.
         if start <= 1:
@@ -2791,7 +2871,8 @@ def subscription_feed(limit=100, force=False):
         return {"ok": True, "items": []}
     if (not force and _feed_cache["items"]
             and time.time() - _feed_cache["ts"] < 300):
-        return {"ok": True, "items": _feed_cache["items"][:int(limit)], "cached": True}
+        return {"ok": True, "items": _feed_hide_watched(_feed_cache["items"])[:int(limit)],
+                "cached": True}
     _force_ipv4()
 
     def fetch(cid):
@@ -2825,7 +2906,7 @@ def subscription_feed(limit=100, force=False):
     } for e in entries]
     _feed_cache["ts"] = time.time()
     _feed_cache["items"] = items
-    return {"ok": True, "items": items[:int(limit)]}
+    return {"ok": True, "items": _feed_hide_watched(items)[:int(limit)]}
 
 
 _feed_durations_cache = {"ts": 0.0, "map": {}}
@@ -3241,6 +3322,7 @@ def youtube_playlist(ref, limit=200):
             "uploader": e.get("uploader") or e.get("channel") or "",
             "duration": e.get("duration") or 0,
             "thumbnail": _video_thumb(e.get("id", "")) or _pick_thumb(e),
+            "live": 1 if (e.get("live_status") == "is_live" or e.get("is_live")) else 0,
         } for e in data.get("entries", []) if e.get("id")]
         return {"ok": True,
                 "title": data.get("title") or "Playlist",

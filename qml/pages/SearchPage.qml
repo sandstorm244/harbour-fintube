@@ -246,6 +246,14 @@ Page {
                 id: dlMenu
                 ContextMenu {
                     MenuItem {
+                        text: (app.backend.watchMap && app.backend.watchMap[item.vidId]
+                               && app.backend.watchMap[item.vidId].w) ? "Mark as unwatched" : "Mark as watched"
+                        onClicked: {
+                            var e = app.backend.watchMap ? app.backend.watchMap[item.vidId] : undefined
+                            app.backend.setWatched(item.vidId, !(e && e.w), item.vidTitle, item.vidUploader)
+                        }
+                    }
+                    MenuItem {
                         text: "Add to playlist"
                         onClicked: pageStack.push(Qt.resolvedUrl("AddToPlaylistPage.qml"),
                             { video: { id: item.vidId, title: item.vidTitle, uploader: item.vidUploader,
@@ -289,6 +297,7 @@ Page {
                     WatchOverlay {
                         anchors.fill: parent
                         videoId: item.isChannel ? "" : (model.id || "")
+                        live: !item.isChannel && !!model.live
                     }
                     Rectangle {
                         visible: model.duration > 0

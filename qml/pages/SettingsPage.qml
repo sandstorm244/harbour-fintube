@@ -41,6 +41,15 @@ Page {
                 onClicked: app.backend.setSponsorBlock(!app.backend.sponsorBlock)
             }
 
+            TextSwitch {
+                text: "Hide watched videos"
+                description: "Hide videos you've already watched from the subscription feed and "
+                             + "channel video lists."
+                automaticCheck: false
+                checked: app.backend.hideWatched
+                onClicked: app.backend.setHideWatched(!app.backend.hideWatched)
+            }
+
             SectionHeader { text: "Playback" }
 
             ComboBox {
@@ -86,6 +95,16 @@ Page {
                 automaticCheck: false
                 checked: app.backend.keepDisplayOn
                 onClicked: app.backend.setKeepDisplayOn(!app.backend.keepDisplayOn)
+            }
+
+            TextSwitch {
+                text: "Portrait fullscreen"
+                description: "Let the fullscreen button fill the screen while staying in portrait, "
+                             + "instead of rotating to landscape. Tap the video's fullscreen "
+                             + "control to toggle."
+                automaticCheck: false
+                checked: app.backend.portraitFullscreen
+                onClicked: app.backend.setPortraitFullscreen(!app.backend.portraitFullscreen)
             }
 
             ValueButton {
