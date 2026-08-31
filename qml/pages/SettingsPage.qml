@@ -50,6 +50,30 @@ Page {
                 onClicked: app.backend.setHideWatched(!app.backend.hideWatched)
             }
 
+            Slider {
+                id: historySlider
+                width: parent.width
+                minimumValue: 100
+                maximumValue: 2000
+                stepSize: 100
+                value: app.backend.historyLimit
+                label: "Watch-history limit"
+                valueText: value + " videos"
+                onReleased: {
+                    app.backend.setHistoryLimit(value)
+                    value = Qt.binding(function() { return app.backend.historyLimit })
+                }
+            }
+            Label {
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                text: "How many recently-watched videos the History page keeps — the oldest drop off "
+                      + "once you pass this. (Resume points expire on their own after 30 days unused.)"
+                color: Theme.secondaryColor
+                font.pixelSize: Theme.fontSizeExtraSmall
+            }
+
             SectionHeader { text: "Playback" }
 
             ComboBox {

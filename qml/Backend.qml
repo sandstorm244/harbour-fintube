@@ -104,6 +104,7 @@ Item {
 
     // --- Settings (persisted by Python) ---
     property real playbackRate: 1.0      // remembered playback speed, carried to each new video
+    property int historyLimit: 500       // max watch-history entries kept (Settings → Content)
     function loadSettings() {
         py.call("youfish.get_settings", [], function(s) {
             if (!s) return
@@ -121,6 +122,7 @@ Item {
             if (s.eq_bands && s.eq_bands.length === 10)
                 backend.eqBands = s.eq_bands
             backend.boostGain = s.boost_gain || 1.0
+            backend.historyLimit = s.history_limit || 500
         })
     }
 
@@ -166,6 +168,12 @@ Item {
     function setHideShorts(on) {
         py.call("youfish.set_setting", ["hide_shorts", !!on], function(s) {
             if (s) backend.hideShorts = !!s.hide_shorts
+        })
+    }
+
+    function setHistoryLimit(n) {
+        py.call("youfish.set_setting", ["history_limit", n], function(s) {
+            if (s) backend.historyLimit = s.history_limit || 500
         })
     }
 
@@ -253,11 +261,13 @@ Item {
         })
     }
 
-    // {video_id: seconds} durations for feed videos (from yt-dlp; RSS lacks them). Called
-    // after the feed shows so the length badges fill in without slowing the initial load.
-    function feedDurations(callback) {
-        py.call("youfish.feed_durations", [30], function(res) {
-            callback(res || {})
+    // { durations: {video_id: seconds}, shorts: [video_id] } for the feed (from yt-dlp; RSS lacks
+    // both). Called after the feed shows so length badges fill in — and Shorts drop out — without
+    // slowing the initial load.
+    function feedDurations(force, callback) {
+        py.call("youfish.feed_durations", [30, !!force], function(res) {
+            callback((res && res.durations) ? res.durations : {},
+                     (res && res.shorts) ? res.shorts : [])
         })
     }
 

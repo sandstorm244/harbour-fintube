@@ -40,19 +40,26 @@ Page {
             for (var i = 0; i < items.length; i++)
                 feedModel.append(items[i])
             if (feedModel.count > 0)
-                page.fillDurations()
+                page.fillDurations(force)
         })
     }
 
-    // RSS has no video length; pull durations from yt-dlp in the background and drop them
-    // into the rows so the length badges appear a moment after the feed.
-    function fillDurations() {
-        app.backend.feedDurations(function(map) {
-            if (!map)
-                return
-            for (var i = 0; i < feedModel.count; i++) {
+    // RSS has no video length or Shorts flag; pull both from yt-dlp in the background. Drop the
+    // durations into the rows so the length badges appear a moment after the feed, and remove any
+    // row now known to be a Short (channel /shorts-tab membership — reliable regardless of length).
+    function fillDurations(force) {
+        app.backend.feedDurations(force, function(map, shorts) {
+            var shortSet = Object.create(null)   // no prototype → an id like "constructor" can't false-hit
+            if (app.backend.hideShorts && shorts)
+                for (var s = 0; s < shorts.length; s++)
+                    shortSet[shorts[s]] = true
+            for (var i = feedModel.count - 1; i >= 0; i--) {   // backwards → safe removal
                 var it = feedModel.get(i)
-                var d = map[it.id]
+                if (shortSet[it.id]) {
+                    feedModel.remove(i)
+                    continue
+                }
+                var d = map ? map[it.id] : undefined
                 if (d !== undefined && d > 0 && it.duration !== d)
                     feedModel.setProperty(i, "duration", d)
             }

@@ -2045,6 +2045,8 @@ def _subs_path():
 _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
                       # Hide already-watched videos from the subscription feed + channel lists.
                       "hide_watched": False,
+                      # Max watch-history entries kept; the oldest are dropped past this. User-set.
+                      "history_limit": 500,
                       # Allow fullscreen while staying in portrait (the video fills the screen
                       # without rotating to landscape).
                       "portrait_fullscreen": False,
@@ -2151,13 +2153,16 @@ def _hide_shorts():
     return bool(get_settings().get("hide_shorts", True))
 
 
+_SHORT_MAX_SECS = 60   # a known duration in (0, this] reads as a Short for the feed/list filters
+
+
 def _is_short(e):
     """A YouTube Short: its watch URL says so, or (fallback) it's <=60s. The duration
     heuristic can catch a genuinely short normal video, which is why it's user-toggleable."""
     if "/shorts/" in (e.get("url") or ""):
         return True
     dur = e.get("duration")
-    return dur is not None and 0 < dur <= 60
+    return dur is not None and 0 < dur <= _SHORT_MAX_SECS
 
 
 def _hide_watched():
@@ -2182,6 +2187,33 @@ def _feed_hide_watched(items):
         return items
     watched = _watched_ids()
     return [it for it in items if it.get("id") not in watched]
+
+
+def _feed_shorts_filter(items):
+    """Drop Shorts from a feed item list when hide_shorts is on. Shorts are identified
+    DEFINITIVELY by channel /shorts-tab membership — a duration heuristic can't tell a 3-minute
+    Short from a 3-minute normal video (Shorts now run up to 3 min). The membership set is
+    discovered + cached by feed_durations; items not yet classified pass through and are pruned
+    client-side once feed_durations reports them."""
+    if not _hide_shorts():
+        return items
+    shorts = _feed_durations_cache.get("shorts") or _load_saved_shorts()
+    return [it for it in items if it.get("id") not in shorts]
+
+
+def _feed_with_durations(items):
+    """Fill each item's duration from the (warm) persistent duration cache, so a length we've ALREADY
+    measured shows WITH the feed instead of popping in a beat later on the separate feed_durations
+    round-trip. Only genuinely-new (uncached) videos still fill in afterwards."""
+    dmap = _feed_durations_cache.get("map") or _load_saved_durations()
+    _feed_durations_cache["map"] = dmap          # warm the in-memory map for feed_durations to reuse
+    if not dmap:
+        return items
+    for it in items:
+        d = dmap.get(it.get("id"))
+        if d and it.get("duration") != d:
+            it["duration"] = d
+    return items
 
 
 def _is_members_only(e):
@@ -2209,27 +2241,55 @@ def _load_positions():
         return {}
 
 
-def get_position(video_id):
-    """Saved watch position (seconds) for a video, 0 if none."""
+_RESUME_TTL = 30 * 86400   # resume points idle (unplayed) longer than this are dropped — you won't
+                           # resume a video you half-watched a month ago
+
+
+def _pos_secs(entry):
+    """Seconds from a positions entry, tolerating the old plain-int on-disk format."""
+    v = entry.get("s") if isinstance(entry, dict) else entry
     try:
-        return int(_load_positions().get(video_id, 0))
-    except Exception:
+        return int(v or 0)
+    except (TypeError, ValueError):
         return 0
 
 
+def _pos_fresh(entry, now):
+    """Keep a positions entry? Old int entries (no timestamp) are grandfathered as touched-now;
+    dict entries survive while touched within _RESUME_TTL. Returns the (migrated) entry, or None
+    to drop it."""
+    if not isinstance(entry, dict):
+        return {"s": _pos_secs(entry), "t": now}          # old int format → stamp it now
+    if now - float(entry.get("t") or 0) > _RESUME_TTL:
+        return None
+    return entry
+
+
+def get_position(video_id):
+    """Saved watch position (seconds) for a video; 0 if none, or if the resume point has gone
+    stale (idle past _RESUME_TTL)."""
+    ent = _load_positions().get(video_id)
+    if isinstance(ent, dict) and time.time() - float(ent.get("t") or 0) > _RESUME_TTL:
+        return 0
+    return _pos_secs(ent)
+
+
 def set_position(video_id, seconds):
-    """Remember (or, with seconds<=0, forget) where a video was left off. Kept as an
-    insertion-ordered LRU so the file can't grow without bound."""
+    """Remember (or, with seconds<=0, forget) where a video was left off, with a last-touched
+    stamp. Each write also migrates old int entries and sweeps any idle past _RESUME_TTL, so the
+    file self-prunes. Insertion-ordered, count-capped so it can't grow without bound."""
     if not video_id:
         return
+    now = time.time()
     d = _load_positions()
     d.pop(video_id, None)                 # reinsert at the end = most-recent
+    d = {k: f for k, f in ((k, _pos_fresh(v, now)) for k, v in d.items()) if f is not None}
     try:
         seconds = int(seconds)
     except (TypeError, ValueError):
         seconds = 0
     if seconds > 0:
-        d[video_id] = seconds
+        d[video_id] = {"s": seconds, "t": now}
     if len(d) > 300:
         d = dict(list(d.items())[-300:])
     try:
@@ -2246,6 +2306,15 @@ def set_position(video_id, seconds):
 # the video WAS watched even after its resume point is gone.
 # --------------------------------------------------------------------------- #
 _WATCHED_FRACTION = 0.8
+
+
+def _history_limit():
+    """Max watch-history entries to keep (user setting; the store drops the oldest past this)."""
+    try:
+        n = int(get_settings().get("history_limit", 500))
+    except (TypeError, ValueError):
+        n = 500
+    return max(50, min(5000, n))          # clamp to a sane range
 
 
 def _watch_history_path():
@@ -2341,8 +2410,9 @@ def record_watch(video_id, position, duration, title="", channel=""):
                    "w": 1 if watched else 0, "t": int(time.time()),
                    "ti": (title or pw.get("ti") or ""),
                    "ch": (channel or pw.get("ch") or "")}
-    if len(d) > 500:
-        d = dict(list(d.items())[-500:])
+    lim = _history_limit()
+    if len(d) > lim:
+        d = dict(list(d.items())[-lim:])
     try:
         with open(_watch_history_path(), "w") as f:
             json.dump(d, f)
@@ -2382,8 +2452,9 @@ def set_watched(video_id, watched=True, title="", channel=""):
         entry["f"] = 0.0
         entry["p"] = 0
     d[video_id] = entry
-    if len(d) > 500:
-        d = dict(list(d.items())[-500:])
+    lim = _history_limit()
+    if len(d) > lim:
+        d = dict(list(d.items())[-lim:])
     try:
         with open(_watch_history_path(), "w") as f:
             json.dump(d, f)
@@ -2652,8 +2723,9 @@ def _import_newpipe_db(con):
         for vid, e in existing_hist.items():  # local history appended last = stays newest
             merged.pop(vid, None)
             merged[vid] = e
-        if len(merged) > 500:
-            merged = dict(list(merged.items())[-500:])
+        lim = _history_limit()
+        if len(merged) > lim:
+            merged = dict(list(merged.items())[-lim:])
         if hist_added:
             try:
                 with open(_watch_history_path(), "w") as f:
@@ -2663,13 +2735,14 @@ def _import_newpipe_db(con):
 
     pos_added = 0
     if imported:
+        now = time.time()
         positions = _load_positions()
         for ts, vid, entry in imported:
             if vid in positions:
                 continue                      # don't overwrite a local resume point
             pp, dd = entry["p"], entry["d"]
             if pp > 10 and not (dd > 0 and pp > dd - 15):
-                positions[vid] = pp
+                positions[vid] = {"s": pp, "t": now}   # stamp imported points touched-now (fresh 30d)
                 pos_added += 1
         if pos_added:
             if len(positions) > 300:
@@ -2871,7 +2944,9 @@ def subscription_feed(limit=100, force=False):
         return {"ok": True, "items": []}
     if (not force and _feed_cache["items"]
             and time.time() - _feed_cache["ts"] < 300):
-        return {"ok": True, "items": _feed_hide_watched(_feed_cache["items"])[:int(limit)],
+        return {"ok": True,
+                "items": _feed_hide_watched(_feed_shorts_filter(
+                    _feed_with_durations(_feed_cache["items"])))[:int(limit)],
                 "cached": True}
     _force_ipv4()
 
@@ -2880,7 +2955,10 @@ def subscription_feed(limit=100, force=False):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
             with urllib.request.urlopen(req, timeout=10) as r:
-                return _parse_feed_entries(r.read().decode("utf-8", "replace"))
+                ents = _parse_feed_entries(r.read().decode("utf-8", "replace"))
+            for e in ents:
+                e["channel_id"] = cid          # lets feed_durations fetch only channels with new videos
+            return ents
         except Exception:
             return []
 
@@ -2903,68 +2981,172 @@ def subscription_feed(limit=100, force=False):
         "thumbnail": _video_thumb(e["id"]),
         "views": e.get("views") or 0,
         "posted": _rel_from_iso(e.get("published")),
+        "channel_id": e.get("channel_id", ""),
     } for e in entries]
     _feed_cache["ts"] = time.time()
     _feed_cache["items"] = items
-    return {"ok": True, "items": _feed_hide_watched(items)[:int(limit)]}
+    return {"ok": True,
+            "items": _feed_hide_watched(_feed_shorts_filter(_feed_with_durations(items)))[:int(limit)]}
 
 
-_feed_durations_cache = {"ts": 0.0, "map": {}}
+_feed_durations_cache = {"ts": 0.0, "map": {}, "shorts": set()}
 
 
-def feed_durations(limit_per_channel=30):
-    """{video_id: duration_seconds} for subscribed channels' recent uploads. RSS (the feed
-    source) has no duration, so this pulls it from yt-dlp's flat listing — fetched in
-    parallel and cached, and called AFTER the RSS feed shows so it never blocks it."""
+def _durations_path():
+    return os.path.join(_data_dir(), "durations.json")
+
+
+def _shorts_path():
+    return os.path.join(_data_dir(), "feed_shorts.json")
+
+
+def _load_saved_durations():
+    """The persistent {video_id: seconds} duration cache. Durations are immutable, so a hit is
+    valid forever — this is what lets a repeat launch skip yt-dlp entirely."""
+    try:
+        with open(_durations_path()) as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            return {}
+        return {str(k): int(v) for k, v in d.items() if int(v or 0) > 0}
+    except Exception:
+        return {}
+
+
+def _load_saved_shorts():
+    """The persistent set of video ids known to be Shorts (from channel /shorts tabs). Once a
+    Short, always a Short → cache forever."""
+    try:
+        with open(_shorts_path()) as f:
+            d = json.load(f)
+        return set(str(v) for v in d) if isinstance(d, list) else set()
+    except Exception:
+        return set()
+
+
+def _save_durations(d):
+    try:
+        if len(d) > 3000:                       # tiny + immutable; keep the file bounded (LRU tail)
+            d = dict(list(d.items())[-3000:])
+        with open(_durations_path(), "w") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+
+
+def _save_shorts(s):
+    try:
+        lst = list(s)
+        if len(lst) > 4000:
+            lst = lst[-4000:]
+        with open(_shorts_path(), "w") as f:
+            json.dump(lst, f)
+    except Exception:
+        pass
+
+
+def feed_durations(limit_per_channel=30, force=False):
+    """For the current subscription feed: {"durations": {video_id: seconds}, "shorts": [video_id]}.
+    RSS carries neither, so this pulls them from yt-dlp's flat channel listing — the /videos tab
+    for durations, and (when hide_shorts is on) the /shorts tab for a DEFINITIVE Shorts set
+    (length can't tell a 3-min Short from a 3-min video). Both are immutable, so they're cached to
+    disk and a yt-dlp spawn is only spent on channels that have a video we've never classified. A
+    fully-cached feed returns instantly with no subprocess. Called AFTER the RSS feed shows."""
     subs = list_subscriptions()
-    urls = []
+    chan_base = {}
     for s in subs:
         cid = str(s.get("id") or "")
         url = str(s.get("url") or "")
         if cid.startswith("UC"):
-            urls.append("https://www.youtube.com/channel/%s/videos" % cid)
+            chan_base[cid] = "https://www.youtube.com/channel/%s" % cid
         elif url:
-            u = url.rstrip("/")
-            urls.append(u if u.endswith("/videos") else u + "/videos")
-    if not urls:
-        return {}
-    if (_feed_durations_cache["map"]
-            and time.time() - _feed_durations_cache["ts"] < 300):
-        return _feed_durations_cache["map"]
+            chan_base[url] = url.rstrip("/")
+    if not chan_base:
+        return {"durations": {}, "shorts": []}
+
+    # Warm both caches from disk once (durations + Shorts membership are immutable → never expire).
+    dmap = _feed_durations_cache["map"] or _load_saved_durations()
+    shorts = _feed_durations_cache["shorts"] or _load_saved_shorts()
+    _feed_durations_cache["map"], _feed_durations_cache["shorts"] = dmap, shorts
+
+    feed_items = _feed_cache.get("items") or []
+    feed_ids = [it.get("id") for it in feed_items if it.get("id")]
+
+    def result():
+        return {"durations": {k: dmap[k] for k in feed_ids if k in dmap},
+                "shorts": [v for v in feed_ids if v in shorts]}
+
+    # A feed video is "classified" once we have its duration OR know it's a Short.
+    def classified(vid):
+        return vid in dmap or vid in shorts
+
+    need = {}
+    for it in feed_items:
+        vid, cid = it.get("id"), it.get("channel_id")
+        if vid and not classified(vid) and cid in chan_base:
+            need[cid] = chan_base[cid]
+    # Feed items without a matching channel_id tag (an older in-memory cache) but with unclassified
+    # ids → fall back to scanning all channels. Runs BEFORE the instant-return below.
+    if not need and feed_ids and any(not classified(v) for v in feed_ids):
+        need = dict(chan_base)
+    if not need:
+        return result()                         # nothing to fetch → instant, no yt-dlp
+    # Throttle: don't re-spawn within 5 min unless the user explicitly refreshed (also stops
+    # hammering when a channel keeps returning nothing new for an unclassified id — e.g. a
+    # live/premiere that's in neither tab).
+    now = time.time()
+    if not force and _feed_durations_cache["ts"] and now - _feed_durations_cache["ts"] < 300:
+        return result()
     path = _ytdlp_path()
     if not path:
-        return {}
+        return result()
 
-    def fetch(u):
+    def flat(url):
         try:
             proc = subprocess.run(
                 [path, *_COMMON_ARGS, "--flat-playlist",
-                 "--playlist-end", str(int(limit_per_channel)), "--dump-single-json", "--", u],
+                 "--playlist-end", str(int(limit_per_channel)), "--dump-single-json", "--", url],
                 capture_output=True, text=True, timeout=60)
             if proc.returncode != 0:
-                return {}
-            data = json.loads(proc.stdout)
-            out = {}
-            for e in data.get("entries", []):
-                vid, dur = e.get("id"), e.get("duration")
-                if vid and dur:
-                    out[vid] = int(dur)
-            return out
+                return []
+            return json.loads(proc.stdout).get("entries", []) or []
         except Exception:
-            return {}
+            return []
 
-    dmap = {}
+    def fetch(base):
+        durs, sh = {}, set()
+        for e in flat(base + "/videos"):
+            vid, dur = e.get("id"), e.get("duration")
+            if vid and dur:
+                durs[vid] = int(dur)
+        # Always scan /shorts (even with hide_shorts off): it's what CLASSIFIES a Short, so it drops
+        # out of `need` (keeping the no-subprocess fast path working) and the filter stays correct if
+        # the user later turns hide_shorts on.
+        for e in flat(base + "/shorts"):
+            vid, dur = e.get("id"), e.get("duration")
+            if vid:
+                sh.add(vid)
+                if dur:
+                    durs[vid] = int(dur)
+        return durs, sh
+
+    bases = list(need.values())
     try:
         import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(urls))) as ex:
-            for res in ex.map(fetch, urls):
-                dmap.update(res)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(bases))) as ex:
+            for durs, sh in ex.map(fetch, bases):
+                dmap.update(durs)
+                shorts |= sh
     except Exception:
-        for u in urls:
-            dmap.update(fetch(u))
-    _feed_durations_cache["ts"] = time.time()
-    _feed_durations_cache["map"] = dmap
-    return dmap
+        for base in bases:
+            durs, sh = fetch(base)
+            dmap.update(durs)
+            shorts |= sh
+    _feed_durations_cache["ts"] = now
+    _feed_durations_cache["map"], _feed_durations_cache["shorts"] = dmap, shorts
+    _save_durations(dmap)
+    _save_shorts(shorts)
+    return result()
 
 
 def comments(video_id, limit=50):

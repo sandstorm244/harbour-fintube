@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import sqlite3
+import time
 import sys
 import tempfile
 import types
@@ -443,6 +444,135 @@ class SetWatched(unittest.TestCase):
         youfish.record_watch("GGGGGGGGGGG", 90, 600)                  # entry + resume=90
         youfish.set_watched("GGGGGGGGGGG", False)                     # unwatch keeps the resume point
         self.assertEqual(youfish.get_position("GGGGGGGGGGG"), 90)
+
+
+class FeedShortsAndDurations(unittest.TestCase):
+    """Persistent duration + Shorts-membership caches and the feed Shorts filter. Shared engine, so
+    this passes in both apps (FinTune has the same functions, just no QML consumer)."""
+    def setUp(self):
+        self._dd, self._gs, self._ls = youfish._data_dir, youfish.get_settings, youfish.list_subscriptions
+        self._fd, self._fc = youfish._feed_durations_cache, youfish._feed_cache
+        self._tmp = tempfile.mkdtemp(prefix="feeddur-")
+        youfish._data_dir = lambda: self._tmp
+        youfish._feed_durations_cache = {"ts": 0.0, "map": {}, "shorts": set()}
+        youfish._feed_cache = {"ts": 0.0, "items": []}
+
+    def tearDown(self):
+        youfish._data_dir, youfish.get_settings, youfish.list_subscriptions = self._dd, self._gs, self._ls
+        youfish._feed_durations_cache, youfish._feed_cache = self._fd, self._fc
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_durations_cache_roundtrip(self):
+        youfish._save_durations({"a": 10, "b": 200})
+        self.assertEqual(youfish._load_saved_durations(), {"a": 10, "b": 200})
+
+    def test_shorts_cache_roundtrip(self):
+        youfish._save_shorts({"x", "y"})
+        self.assertEqual(youfish._load_saved_shorts(), {"x", "y"})
+
+    def test_shorts_filter_drops_known_shorts(self):
+        youfish.get_settings = lambda: {"hide_shorts": True}
+        youfish._feed_durations_cache["shorts"] = {"S1"}
+        items = [{"id": "V1"}, {"id": "S1"}, {"id": "V2"}]
+        self.assertEqual(youfish._feed_shorts_filter(items), [{"id": "V1"}, {"id": "V2"}])
+
+    def test_shorts_filter_noop_when_off(self):
+        youfish.get_settings = lambda: {"hide_shorts": False}
+        youfish._feed_durations_cache["shorts"] = {"S1"}
+        items = [{"id": "V1"}, {"id": "S1"}]
+        self.assertEqual(youfish._feed_shorts_filter(items), items)
+
+    def test_feed_durations_all_classified_is_instant(self):
+        cid = "UC00000000000000000000AA"                      # fully-classified feed → no yt-dlp needed
+        youfish.list_subscriptions = lambda: [{"id": cid, "url": "", "name": "A"}]
+        youfish._feed_cache = {"ts": 0.0, "items": [
+            {"id": "LONG", "channel_id": cid},
+            {"id": "OTHER", "channel_id": cid},
+            {"id": "SHORT", "channel_id": cid},
+        ]}
+        youfish._feed_durations_cache = {"ts": 0.0, "map": {"LONG": 300, "OTHER": 42}, "shorts": {"SHORT"}}
+        res = youfish.feed_durations()
+        self.assertEqual(res["durations"], {"LONG": 300, "OTHER": 42})   # SHORT has no /videos duration
+        self.assertEqual(res["shorts"], ["SHORT"])
+
+    def test_feed_with_durations_fills_cached_lengths(self):
+        youfish._feed_durations_cache = {"ts": 0.0, "map": {"A": 120}, "shorts": set()}
+        items = [{"id": "A", "duration": 0}, {"id": "C", "duration": 0}]
+        out = youfish._feed_with_durations(items)
+        self.assertEqual(out[0]["duration"], 120)   # cached → shows immediately with the feed
+        self.assertEqual(out[1]["duration"], 0)      # uncached → filled later by feed_durations
+
+
+class ResumeIdleTTL(unittest.TestCase):
+    """Resume points carry a last-touched stamp, expire after _RESUME_TTL idle, and old int-format
+    entries are grandfathered. Shared engine → passes in both apps."""
+    def setUp(self):
+        self._dd = youfish._data_dir
+        self._tmp = tempfile.mkdtemp(prefix="pos-")
+        youfish._data_dir = lambda: self._tmp
+
+    def tearDown(self):
+        youfish._data_dir = self._dd
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_set_get_roundtrip_and_forget(self):
+        youfish.set_position("AAAAAAAAAAA", 120)
+        self.assertEqual(youfish.get_position("AAAAAAAAAAA"), 120)
+        youfish.set_position("AAAAAAAAAAA", 0)
+        self.assertEqual(youfish.get_position("AAAAAAAAAAA"), 0)
+
+    def test_stale_entry_expires_on_read(self):
+        old = time.time() - (youfish._RESUME_TTL + 3600)
+        with open(youfish._positions_path(), "w") as f:
+            json.dump({"OLD": {"s": 90, "t": old}}, f)
+        self.assertEqual(youfish.get_position("OLD"), 0)          # idle past TTL → gone
+
+    def test_stale_swept_on_write(self):
+        old = time.time() - (youfish._RESUME_TTL + 3600)
+        with open(youfish._positions_path(), "w") as f:
+            json.dump({"OLD": {"s": 90, "t": old}, "KEEP": {"s": 30, "t": time.time()}}, f)
+        youfish.set_position("NEW", 50)
+        d = youfish._load_positions()
+        self.assertNotIn("OLD", d)                                # swept
+        self.assertIn("KEEP", d)
+        self.assertEqual(youfish.get_position("NEW"), 50)
+
+    def test_old_int_format_grandfathered(self):
+        with open(youfish._positions_path(), "w") as f:
+            json.dump({"LEGACY": 77}, f)                          # pre-change plain-int format
+        self.assertEqual(youfish.get_position("LEGACY"), 77)      # still readable
+        youfish.set_position("OTHER", 10)                         # a write migrates LEGACY
+        self.assertEqual(youfish._load_positions()["LEGACY"]["s"], 77)   # migrated + kept
+
+
+class HistoryLimitSetting(unittest.TestCase):
+    """Watch history is capped at the history_limit setting (FinTube-only store)."""
+    def setUp(self):
+        if not hasattr(youfish, "record_watch"):
+            self.skipTest("no watch-history store (FinTune)")
+        self._dd, self._gs = youfish._data_dir, youfish.get_settings
+        self._tmp = tempfile.mkdtemp(prefix="histlim-")
+        youfish._data_dir = lambda: self._tmp
+
+    def tearDown(self):
+        if hasattr(self, "_dd"):
+            youfish._data_dir, youfish.get_settings = self._dd, self._gs
+            shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_history_capped_at_setting(self):
+        youfish.get_settings = lambda: {"history_limit": 50}     # 50 = the clamp floor
+        for i in range(53):
+            youfish.record_watch("VID%08d" % i, 30, 600)         # 5% → not watched, just recorded
+        d = youfish._load_watch_history()
+        self.assertEqual(len(d), 50)                             # capped to the setting
+        self.assertIn("VID00000052", d)                         # newest kept
+        self.assertNotIn("VID00000000", d)                      # oldest dropped
+
+    def test_history_limit_clamped(self):
+        youfish.get_settings = lambda: {"history_limit": 999999}
+        self.assertEqual(youfish._history_limit(), 5000)         # clamp upper
+        youfish.get_settings = lambda: {"history_limit": 1}
+        self.assertEqual(youfish._history_limit(), 50)           # clamp lower
 
 
 if __name__ == "__main__":
