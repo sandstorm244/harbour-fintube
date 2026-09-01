@@ -23,6 +23,10 @@ Item {
     property real denoPct: -1
     property string denoStatusMsg: ""
     property var subscriptions: []
+    // YouTube login (cookies imported from the Sailfish Browser; enables premium / age-gated /
+    // members content + subscription import). Presence of the import IS the signed-in state.
+    property bool youtubeLoggedIn: false
+    property int  youtubeCookieCount: 0
     property bool hideShorts: true       // filter Shorts out of results (persisted by Python)
     property bool hideWatched: false     // hide watched videos from the feed + channel lists
     property bool sponsorBlock: true     // auto-skip SponsorBlock segments during playback
@@ -323,6 +327,38 @@ Item {
         })
     }
 
+    // --- YouTube login (browser cookies) + live subscription import ---
+    function loadLoginStatus() {
+        py.call("youfish.youtube_login_status", [], function(s) {
+            backend.youtubeLoggedIn = !!(s && s.logged_in)
+            backend.youtubeCookieCount = (s && s.count) || 0
+        })
+    }
+    // Import the signed-in session from the Sailfish Browser's cookie jar. res = {ok, count, error?}.
+    function importBrowserLogin(callback) {
+        py.call("youfish.youtube_import_login", [], function(res) {
+            backend.loadLoginStatus()
+            if (callback) callback(res || {})
+        })
+    }
+    function youtubeLogout(callback) {
+        py.call("youfish.youtube_logout", [], function(res) {
+            backend.youtubeLoggedIn = false
+            backend.youtubeCookieCount = 0
+            if (callback) callback(res || {})
+        })
+    }
+    // Import BOTH subscriptions and playlists from the signed-in account (needs an imported login).
+    // Refreshes whichever stores gained entries; res = {ok, subs_added, playlists_added, summary,
+    // error?} → caller callback.
+    function importYoutubeAccount(callback) {
+        py.call("youfish.import_youtube_account", [], function(res) {
+            if (res && res.subs_added > 0) backend.loadSubscriptions()
+            if (res && res.playlists_added > 0) backend.loadPlaylists()
+            if (callback) callback(res || {})
+        })
+    }
+
     // Import channel subscriptions from a NewPipe / PipePipe backup (.zip or raw newpipe.db).
     // Refreshes the list on success; result {ok, added, skipped, total, error?} → caller callback.
     function importNewpipe(path, callback) {
@@ -564,6 +600,7 @@ Item {
                 backend.recheck()
                 backend.recheckFfmpeg()
                 backend.loadSubscriptions()
+                backend.loadLoginStatus()
                 backend.loadSettings()
                 backend.loadDownloads()
                 backend.loadDownloadLocation()

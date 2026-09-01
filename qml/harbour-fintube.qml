@@ -46,6 +46,26 @@ ApplicationWindow {
     // (functions can't survive the var-array model), which MorePage routes here.
     function moreAction(key) {
         if (key === "import-newpipe") importNewpipe()
+        else if (key === "youtube-import") importYoutubeAccount()
+    }
+
+    // --- Live YouTube account import: subscriptions + playlists (Home → More → "Import from YouTube") ---
+    // Needs an imported browser login (More → Providers → YouTube account). Two network calls;
+    // a toast reports the combined result. Guarded so a signed-out tap explains itself.
+    function importYoutubeAccount() {
+        if (!app.backend.youtubeLoggedIn) {
+            app.showToast("Sign in first: More → Providers → YouTube account")
+            return
+        }
+        var win = app
+        win.showToast("Importing from YouTube…")
+        win.backend.importYoutubeAccount(function(res) {
+            if (!res || !res.ok) {
+                win.showToast((res && res.error) ? res.error : "Import failed")
+                return
+            }
+            win.showToast(res.summary || "Imported from YouTube")
+        })
     }
 
     // --- NewPipe / PipePipe subscription import (Home → More → "Import subscriptions") ---

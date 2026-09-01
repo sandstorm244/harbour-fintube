@@ -328,10 +328,15 @@ Page {
         }
         page.playRetries++
         var atMs = page.positionMs > 0 ? page.positionMs : page.resumeMs
-        page.resumeMs = atMs > 0 ? atMs : 0
+        page.resumeMs = atMs > 0 ? atMs : 0      // captured BEFORE stop() zeroes the position
         page.recoverAtMs = atMs + 5000    // 5s of clean playback past here = recovered
         page.errorText = ""
         page.resolving = true             // re-arm the onResolved handler + show the spinner
+        // Full teardown so the re-resolve rebuilds a FRESH pipeline — a GStreamer error leaves the
+        // old pipeline alive (setError doesn't tear it down), and play() only builds when there's
+        // none, so without this the recovery would replay the DEAD pipeline with stale URLs.
+        // Mirrors the swipe-out teardown path (position rides along in resumeMs → seekWhenReady).
+        gplayer.stop()
         retryTimer.restart()
     }
     Timer {

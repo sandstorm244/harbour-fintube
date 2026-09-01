@@ -19,6 +19,7 @@ sidecar is milestone M2. For now yt-dlp's android_vr client resolves without one
 
 import atexit
 import calendar
+import contextlib
 import ctypes
 import hashlib
 import html
@@ -32,6 +33,7 @@ import socket
 import socketserver
 import ssl
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -46,6 +48,56 @@ _BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # can hang when a network advertises IPv6 routes it can't actually carry.
 # (This is where PO-token / player-client args will accrue in M2.)
 _COMMON_ARGS = ("-4",)
+
+
+# --------------------------------------------------------------------------- #
+# Authenticated extraction: hand yt-dlp the imported YouTube login as cookies.
+# The session comes from the optional `ytm` module (import_browser_login reads the Sailfish
+# Browser's cookie jar). It is materialised to an EPHEMERAL, owner-only temp file per yt-dlp call
+# and removed straight after — there is never a persistent plaintext cookies file on disk, and a
+# per-call file means parallel calls (the subscription feed) never share/clobber one cookie jar.
+# --------------------------------------------------------------------------- #
+
+def _write_cookies_temp():
+    """Write the imported YouTube login (if any) to a fresh 0600 cookies.txt and return its path,
+    or "" when signed out / the ytm module isn't present (FinTube without a login). The CALLER
+    must remove the file when the yt-dlp call finishes."""
+    text = ""
+    try:
+        import ytm
+        text = ytm.netscape_cookies()
+    except Exception:
+        text = ""
+    if not text:
+        return ""
+    fd, path = tempfile.mkstemp(prefix="ytdlp-ck-", suffix=".txt")   # mkstemp creates it 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+    except Exception:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return ""
+    return path
+
+
+@contextlib.contextmanager
+def _cookies_args():
+    """Yield ["--cookies", <ephemeral file>] for authenticated extraction (age-gated / members /
+    premium content, fewer bot-wall 403s) when a YouTube login is imported, else []. The temp file
+    lives only for the `with` block. Used to splice *cargs into a yt-dlp argv right after
+    *_COMMON_ARGS. For a long-lived Popen (download) call _write_cookies_temp() directly instead."""
+    path = _write_cookies_temp()
+    try:
+        yield (["--cookies", path] if path else [])
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 # Playback uses SEPARATE video-only + audio-only tracks fed to a raw dual-source GStreamer
 # pipeline (YouTube killed the old muxed itag 22 in mid-2024). We select video by its PROPERTIES
@@ -451,9 +503,11 @@ def _ytdlp_formats(video_id):
     url = video_id if "://" in video_id else "https://www.youtube.com/watch?v=" + video_id
     _ensure_pot_server()  # a fresh URL is just as PO-gated; keep the token sidecar warm
     try:
-        proc = subprocess.run([path, *_COMMON_ARGS, *_pot_ytdlp_args(), *_yt_extractor_args(),
-                               "--dump-single-json", "--", url],
-                              capture_output=True, text=True, timeout=90)
+        with _cookies_args() as cargs:
+            proc = subprocess.run([path, *_COMMON_ARGS, *cargs, *_pot_ytdlp_args(),
+                                   *_yt_extractor_args(),
+                                   "--dump-single-json", "--", url],
+                                  capture_output=True, text=True, timeout=90)
         if proc.returncode != 0:
             return {}
         data = json.loads(proc.stdout)
@@ -1621,11 +1675,12 @@ def search(query, n=15, kind="video", start=1):
             # ytsearch<end> fetches enough hits to cover the wanted window; --playlist-items
             # then returns just [start:end], so paging deeper is a bigger fetch sliced tighter.
             target = "ytsearch%d:%s" % (end, query)
-        proc = subprocess.run(
-            [path, *_COMMON_ARGS, "--flat-playlist",
-             "--playlist-items", "%d:%d" % (start, end),
-             "--dump-single-json", "--", target],
-            capture_output=True, text=True, timeout=90)
+        with _cookies_args() as cargs:
+            proc = subprocess.run(
+                [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
+                 "--playlist-items", "%d:%d" % (start, end),
+                 "--dump-single-json", "--", target],
+                capture_output=True, text=True, timeout=90)
         if proc.returncode != 0:
             return {"ok": False, "error": (proc.stderr.strip()[:300] or "search failed")}
         data = json.loads(proc.stdout)
@@ -1734,9 +1789,11 @@ def resolve(video_id):
     def _dump(extra):
         """Run yt-dlp --dump-single-json with extra args; return (data, error)."""
         _td = time.time()
-        proc = subprocess.run(
-            [path, *_COMMON_ARGS, *_pot_ytdlp_args(), *extra, "--dump-single-json", "--", url],
-            capture_output=True, text=True, timeout=90)
+        with _cookies_args() as cargs:
+            proc = subprocess.run(
+                [path, *_COMMON_ARGS, *cargs, *_pot_ytdlp_args(), *extra,
+                 "--dump-single-json", "--", url],
+                capture_output=True, text=True, timeout=90)
         _tlog("dump %.2fs rc=%d" % (time.time() - _td, proc.returncode))
         if proc.returncode != 0:
             return None, (proc.stderr.strip()[:300] or "resolve failed")
@@ -2713,6 +2770,179 @@ def toggle_subscription(channel_id, name="", url="", thumbnail=""):
     return {"ok": True, "subscribed": subscribed, "subscriptions": subs}
 
 
+def import_youtube_subscriptions():
+    """Import the signed-in account's YouTube subscriptions via yt-dlp's feed/channels tab (needs
+    an imported browser login — see the ytm cookie module). New channels are added to the local
+    subscription store, deduped by id; returns an import summary shaped like import_newpipe."""
+    path = _ytdlp_path()
+    if not path:
+        return {"ok": False, "error": "yt-dlp not found"}
+    # feed/channels is empty / errors when signed out, so fail early with a clear hint.
+    try:
+        import ytm
+        signed_in = bool(ytm.netscape_cookies())
+    except Exception:
+        signed_in = False
+    if not signed_in:
+        return {"ok": False, "error": "Not signed in — import your YouTube login from the browser "
+                                      "first (More → Providers → YouTube account)."}
+    url = "https://www.youtube.com/feed/channels"
+    try:
+        with _cookies_args() as cargs:
+            proc = subprocess.run(
+                [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
+                 "--dump-single-json", "--", url],
+                capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            return {"ok": False,
+                    "error": (proc.stderr.strip()[:300] or "subscription fetch failed")}
+        data = json.loads(proc.stdout)
+    except Exception as ex:
+        return {"ok": False, "error": str(ex)}
+    entries = [e for e in (data.get("entries") or []) if e]
+    subs = list_subscriptions()
+    have = set(s.get("id") for s in subs if s.get("id"))
+    added = 0
+    for e in entries:
+        cid = e.get("id") or e.get("channel_id") or ""
+        curl = e.get("url") or e.get("channel_url") or ""
+        if not (cid or "").startswith("UC"):
+            m = re.search(r"/channel/(UC[\w-]+)", curl or "")   # some entries carry only a URL
+            cid = m.group(1) if m else ""
+        if not cid or cid in have:
+            continue
+        name = e.get("title") or e.get("channel") or e.get("uploader") or cid
+        if not curl:
+            curl = "https://www.youtube.com/channel/" + cid
+        thumb = ""
+        thumbs = e.get("thumbnails")
+        if isinstance(thumbs, list) and thumbs and isinstance(thumbs[-1], dict):
+            thumb = thumbs[-1].get("url", "") or ""
+        subs.append({"id": cid, "name": name, "url": curl, "thumbnail": thumb})
+        have.add(cid)
+        added += 1
+    if added:
+        _save_subscriptions(subs)
+        _feed_durations_cache["ts"] = 0.0   # a fresh channel is due on the next feed refresh
+    total = len(entries)
+    if total:
+        summary = ("Imported %d new channel%s (%d already subscribed)."
+                   % (added, "" if added == 1 else "s", total - added))
+    else:
+        summary = "No subscriptions found for this account."
+    return {"ok": True, "added": added, "skipped": total - added, "total": total,
+            "count": len(subs), "summary": summary}
+
+
+def import_youtube_playlists():
+    """Import the signed-in account's YouTube playlists via yt-dlp's feed/playlists tab (needs an
+    imported login). Each becomes a kind="youtube" library entry with EMPTY items — opening or
+    refreshing it fetches the videos, exactly like a NewPipe-imported saved playlist. Deduped by
+    list id; returns an import summary."""
+    path = _ytdlp_path()
+    if not path:
+        return {"ok": False, "error": "yt-dlp not found"}
+    try:
+        import ytm
+        signed_in = bool(ytm.netscape_cookies())
+    except Exception:
+        signed_in = False
+    if not signed_in:
+        return {"ok": False, "error": "Not signed in — import your YouTube login from the browser "
+                                      "first (More → Providers → YouTube account)."}
+    url = "https://www.youtube.com/feed/playlists"
+    try:
+        with _cookies_args() as cargs:
+            proc = subprocess.run(
+                [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
+                 "--dump-single-json", "--", url],
+                capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            return {"ok": False, "error": (proc.stderr.strip()[:300] or "playlist fetch failed")}
+        data = json.loads(proc.stdout)
+    except Exception as ex:
+        return {"ok": False, "error": str(ex)}
+    entries = [e for e in (data.get("entries") or []) if e]
+    lst = _load_playlists()
+    have_yt = set(p.get("yt_id") for p in lst if p.get("yt_id"))
+    list_re = re.compile(r"[?&]list=([0-9A-Za-z_-]+)")
+    added = 0
+    for e in entries:
+        yt_id = e.get("id") or ""
+        if not yt_id:
+            m = list_re.search(e.get("url") or "")
+            yt_id = m.group(1) if m else ""
+        # Skip empties, dupes, and any channel-id row (UC…) that isn't a real playlist — the
+        # uploads playlist is UU…, liked is LL, watch-later WL, user playlists PL…, so only UC is
+        # excluded. (Symmetric with the UC-check the subscription import relies on.)
+        if not yt_id or yt_id.startswith("UC") or yt_id in have_yt:
+            continue
+        title = (e.get("title") or e.get("channel") or "Playlist").strip()[:100] or "Playlist"
+        lst.insert(0, {"id": uuid.uuid4().hex[:12], "title": title,
+                       "kind": "youtube", "yt_id": yt_id, "items": []})
+        have_yt.add(yt_id)
+        added += 1
+    if added:
+        _save_playlists(lst)
+    total = len(entries)
+    if total:
+        summary = ("Imported %d new playlist%s (%d already saved)."
+                   % (added, "" if added == 1 else "s", total - added))
+    else:
+        summary = "No playlists found for this account."
+    return {"ok": True, "added": added, "skipped": total - added, "total": total,
+            "count": len(lst), "summary": summary}
+
+
+def import_youtube_account():
+    """One-shot import of BOTH subscriptions and playlists from the signed-in account — the
+    'Import from YouTube' action. Combined summary; ok when either half succeeds."""
+    subs = import_youtube_subscriptions()
+    pls = import_youtube_playlists()
+    sa = subs.get("added", 0) if subs.get("ok") else 0
+    pa = pls.get("added", 0) if pls.get("ok") else 0
+    if not subs.get("ok") and not pls.get("ok"):
+        return {"ok": False, "subs": subs, "playlists": pls, "subs_added": 0, "playlists_added": 0,
+                "error": subs.get("error") or pls.get("error") or "import failed"}
+    # Only name a half that actually added something, so a re-run (both already imported) reads
+    # "Nothing new to import." instead of "Imported 0 subscriptions and 0 playlists."
+    parts = []
+    if sa:
+        parts.append("%d subscription%s" % (sa, "" if sa == 1 else "s"))
+    if pa:
+        parts.append("%d playlist%s" % (pa, "" if pa == 1 else "s"))
+    summary = ("Imported " + " and ".join(parts) + ".") if parts else "Nothing new to import."
+    return {"ok": True, "subs": subs, "playlists": pls,
+            "subs_added": sa, "playlists_added": pa, "summary": summary}
+
+
+# QML-facing thin wrappers over the optional `ytm` cookie module, so the QML side only ever calls
+# one module (youfish) and degrades gracefully if ytm isn't present.
+def youtube_login_status():
+    try:
+        import ytm
+        return ytm.login_status()
+    except Exception:
+        return {"logged_in": False, "count": 0, "imported_at": 0, "source": ""}
+
+
+def youtube_import_login():
+    """Import the signed-in session from the Sailfish Browser cookie jar (see ytm)."""
+    try:
+        import ytm
+        return ytm.import_browser_login()
+    except Exception as ex:
+        return {"ok": False, "count": 0, "error": str(ex)}
+
+
+def youtube_logout():
+    try:
+        import ytm
+        return ytm.logout()
+    except Exception:
+        return {"logged_in": False}
+
+
 def _np_query(con, sql):
     """Run a SELECT against a NewPipe/PipePipe backup DB, returning [] when the table or a column
     is absent — the schema varies across NewPipe versions and PipePipe forks, so a missing piece
@@ -3029,10 +3259,11 @@ def channel_avatar(channel):
     if not url.rstrip("/").endswith("/videos"):
         url = url.rstrip("/") + "/videos"
     try:
-        proc = subprocess.run(
-            [path, *_COMMON_ARGS, "--flat-playlist", "--playlist-items", "1",
-             "--dump-single-json", "--", url],
-            capture_output=True, text=True, timeout=60)
+        with _cookies_args() as cargs:
+            proc = subprocess.run(
+                [path, *_COMMON_ARGS, *cargs, "--flat-playlist", "--playlist-items", "1",
+                 "--dump-single-json", "--", url],
+                capture_output=True, text=True, timeout=60)
         if proc.returncode != 0:
             return {"ok": False}
         data = json.loads(proc.stdout)
@@ -3064,12 +3295,13 @@ def channel_videos(channel, start=1, n=30):
     try:
         start = max(1, int(start))
         n = max(1, int(n))
-        proc = subprocess.run(
-            [path, *_COMMON_ARGS, "--flat-playlist",
-             "--extractor-args", "youtubetab:approximate_date",   # upload dates inline (RSS is gone)
-             "--playlist-items", "%d:%d" % (start, start + n - 1),
-             "--dump-single-json", "--", url],
-            capture_output=True, text=True, timeout=90)
+        with _cookies_args() as cargs:
+            proc = subprocess.run(
+                [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
+                 "--extractor-args", "youtubetab:approximate_date",   # upload dates inline (RSS is gone)
+                 "--playlist-items", "%d:%d" % (start, start + n - 1),
+                 "--dump-single-json", "--", url],
+                capture_output=True, text=True, timeout=90)
         if proc.returncode != 0:
             return {"ok": False, "error": (proc.stderr.strip()[:300] or "channel fetch failed")}
         data = json.loads(proc.stdout)
@@ -3120,12 +3352,13 @@ def _feed_from_ytdlp(path, cid, per_channel):
     the tab excludes Shorts itself, so no separate durations or Shorts pass is needed."""
     url = "https://www.youtube.com/channel/%s/videos" % cid
     try:
-        proc = subprocess.run(
-            [path, *_COMMON_ARGS, "--flat-playlist",
-             "--extractor-args", "youtubetab:approximate_date",
-             "--playlist-items", "1:%d" % per_channel,
-             "--dump-single-json", "--", url],
-            capture_output=True, text=True, timeout=60)
+        with _cookies_args() as cargs:
+            proc = subprocess.run(
+                [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
+                 "--extractor-args", "youtubetab:approximate_date",
+                 "--playlist-items", "1:%d" % per_channel,
+                 "--dump-single-json", "--", url],
+                capture_output=True, text=True, timeout=60)
         if proc.returncode != 0:
             return []
         data = json.loads(proc.stdout)
@@ -3445,10 +3678,11 @@ def feed_durations(limit_per_channel=30, force=False):
 
     def flat(url):
         try:
-            proc = subprocess.run(
-                [path, *_COMMON_ARGS, "--flat-playlist",
-                 "--playlist-end", str(int(limit_per_channel)), "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=60)
+            with _cookies_args() as cargs:
+                proc = subprocess.run(
+                    [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
+                     "--playlist-end", str(int(limit_per_channel)), "--dump-single-json", "--", url],
+                    capture_output=True, text=True, timeout=60)
             if proc.returncode != 0:
                 return []
             return json.loads(proc.stdout).get("entries", []) or []
@@ -3511,10 +3745,11 @@ def comments(video_id, limit=50):
     # max_comments = total,max-parents,max-replies,max-replies-per-thread — parents only.
     xargs = "youtube:max_comments=%d,%d,0,0;comment_sort=top" % (n, n)
     try:
-        proc = subprocess.run(
-            [path, *_COMMON_ARGS, "--skip-download", "--write-comments",
-             "--extractor-args", xargs, "--dump-single-json", "--", url],
-            capture_output=True, text=True, timeout=120)
+        with _cookies_args() as cargs:
+            proc = subprocess.run(
+                [path, *_COMMON_ARGS, *cargs, "--skip-download", "--write-comments",
+                 "--extractor-args", xargs, "--dump-single-json", "--", url],
+                capture_output=True, text=True, timeout=120)
         if proc.returncode != 0:
             return {"ok": False, "error": (proc.stderr.strip()[:300] or "comments failed")}
         data = json.loads(proc.stdout)
@@ -3670,10 +3905,12 @@ def download(video_id, title, kind):
     base = os.path.join(_downloads_dir(), "%s [%s] %s" % (_safe_name(title), vid, kind))
 
     def run():
+        ck = _write_cookies_temp()   # authenticated download (age-gated / members); rm in finally
         try:
             _ensure_pot_server()  # a download is just as PO-gated as playback
             proc = subprocess.Popen(
-                [binp, *_COMMON_ARGS, *_yt_extractor_args(), *_pot_ytdlp_args(), *_ffmpeg_args(),
+                [binp, *_COMMON_ARGS, *(["--cookies", ck] if ck else []),
+                 *_yt_extractor_args(), *_pot_ytdlp_args(), *_ffmpeg_args(),
                  "--no-playlist", "-f", fmt, *merge, "--no-part", "--newline",
                  "-o", base + ".%(ext)s", "--", url],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -3710,6 +3947,12 @@ def download(video_id, title, kind):
                 pyotherside.send("download_done", video_id, kind, False, msg)
         except Exception as ex:
             pyotherside.send("download_done", video_id, kind, False, str(ex))
+        finally:
+            if ck:
+                try:
+                    os.remove(ck)
+                except Exception:
+                    pass
 
     threading.Thread(target=run, daemon=True).start()
     return {"ok": True}
@@ -3833,10 +4076,11 @@ def youtube_playlist(ref, limit=200):
         return {"ok": False, "error": "yt-dlp not found"}
     url = ref if "://" in (ref or "") else ("https://www.youtube.com/playlist?list=" + (ref or ""))
     try:
-        proc = subprocess.run(
-            [path, *_COMMON_ARGS, *_yt_extractor_args(), "--flat-playlist",
-             "--playlist-end", str(int(limit)), "--dump-single-json", "--", url],
-            capture_output=True, text=True, timeout=120)
+        with _cookies_args() as cargs:
+            proc = subprocess.run(
+                [path, *_COMMON_ARGS, *cargs, *_yt_extractor_args(), "--flat-playlist",
+                 "--playlist-end", str(int(limit)), "--dump-single-json", "--", url],
+                capture_output=True, text=True, timeout=120)
         if proc.returncode != 0:
             return {"ok": False, "error": (proc.stderr.strip()[:300] or "playlist fetch failed")}
         data = json.loads(proc.stdout)
@@ -3906,10 +4150,11 @@ def channel_playlists(channel):
 
     def fetch(tab):
         try:
-            proc = subprocess.run(
-                [path, *_COMMON_ARGS, *_yt_extractor_args(), "--flat-playlist",
-                 "--dump-single-json", "--", base + tab],
-                capture_output=True, text=True, timeout=90)
+            with _cookies_args() as cargs:
+                proc = subprocess.run(
+                    [path, *_COMMON_ARGS, *cargs, *_yt_extractor_args(), "--flat-playlist",
+                     "--dump-single-json", "--", base + tab],
+                    capture_output=True, text=True, timeout=90)
             if proc.returncode != 0:
                 return []
             data = json.loads(proc.stdout)

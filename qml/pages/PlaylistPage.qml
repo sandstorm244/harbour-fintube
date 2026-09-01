@@ -14,6 +14,7 @@ Page {
     property bool ytView: ytRef.length > 0
     property bool saved: false
     property bool loading: true
+    property bool _autoRefreshed: false   // auto-fetch an imported YT playlist's videos once, on open
 
     ListModel { id: itemsModel }
 
@@ -42,13 +43,22 @@ Page {
             return
         }
         app.backend.getPlaylist(page.playlistId, function(pl) {
-            page.loading = false
             itemsModel.clear()
-            if (!pl) return
+            if (!pl) { page.loading = false; return }
             page.playlistTitle = pl.title || page.playlistTitle
             page.playlistKind = pl.kind || "local"
             var its = pl.items || []
+            // First open of a freshly-imported YouTube playlist (no items stored yet) → pull its
+            // videos now instead of making the user tap "Refresh from YouTube". Fires once
+            // (_autoRefreshed), so a genuinely empty or fetch-failed playlist can't loop. The
+            // spinner stays up: refreshPlaylist re-fetches, then its callback re-runs load().
+            if (page.playlistKind === "youtube" && its.length === 0 && !page._autoRefreshed) {
+                page._autoRefreshed = true
+                app.backend.refreshPlaylist(page.playlistId, function() { page.load() })
+                return
+            }
             for (var i = 0; i < its.length; i++) itemsModel.append(its[i])
+            page.loading = false
         })
     }
     Component.onCompleted: load()

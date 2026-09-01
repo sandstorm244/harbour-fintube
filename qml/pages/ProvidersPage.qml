@@ -333,6 +333,61 @@ Page {
                 onClicked: app.backend.updatePotProvider()
             }
 
+            SectionHeader { text: "YouTube account" }
+
+            Label {
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                text: "Sign in to YouTube in the Sailfish Browser, then import the session here. It "
+                      + "unlocks age-restricted, members-only and premium content, eases the robot "
+                      + "check, and lets you import your subscriptions.\n\n"
+                      + "Cookies stay on this device (owner-only) and are never uploaded. The session "
+                      + "eventually expires — just Re-import when it does."
+                color: Theme.secondaryColor
+                font.pixelSize: Theme.fontSizeExtraSmall
+            }
+
+            Label {
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                text: app.backend.youtubeLoggedIn
+                      ? ("Signed in — " + app.backend.youtubeCookieCount + " cookies imported.")
+                      : "Not signed in."
+                color: app.backend.youtubeLoggedIn ? Theme.highlightColor : Theme.secondaryColor
+                font.pixelSize: Theme.fontSizeSmall
+            }
+
+            Button {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: app.backend.youtubeLoggedIn ? "Re-import from browser"
+                                                  : "Import login from browser"
+                onClicked: app.backend.importBrowserLogin(function(res) {
+                    if (res && res.ok)
+                        app.showToast("Signed in (" + (res.count || 0) + " cookies)")
+                    else
+                        app.showToast((res && res.error) ? res.error : "Import failed")
+                })
+            }
+
+            Label {
+                visible: app.backend.youtubeLoggedIn
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                text: "Import your subscriptions and playlists from More → Import from YouTube."
+                color: Theme.secondaryColor
+                font.pixelSize: Theme.fontSizeExtraSmall
+            }
+
+            Button {
+                visible: app.backend.youtubeLoggedIn
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "Log out"
+                onClicked: app.backend.youtubeLogout(function() { app.showToast("Logged out") })
+            }
+
             SectionHeader { text: "Diagnostics" }
 
             Label {

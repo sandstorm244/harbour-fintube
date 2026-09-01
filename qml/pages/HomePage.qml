@@ -91,7 +91,9 @@ Page {
                     { title: "Settings", desc: "Playback + content", page: "SettingsPage.qml" },
                     { title: "Providers", desc: "yt-dlp, ffmpeg, PO-token provider", page: "ProvidersPage.qml" },
                     { title: "Import from NewPipe", desc: "Subs, history & playlists from a backup",
-                      action: "import-newpipe" }
+                      action: "import-newpipe" },
+                    { title: "Import from YouTube", desc: "Your subscriptions & playlists (needs sign-in)",
+                      action: "youtube-import" }
                 ]
             })
         }

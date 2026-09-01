@@ -1050,5 +1050,292 @@ class CaptionCuesCache(unittest.TestCase):
         self.assertEqual(youfish.caption_cues(""), {"ok": False, "cues": []})
 
 
+# --- YouTube login (cookies) + subscription import ------------------------------------------- #
+
+def _fake_ytm(text):
+    """Install a fake `ytm` module exposing netscape_cookies() → text, for the engine's lazy
+    `import ytm`. Returns the previous sys.modules entry (or None) so the caller can restore it."""
+    prev = sys.modules.get("ytm")
+    m = types.ModuleType("ytm")
+    m.netscape_cookies = lambda: text
+    sys.modules["ytm"] = m
+    return prev
+
+
+class CookiesArgs(unittest.TestCase):
+    def setUp(self):
+        self._prev = sys.modules.get("ytm")
+
+    def tearDown(self):
+        if self._prev is not None:
+            sys.modules["ytm"] = self._prev
+        else:
+            sys.modules.pop("ytm", None)
+
+    def test_signed_out_yields_empty(self):
+        _fake_ytm("")                               # netscape_cookies() == "" → no --cookies
+        with youfish._cookies_args() as cargs:
+            self.assertEqual(cargs, [])
+
+    def test_signed_in_yields_ephemeral_file_removed_after(self):
+        _fake_ytm("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tv\n")
+        with youfish._cookies_args() as cargs:
+            self.assertEqual(cargs[0], "--cookies")
+            path = cargs[1]
+            self.assertTrue(os.path.exists(path))   # exists during the with
+            with open(path) as f:
+                self.assertIn("SAPISID", f.read())
+        self.assertFalse(os.path.exists(path))      # and is removed after
+
+
+class ImportYoutubeSubs(unittest.TestCase):
+    def setUp(self):
+        self._ytdlp = youfish._ytdlp_path
+        self._run = youfish.subprocess.run
+        self._ls = youfish.list_subscriptions
+        self._save = youfish._save_subscriptions
+        self._prev_ytm = sys.modules.get("ytm")
+        self._store = []
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        youfish.list_subscriptions = lambda: list(self._store)
+        youfish._save_subscriptions = lambda subs: self._store.__setitem__(slice(None), subs)
+        _fake_ytm("# ck\n")                          # signed in
+
+    def tearDown(self):
+        youfish._ytdlp_path = self._ytdlp
+        youfish.subprocess.run = self._run
+        youfish.list_subscriptions = self._ls
+        youfish._save_subscriptions = self._save
+        if self._prev_ytm is not None:
+            sys.modules["ytm"] = self._prev_ytm
+        else:
+            sys.modules.pop("ytm", None)
+
+    def _mock_feed(self, entries):
+        data = {"entries": entries}
+        youfish.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=0, stdout=json.dumps(data), stderr="")
+
+    def test_maps_dedupes_and_saves(self):
+        self._store[:] = [{"id": "UChave", "name": "Have", "url": "", "thumbnail": ""}]
+        self._mock_feed([
+            {"id": "UCnew1", "url": "https://www.youtube.com/channel/UCnew1",
+             "title": "New One", "thumbnails": [{"url": "t1"}]},
+            {"id": "UChave", "url": "x", "title": "Have"},                       # already subscribed
+            {"url": "https://www.youtube.com/channel/UCfromurl", "title": "URL Only"},  # id from url
+            None,                                                                # malformed
+        ])
+        res = youfish.import_youtube_subscriptions()
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["added"], 2)                # UCnew1 + UCfromurl (UChave deduped)
+        ids = [s["id"] for s in self._store]
+        self.assertEqual(ids, ["UChave", "UCnew1", "UCfromurl"])
+        new1 = [s for s in self._store if s["id"] == "UCnew1"][0]
+        self.assertEqual(new1["name"], "New One")
+        self.assertEqual(new1["thumbnail"], "t1")
+        self.assertEqual(new1["url"], "https://www.youtube.com/channel/UCnew1")
+
+    def test_signed_out_is_a_clear_error(self):
+        _fake_ytm("")                                    # not signed in
+        self._mock_feed([{"id": "UCx", "title": "X"}])
+        res = youfish.import_youtube_subscriptions()
+        self.assertFalse(res["ok"])
+        self.assertIn("signed in", res["error"].lower())
+
+    def test_ytdlp_failure_surfaces(self):
+        youfish.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=1, stdout="", stderr="feed error")
+        res = youfish.import_youtube_subscriptions()
+        self.assertFalse(res["ok"])
+
+
+class ImportYoutubePlaylists(unittest.TestCase):
+    def setUp(self):
+        self._ytdlp = youfish._ytdlp_path
+        self._run = youfish.subprocess.run
+        self._lp = youfish._load_playlists
+        self._sp = youfish._save_playlists
+        self._prev_ytm = sys.modules.get("ytm")
+        self._store = []
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        youfish._load_playlists = lambda: list(self._store)
+        youfish._save_playlists = lambda lst: self._store.__setitem__(slice(None), lst)
+        _fake_ytm("# ck\n")
+
+    def tearDown(self):
+        youfish._ytdlp_path = self._ytdlp
+        youfish.subprocess.run = self._run
+        youfish._load_playlists = self._lp
+        youfish._save_playlists = self._sp
+        if self._prev_ytm is not None:
+            sys.modules["ytm"] = self._prev_ytm
+        else:
+            sys.modules.pop("ytm", None)
+
+    def _mock_feed(self, entries):
+        youfish.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=0, stdout=json.dumps({"entries": entries}), stderr="")
+
+    def test_maps_dedupes_and_stores_empty_youtube_entries(self):
+        self._store[:] = [{"id": "aaa", "title": "Old", "kind": "youtube",
+                           "yt_id": "PLhave", "items": []}]
+        self._mock_feed([
+            {"id": "PLnew", "url": "https://www.youtube.com/playlist?list=PLnew", "title": "New PL"},
+            {"id": "PLhave", "title": "Old"},                                  # dupe by yt_id
+            {"url": "https://www.youtube.com/playlist?list=LL", "title": "Liked"},  # id from url
+            None,
+        ])
+        res = youfish.import_youtube_playlists()
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["added"], 2)                       # PLnew + LL (PLhave deduped)
+        yt_ids = [p["yt_id"] for p in self._store]
+        self.assertIn("PLnew", yt_ids)
+        self.assertIn("LL", yt_ids)
+        newpl = [p for p in self._store if p["yt_id"] == "PLnew"][0]
+        self.assertEqual(newpl["kind"], "youtube")
+        self.assertEqual(newpl["items"], [])                    # lazy — fetched on open
+        self.assertEqual(newpl["title"], "New PL")
+
+    def test_skips_channel_id_rows(self):
+        # feed/playlists should only list playlists; if a channel-id (UC…) row slips in, it must
+        # NOT be stored as a bogus playlist (opening it would build playlist?list=UC… and fail).
+        self._mock_feed([
+            {"id": "UCnotaplaylist", "title": "Not a playlist"},
+            {"id": "PLreal", "title": "Real"},
+        ])
+        res = youfish.import_youtube_playlists()
+        self.assertEqual(res["added"], 1)
+        self.assertEqual([p["yt_id"] for p in self._store], ["PLreal"])
+
+    def test_signed_out_is_a_clear_error(self):
+        _fake_ytm("")
+        self._mock_feed([{"id": "PLx", "title": "X"}])
+        res = youfish.import_youtube_playlists()
+        self.assertFalse(res["ok"])
+        self.assertIn("signed in", res["error"].lower())
+
+
+class ImportYoutubeAccount(unittest.TestCase):
+    def setUp(self):
+        self._ytdlp = youfish._ytdlp_path
+        self._run = youfish.subprocess.run
+        self._ls = youfish.list_subscriptions
+        self._save_s = youfish._save_subscriptions
+        self._lp = youfish._load_playlists
+        self._sp = youfish._save_playlists
+        self._prev_ytm = sys.modules.get("ytm")
+        self._subs, self._pls = [], []
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        youfish.list_subscriptions = lambda: list(self._subs)
+        youfish._save_subscriptions = lambda s: self._subs.__setitem__(slice(None), s)
+        youfish._load_playlists = lambda: list(self._pls)
+        youfish._save_playlists = lambda p: self._pls.__setitem__(slice(None), p)
+        _fake_ytm("# ck\n")
+
+        def fake(cmd, **kw):
+            u = cmd[-1]                                          # the url is the last argv element
+            if "feed/channels" in u:
+                entries = [{"id": "UCa", "title": "Chan A",
+                            "url": "https://www.youtube.com/channel/UCa"}]
+            elif "feed/playlists" in u:
+                entries = [{"id": "PLa", "title": "PL A",
+                            "url": "https://www.youtube.com/playlist?list=PLa"}]
+            else:
+                entries = []
+            return types.SimpleNamespace(returncode=0,
+                                         stdout=json.dumps({"entries": entries}), stderr="")
+        youfish.subprocess.run = fake
+
+    def tearDown(self):
+        youfish._ytdlp_path = self._ytdlp
+        youfish.subprocess.run = self._run
+        youfish.list_subscriptions = self._ls
+        youfish._save_subscriptions = self._save_s
+        youfish._load_playlists = self._lp
+        youfish._save_playlists = self._sp
+        if self._prev_ytm is not None:
+            sys.modules["ytm"] = self._prev_ytm
+        else:
+            sys.modules.pop("ytm", None)
+
+    def test_imports_both_and_combines_summary(self):
+        res = youfish.import_youtube_account()
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["subs_added"], 1)
+        self.assertEqual(res["playlists_added"], 1)
+        self.assertIn("subscription", res["summary"])
+        self.assertIn("playlist", res["summary"])
+        self.assertEqual([s["id"] for s in self._subs], ["UCa"])
+        self.assertEqual([p["yt_id"] for p in self._pls], ["PLa"])
+
+    def test_reimport_says_nothing_new(self):
+        # Both halves succeed but add nothing (already imported) → clean "Nothing new" summary,
+        # not "Imported 0 subscriptions and 0 playlists."
+        self._subs[:] = [{"id": "UCa", "name": "Chan A", "url": "", "thumbnail": ""}]
+        self._pls[:] = [{"id": "x", "title": "PL A", "kind": "youtube", "yt_id": "PLa", "items": []}]
+        res = youfish.import_youtube_account()
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["subs_added"], 0)
+        self.assertEqual(res["playlists_added"], 0)
+        self.assertEqual(res["summary"], "Nothing new to import.")
+
+    def test_signed_out_fails_cleanly(self):
+        _fake_ytm("")
+        res = youfish.import_youtube_account()
+        self.assertFalse(res["ok"])
+        self.assertIn("signed in", res["error"].lower())
+        self.assertEqual(res["subs_added"], 0)          # always present, even on the fail path
+        self.assertEqual(res["playlists_added"], 0)
+
+
+class YtmCookieModule(unittest.TestCase):
+    def setUp(self):
+        import ytm
+        self.ytm = ytm
+        self._dd = ytm._data_dir
+        self._rj = ytm._read_cookie_jar
+        self._paths = ytm._BROWSER_COOKIE_PATHS
+        self._tmp = tempfile.mkdtemp()
+        # Patch _data_dir (which _cookies_path derives from AND _save_cookies uses for its temp), so
+        # the atomic os.replace stays within one filesystem instead of crossing /tmp <-> the real dir.
+        ytm._data_dir = lambda: self._tmp
+
+    def tearDown(self):
+        self.ytm._data_dir = self._dd
+        self.ytm._read_cookie_jar = self._rj
+        self.ytm._BROWSER_COOKIE_PATHS = self._paths
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_netscape_from_rows_format(self):
+        rows = [("SAPISID", "v", ".youtube.com", "/", 123, 1),
+                ("X", "y", "youtube.com", "", 0, 0)]
+        txt = self.ytm._netscape_from_rows(rows)
+        self.assertTrue(txt.startswith("# Netscape HTTP Cookie File"))
+        self.assertIn("\t".join([".youtube.com", "TRUE", "/", "TRUE", "123", "SAPISID", "v"]), txt)
+        self.assertIn("\t".join(["youtube.com", "FALSE", "/", "FALSE", "0", "X", "y"]), txt)  # ""→"/"
+
+    def test_status_roundtrip_and_logout(self):
+        self.assertFalse(self.ytm.login_status()["logged_in"])
+        self.assertEqual(self.ytm.netscape_cookies(), "")
+        self.ytm._save_cookies({"ytdlp": "# ck\n", "count": 5,
+                                "imported_at": 111, "source": "/jar"})
+        st = self.ytm.login_status()
+        self.assertTrue(st["logged_in"])
+        self.assertEqual(st["count"], 5)
+        self.assertEqual(self.ytm.netscape_cookies(), "# ck\n")
+        self.ytm.logout()
+        self.assertFalse(self.ytm.login_status()["logged_in"])
+        self.assertEqual(self.ytm.netscape_cookies(), "")
+
+    def test_import_rejects_jar_without_session(self):
+        # cookies present but no login marker (no SAPISID/*PSID) → clear "not signed in" error.
+        self.ytm._read_cookie_jar = lambda p: [("PREF", "x", ".youtube.com", "/", 0, 0)]
+        self.ytm._BROWSER_COOKIE_PATHS = [self._tmp + "/cookies.sqlite"]
+        open(self._tmp + "/cookies.sqlite", "w").close()   # make the candidate path exist
+        res = self.ytm.import_browser_login()
+        self.assertFalse(res["ok"])
+        self.assertIn("signed-in", res["error"].lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
