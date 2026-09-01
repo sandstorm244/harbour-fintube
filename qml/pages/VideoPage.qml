@@ -6,12 +6,35 @@ import FinTube 1.0
 
 Page {
     id: page
-    allowedOrientations: Orientation.All
+    // Details-only view has no video, so keep it upright; the player view rotates freely.
+    allowedOrientations: page.infoOnly ? Orientation.Portrait : Orientation.All
 
     property string videoId: ""
     readonly property string shareUrl: "https://www.youtube.com/watch?v=" + page.videoId
     property string title: ""
     property bool fromQueue: false    // launched from a playlist → auto-advance to the next on end
+
+    // Details-only view: title / description / channel / comments, NO playback. Opened from a
+    // video's long-press menu. Uses the lightweight video_info() (works even on unplayable videos)
+    // and never touches the shared player, so it can't disturb background audio.
+    property bool infoOnly: false
+    property string infoThumbnail: ""
+    property int viewCount: 0
+    property int likeCount: 0
+    property string uploadDate: ""    // YYYYMMDD from yt-dlp
+
+    // The single, persistent player lives at the app level so audio survives leaving this page;
+    // this page borrows it (reparents it into videoSurface) while open. Every gplayer.* below
+    // operates on that shared instance.
+    readonly property var gplayer: app.gplayer
+    property bool reattaching: false  // reopened onto the still-playing video → adopt, don't restart
+    // Does THIS page currently hold the shared player? True only while gplayer is reparented into
+    // our videoSurface. The single ownership signal: an info-only page never attaches it, and a
+    // page displaced by a newer video (its player reparented away) reads false — so signal handlers
+    // and teardown below act ONLY for the page whose video is actually on the shared player.
+    readonly property bool holdsPlayer: gplayer.parent === videoSurface
+    property bool _played: false      // completed an initial load+claim once (foreground-reclaim guard)
+
     property string channel: ""
     property string channelId: ""
     property string channelUrl: ""
@@ -67,6 +90,9 @@ Page {
     property string commentsError: ""
     property int commentsShown: 5     // client-side page size; grows on scroll
     property int commentsTotal: 0     // YouTube's real total (for the header)
+    property var repliesExpanded: ({}) // comment id → its reply thread revealed?
+    property bool repliesLoading: false // background reply top-up in flight
+    property bool repliesLoaded: false  // replies merged in (or the top-up failed — fire once)
 
     // Re-evaluates whenever the saved-channel list changes, so the button stays in sync.
     property bool subscribed: {
@@ -304,7 +330,9 @@ Page {
     }
     Connections {
         target: gplayer
-        onEnded: { page.markFinished(); page.playNextInQueue() }
+        // Only the page whose video is actually on the shared player reacts — otherwise an
+        // info-only or stacked page would mark ITS video watched when a DIFFERENT video ends.
+        onEnded: if (page.holdsPlayer) { page.markFinished(); page.playNextInQueue() }
     }
 
     // A googlevideo stream can 403 mid-playback (session throttle) faster than the proxy's
@@ -353,6 +381,16 @@ Page {
 
     // Tap-to-load comments. One backend fetch of a capped batch; the section then reveals
     // page.commentsShown of them and grows as the user scrolls (see infoFlick).
+    // Toggle a comment's reply thread open/closed. Reassign a fresh object so the delegate binding
+    // (repliesExpanded[cid]) actually re-evaluates — mutating in place wouldn't notify.
+    function toggleReplies(cid) {
+        if (!cid) return
+        var m = {}
+        for (var k in page.repliesExpanded) m[k] = page.repliesExpanded[k]
+        m[cid] = !m[cid]
+        page.repliesExpanded = m
+    }
+
     function loadComments() {
         if (page.commentsLoading || page.commentsLoaded)
             return
@@ -365,9 +403,48 @@ Page {
                 page.comments = res.comments || []
                 page.commentsTotal = res.total || (res.comments ? res.comments.length : 0)
                 page.commentsLoaded = true
+                page.loadReplies()         // top up reply threads in the background
             } else {
                 page.commentsError = (res && res.error) ? res.error : "couldn't load comments"
             }
+        })
+    }
+
+    // Background reply top-up: fetch the same top comments WITH their replies and merge them into
+    // the already-shown list by id, so the "View N replies" expanders appear a moment after the
+    // (fast, parents-only) comments do — without ever blocking the initial paint. Fires once.
+    function loadReplies() {
+        if (page.repliesLoading || page.repliesLoaded || page.comments.length === 0)
+            return
+        page.repliesLoading = true
+        app.backend.fetchCommentReplies(page.videoId, 50, function(res) {
+            if (!page) return
+            page.repliesLoading = false
+            page.repliesLoaded = true      // one shot: a failed/empty top-up just leaves replies off
+            if (!res || !res.ok || !res.comments || res.comments.length === 0)
+                return
+            var byId = {}
+            for (var i = 0; i < res.comments.length; i++) {
+                var rc = res.comments[i]
+                if (rc && rc.id) byId[rc.id] = rc
+            }
+            // Rebuild the list (same order/count) attaching replies where the top-up has them, so
+            // the reassignment re-evaluates the delegate bindings and the expanders light up.
+            var merged = []
+            for (var j = 0; j < page.comments.length; j++) {
+                var c = page.comments[j]
+                var withR = c && c.id ? byId[c.id] : null
+                if (withR && withR.replies && withR.replies.length > 0) {
+                    var nc = {}
+                    for (var k in c) nc[k] = c[k]
+                    nc.replies = withR.replies
+                    nc.reply_count = withR.reply_count
+                    merged.push(nc)
+                } else {
+                    merged.push(c)
+                }
+            }
+            page.comments = merged
         })
     }
 
@@ -430,18 +507,99 @@ Page {
         page.skipHint = t
         skipHintTimer.restart()
     }
-    // Become the app's now-playing source (drives the cover). Stopping any previous holder
-    // first keeps a single pipeline playing at a time.
+    // Borrow the shared player: reparent it behind our overlays, size it to the video box, thaw
+    // its video branch. Called on open (fresh or reattach). bgAudioActive clears — a page is now
+    // in charge of the cover, not the app-level background controller.
+    function attachPlayer() {
+        gplayer.anchors.fill = undefined     // drop the old-parent anchor before reparenting
+        gplayer.parent = videoSurface
+        gplayer.anchors.fill = videoSurface
+        gplayer.visible = Qt.binding(function() { return page.useGst })
+        gplayer.setVideoActive(true)
+        app.bgAudioActive = false
+    }
+
+    // Populate the info column + the player's menus from a resolve() result. Shared by the fresh
+    // resolve (onResolved) and the reattach path (from the stashed app.lastResolvedInfo). Touches
+    // TransportControls, so it's for the PLAYING page only — the info-only view uses loadInfoOnly().
+    function populateMetadata(info) {
+        page.isLive = !!info.is_live
+        page.channel = info.uploader || ""
+        page.channelId = info.channel_id || ""
+        page.channelUrl = info.channel_url || ""
+        page.description = info.description || ""
+        page.videoDuration = info.duration || 0
+        page.chapters = info.chapters || []
+        page.qualities = info.qualities || []
+        // Reflect the track we actually started on — the default-quality cap may not be the top of
+        // the ladder — falling back to the highest if we can't match it.
+        page.currentQuality = ""
+        for (var qi = 0; qi < page.qualities.length; qi++) {
+            if (page.qualities[qi].itag === info.video_itag) {
+                page.currentQuality = page.qualities[qi].label
+                break
+            }
+        }
+        if (page.currentQuality.length === 0 && page.qualities.length > 0)
+            page.currentQuality = page.qualities[0].label
+        // Captions: hand the two lists to the overlay, clear any prior track, then auto-enable the
+        // remembered language if this video offers it.
+        transport.captionTracks = info.tracks || []
+        transport.captionTranslations = info.translations || []
+        page.selectCaption(null, false)
+        page.autoSelectCaption(transport.captionTracks, transport.captionTranslations)
+        // Audio tracks (dubs): the engine already started the remembered/original language, so
+        // just hand the list over and mark which itag is playing for the picker's highlight.
+        transport.audioTracks = info.audio_tracks || []
+        transport.currentAudioItag = info.audio_itag || ""
+        if (page.channelUrl.length > 0 || page.channelId.length > 0)
+            app.backend.fetchChannelAvatar(page.channelUrl || page.channelId,
+                function(res) { if (page && res && res.thumbnail) page.channelAvatar = res.thumbnail })
+    }
+
+    // Details-only load: lightweight metadata via video_info() (no playback, no player). Works even
+    // when the video can't be played here (geo-blocked / bot-walled) — the point of the view.
+    function loadInfoOnly() {
+        page.resolving = true
+        app.backend.videoInfo(page.videoId, function(res) {
+            if (!page) return
+            page.resolving = false
+            if (!res || !res.ok) {
+                page.errorText = (res && res.error) ? res.error : "couldn't load details"
+                return
+            }
+            var info = res.info || {}
+            page.isLive = !!info.is_live
+            page.channel = info.uploader || ""
+            page.channelId = info.channel_id || ""
+            page.channelUrl = info.channel_url || ""
+            page.description = info.description || ""
+            page.videoDuration = info.duration || 0
+            page.chapters = info.chapters || []
+            if (page.title.length === 0) page.title = info.title || ""
+            page.infoThumbnail = info.thumbnail || ""
+            page.viewCount = info.view_count || 0
+            page.likeCount = info.like_count || 0
+            page.uploadDate = info.upload_date || ""
+            if (page.channelUrl.length > 0 || page.channelId.length > 0)
+                app.backend.fetchChannelAvatar(page.channelUrl || page.channelId,
+                    function(r) { if (page && r && r.thumbnail) page.channelAvatar = r.thumbnail })
+        })
+    }
+
+    // Become the app's now-playing source (drives the cover + lockscreen). With one shared player
+    // there's no separate pipeline to stop here — the fresh-open path already stopped the old one
+    // (see Component.onCompleted) — so this just publishes the current video and takes control.
     function claimNowPlaying() {
-        app.nowPlaying.stopRequested()
+        app.bgAudioActive = false
+        page._played = true          // we've loaded a playable video (gst OR HLS) at least once
+        app.nowPlaying.videoId = page.videoId
         app.nowPlaying.title = page.title
         app.nowPlaying.channel = page.channel
         app.nowPlaying.playing = page.isPlaying
         app.nowPlaying.active = true
         nowPlayingConn.target = app.nowPlaying   // listen only after we've claimed
-        // Route the equalizer / volume-boost settings to this page's GStreamer player.
-        app.activePlayer = gplayer
-        app.applyAudioFx()
+        app.applyAudioFx()                       // route EQ / boost to the (shared) player
         // NB: the remembered speed is primed on gplayer before play() (in onResolved) and engaged
         // by the C++ player during preroll — nothing rate-related happens here.
     }
@@ -451,13 +609,13 @@ Page {
         target: null
         onToggleRequested: page.togglePlay()
         onStopRequested: {
-            // A newer video is taking over — stop this one and release the claim.
+            // A newer source (another video, or a downloaded file) is taking over — stop this one
+            // and release the claim.
             page.persistPosition()
             gplayer.stop()
             mediaPlayer.stop()
             nowPlayingConn.target = null
-            if (app.activePlayer === gplayer)
-                app.activePlayer = null
+            app.nowPlaying.videoId = ""
         }
     }
 
@@ -498,43 +656,13 @@ Page {
         target: page.resolving ? app.backend : null
         onResolved: {
             page.resolving = false
-            page.isLive = !!info.is_live
+            page.reattaching = false
             // Prime the remembered speed while the pipeline doesn't exist yet (setRate is a no-op
             // without a pipeline — no seek). The C++ player then engages it during preroll, before
             // the first frame, so both the audio and video branches take it together — no flush,
             // no dark flash, no audio/video rate split.
             gplayer.rate = page.playbackRate
-            page.channel = info.uploader || ""
-            page.channelId = info.channel_id || ""
-            page.channelUrl = info.channel_url || ""
-            page.description = info.description || ""
-            page.videoDuration = info.duration || 0
-            page.chapters = info.chapters || []
-            page.qualities = info.qualities || []
-            // Reflect the track we actually started on — the default-quality cap may not be
-            // the top of the ladder — falling back to the highest if we can't match it.
-            page.currentQuality = ""
-            for (var qi = 0; qi < page.qualities.length; qi++) {
-                if (page.qualities[qi].itag === info.video_itag) {
-                    page.currentQuality = page.qualities[qi].label
-                    break
-                }
-            }
-            if (page.currentQuality.length === 0 && page.qualities.length > 0)
-                page.currentQuality = page.qualities[0].label
-            // Captions: hand the two lists to the overlay, clear any prior video's track, then
-            // auto-enable the remembered language if this video offers it.
-            transport.captionTracks = info.tracks || []
-            transport.captionTranslations = info.translations || []
-            page.selectCaption(null, false)
-            page.autoSelectCaption(transport.captionTracks, transport.captionTranslations)
-            // Audio tracks (dubs): the engine already started the remembered/original language, so
-            // just hand the list over and mark which itag is playing for the picker's highlight.
-            transport.audioTracks = info.audio_tracks || []
-            transport.currentAudioItag = info.audio_itag || ""
-            if (page.channelUrl.length > 0 || page.channelId.length > 0)
-                app.backend.fetchChannelAvatar(page.channelUrl || page.channelId,
-                    function(res) { if (page && res && res.thumbnail) page.channelAvatar = res.thumbnail })
+            page.populateMetadata(info)
             if (info.video_url && info.video_url.length > 0
                     && info.audio_url && info.audio_url.length > 0) {
                 page.useGst = true
@@ -567,8 +695,13 @@ Page {
             } else {
                 page.errorText = "no playable stream"
             }
-            if (page.errorText.length === 0)
+            if (page.errorText.length === 0) {
                 page.claimNowPlaying()
+                // Stash the resolved metadata so reopening this still-playing video repopulates the
+                // page instantly (reattach) without a re-resolve or a restart.
+                app.lastResolvedInfo = info
+                app.lastResolvedId = page.videoId
+            }
         }
         onResolveError: {
             page.resolving = false
@@ -579,7 +712,9 @@ Page {
 
     Connections {
         target: gplayer
-        onErrorOccurred: page.recoverPlayback(message)
+        // Only the owning page recovers — otherwise an info-only or stacked page would hijack the
+        // shared player (stop background audio, re-resolve + play ITS own video) on any error.
+        onErrorOccurred: if (page.holdsPlayer) page.recoverPlayback(message)
         // Position restore after a switch/resume now happens in the C++ player at preroll
         // (seekWhenReady → ASYNC_DONE), where BOTH branches are guaranteed linked — no QML timer.
     }
@@ -597,6 +732,28 @@ Page {
     // reason, close the menu with them — otherwise the open flag leaves an invisible, dead menu.
     onControlsShownChanged: if (!page.controlsShown) {
         transport.playbackMenuOpen = false
+    }
+
+    // Foreground sync for a STACKED page: while this page sat in the back stack, a newer video page
+    // could have taken the shared player. When we return to the top and the player has moved on to
+    // another video, reclaim it for this page — reload our video onto it (stopping the other one).
+    // Skipped on first show (still resolving) and while our own video is the one playing.
+    onStatusChanged: {
+        if (status !== PageStatus.Active || page.infoOnly || page.resolving || !page._played)
+            return                              // never loaded a video yet (first show) → nothing to reclaim
+        if (app.nowPlaying.videoId === page.videoId)
+            return                              // still our video on the shared player — nothing to do
+        page.errorText = ""
+        page.useGst = false
+        page.resolving = true                   // re-arm onResolved + show the spinner
+        app.nowPlaying.stopRequested()          // stop whatever took the player
+        gplayer.stop()
+        page.attachPlayer()
+        app.backend.resumePosition(page.videoId, function(sec) {
+            if (!page) return
+            page.resumeMs = (sec || 0) * 1000
+            app.backend.resolve(page.videoId)
+        })
     }
 
     // Position ticks (500ms) drive the SponsorBlock auto-skip check. They also clear the
@@ -698,7 +855,41 @@ Page {
 
     Component.onCompleted: {
         page.updateCutout()
+
+        // Details-only view: no player, no resume, no sponsor skips — just load the metadata.
+        if (page.infoOnly) {
+            page.loadInfoOnly()
+            return
+        }
+
         app.lastVideo = null    // we're watching this now → hide the resume bar
+
+        // Reattach: reopened onto the video that's still playing in the shared background player.
+        // Adopt it exactly as it is (no re-resolve, no restart) and repopulate the page from the
+        // stashed resolve() info, so browsing away and back is seamless.
+        if (app.bgAudioActive && app.nowPlaying.videoId === page.videoId
+                && app.lastResolvedId === page.videoId && app.lastResolvedInfo
+                && (gplayer.playing || gplayer.position > 0)) {
+            page.reattaching = true
+            page.useGst = true
+            page.attachPlayer()
+            gplayer.requestRepaint()        // repaint the live frame into the reattached surface
+            page.populateMetadata(app.lastResolvedInfo)
+            page.claimNowPlaying()
+            page.resolving = false
+            page.reattaching = false
+            if (app.backend.sponsorBlock)   // segments were dropped with the old page → re-fetch
+                app.backend.sponsorSegments(videoId, function(segs) {
+                    if (page) page.sponsorSegments = segs || []
+                })
+            return
+        }
+
+        // Fresh video: stop whatever's currently playing (a download, or a backgrounded video),
+        // take the shared player, then resolve + play.
+        app.nowPlaying.stopRequested()
+        gplayer.stop()
+        page.attachPlayer()
         // Fetch the saved position FIRST, then resolve — both share the Python worker and
         // resolve() is slow, so kicking it off inside the position callback guarantees
         // resumeMs is set before onResolved fires (otherwise the seek target is still 0).
@@ -733,24 +924,52 @@ Page {
                   topMargin: (page.landscape || page.portraitFull) ? 0 : page.notchOffset }
         height: (page.landscape || page.portraitFull) ? page.height : Math.round(width * 9 / 16)
 
-        VideoPlayer {
-            id: gplayer
-            anchors.fill: parent
-            visible: page.useGst
-            // Set before playback so the player picks its FBO render target + pipeline branch.
-            hwDecode: app.backend.hwDecode
-        }
+        // The app-level shared player (app.gplayer) is reparented into here while the page is open,
+        // so it sits BEHIND the controls / overlays that follow. attachPlayer()/parkPlayer() move
+        // it; declared first, so the reparented player renders at the bottom of the stack.
+        Item { id: videoSurface; anchors.fill: parent }
+
         VideoOutput {
             anchors.fill: parent
             source: mediaPlayer
             fillMode: VideoOutput.PreserveAspectFit
-            visible: !page.useGst
+            visible: !page.useGst && !page.infoOnly
+        }
+
+        // Details-only view: a still thumbnail stands in for the (absent) player, with a Watch
+        // button to switch to real playback.
+        Image {
+            anchors.fill: parent
+            visible: page.infoOnly && page.infoThumbnail.length > 0
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            source: page.infoOnly ? page.infoThumbnail : ""
+        }
+        BackgroundItem {
+            anchors.centerIn: parent
+            width: watchRow.width + 2 * Theme.paddingLarge
+            height: Theme.itemSizeMedium
+            visible: page.infoOnly && !page.resolving && page.errorText.length === 0
+            Row {
+                id: watchRow
+                anchors.centerIn: parent
+                spacing: Theme.paddingSmall
+                Label { text: "▶"; color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeLarge
+                        anchors.verticalCenter: parent.verticalCenter }
+                Label { text: "Watch"; color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeMedium
+                        anchors.verticalCenter: parent.verticalCenter }
+            }
+            onClicked: pageStack.replace(Qt.resolvedUrl("VideoPage.qml"),
+                { videoId: page.videoId, title: page.title })
         }
 
         BusyIndicator {
             anchors.centerIn: parent
             size: BusyIndicatorSize.Large
-            running: page.resolving
+            // Not while reattaching — the live video is already showing behind us.
+            running: page.resolving && !page.reattaching
         }
         Label {
             anchors.centerIn: parent
@@ -764,7 +983,7 @@ Page {
 
         MouseArea {
             anchors.fill: parent
-            enabled: !page.resolving && page.errorText.length === 0
+            enabled: !page.resolving && page.errorText.length === 0 && !page.infoOnly
             onClicked: {
                 var zone = mouse.x < width / 2 ? "left" : "right"
                 if (page.seekActive) {
@@ -855,7 +1074,7 @@ Page {
         TransportControls {
             id: transport
             anchors.fill: parent
-            visible: !page.resolving && page.errorText.length === 0
+            visible: !page.resolving && page.errorText.length === 0 && !page.infoOnly
             enabled: page.controlsShown
             opacity: page.controlsShown ? 1 : 0
             Behavior on opacity { FadeAnimation {} }
@@ -991,6 +1210,24 @@ Page {
                 wrapMode: Text.Wrap
                 font.pixelSize: Theme.fontSizeMedium
                 color: Theme.highlightColor
+            }
+
+            // Stats line (details view only — resolve() doesn't carry these): views · likes · date.
+            Label {
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                visible: page.infoOnly && text.length > 0
+                text: {
+                    var parts = []
+                    if (page.viewCount > 0) parts.push(page.fmtCount(page.viewCount) + " views")
+                    if (page.likeCount > 0) parts.push("▲ " + page.fmtCount(page.likeCount))
+                    if (page.uploadDate.length === 8)
+                        parts.push(page.uploadDate.substr(0, 4) + "-"
+                                   + page.uploadDate.substr(4, 2) + "-" + page.uploadDate.substr(6, 2))
+                    return parts.join("   ·   ")
+                }
+                font.pixelSize: Theme.fontSizeExtraSmall
+                color: Theme.secondaryColor
             }
 
             Item {
@@ -1179,8 +1416,12 @@ Page {
                 Repeater {
                     model: page.commentsLoaded ? Math.min(page.commentsShown, page.comments.length) : 0
                     delegate: Item {
+                        id: cmt
                         width: commentsCol.width
                         property var c: page.comments[index]
+                        property string cid: c ? (c.id || "") : ""
+                        property bool hasReplies: !!(c && c.replies && c.replies.length > 0)
+                        property bool repExpanded: !!page.repliesExpanded[cid]
                         height: Math.max(cAvatar.height, cCol.height) + Theme.paddingSmall
 
                         Image {
@@ -1225,6 +1466,82 @@ Page {
                                 font.pixelSize: Theme.fontSizeExtraSmall
                                 color: Theme.secondaryColor
                             }
+
+                            // Reply thread — tap to reveal the fetched replies, indented below.
+                            BackgroundItem {
+                                visible: hasReplies
+                                width: parent.width
+                                height: Theme.itemSizeExtraSmall
+                                Label {
+                                    anchors { left: parent.left; verticalCenter: parent.verticalCenter }
+                                    text: {
+                                        if (!c) return ""
+                                        var n = c.reply_count || (c.replies ? c.replies.length : 0)
+                                        return repExpanded ? "▴  Hide replies"
+                                            : ("▾  " + page.fmtCount(n) + (n === 1 ? " reply" : " replies"))
+                                    }
+                                    font.pixelSize: Theme.fontSizeExtraSmall
+                                    color: Theme.highlightColor
+                                }
+                                onClicked: page.toggleReplies(cid)
+                            }
+                            Column {
+                                width: parent.width
+                                visible: repExpanded
+                                spacing: Theme.paddingSmall
+                                Repeater {
+                                    model: (cmt.repExpanded && cmt.c && cmt.c.replies) ? cmt.c.replies.length : 0
+                                    delegate: Item {
+                                        width: parent.width
+                                        property var r: cmt.c.replies[index]
+                                        height: Math.max(rAvatar.height, rCol.height) + Theme.paddingSmall / 2
+                                        Image {
+                                            id: rAvatar
+                                            x: Theme.paddingMedium
+                                            y: 0
+                                            width: (r && r.thumbnail) ? Theme.iconSizeExtraSmall : 0
+                                            height: width
+                                            fillMode: Image.PreserveAspectCrop
+                                            asynchronous: true
+                                            smooth: true
+                                            source: (r && r.thumbnail) ? r.thumbnail : ""
+                                        }
+                                        Column {
+                                            id: rCol
+                                            anchors {
+                                                left: rAvatar.right
+                                                leftMargin: (r && r.thumbnail) ? Theme.paddingSmall
+                                                                                : Theme.paddingMedium
+                                                right: parent.right
+                                                top: parent.top
+                                            }
+                                            spacing: Theme.paddingSmall / 3
+                                            Label {
+                                                width: parent.width
+                                                text: (r ? r.author : "")
+                                                      + (r && r.time ? "  ·  " + r.time : "")
+                                                font.pixelSize: Theme.fontSizeTiny
+                                                color: (r && r.is_uploader)
+                                                         ? Theme.highlightColor : Theme.secondaryColor
+                                                truncationMode: TruncationMode.Fade
+                                            }
+                                            Label {
+                                                width: parent.width
+                                                text: r ? r.text : ""
+                                                wrapMode: Text.Wrap
+                                                font.pixelSize: Theme.fontSizeExtraSmall
+                                                color: Theme.primaryColor
+                                            }
+                                            Label {
+                                                visible: !!(r && r.likes > 0)
+                                                text: "▲ " + page.fmtCount(r ? r.likes : 0)
+                                                font.pixelSize: Theme.fontSizeTiny
+                                                color: Theme.secondaryColor
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1252,7 +1569,9 @@ Page {
     MediaPlayer {
         id: mediaPlayer
         autoPlay: false
-        onError: page.recoverPlayback(errorString)
+        // Only recover while this page still owns the shared player — a late error from a displaced
+        // page's just-stopped MediaPlayer must not re-resolve and yank playback from the new owner.
+        onError: if (page.holdsPlayer) page.recoverPlayback(errorString)
     }
 
     // The overlay's own scrim only covers the video surface, so in portrait a tap in the info
@@ -1270,14 +1589,36 @@ Page {
     }
 
     Component.onDestruction: {
+        // Info-only view never touched the shared player and isn't a "watch" — leave everything
+        // (incl. any background audio of another video) exactly as it is.
+        if (page.infoOnly)
+            return
+        mediaPlayer.stop()                  // our OWN per-page HLS player — always ours to stop
+        // If a newer page already took the shared player (playlist auto-advance via
+        // pageStack.replace, or a stacked page that was displaced), we no longer hold it — the new
+        // owner has reparented/started it. Touching it here would yank/stop it out from under that
+        // page, and our position/lastVideo would be about a video that's no longer on the player.
+        if (!page.holdsPlayer)
+            return
         page.persistPosition()
         if (page.videoId.length > 0)        // remember it for quick-resume from home
             app.lastVideo = { id: page.videoId, title: page.title, channel: page.channel }
-        if (nowPlayingConn.target)          // we were the active player → clear the cover
+        // Keep audio playing in the background when enabled and actually playing: freeze the (now
+        // unseen) video branch, hand the player back to its off-screen home, and let the app-level
+        // controller drive the cover/lockscreen. Otherwise stop and release the cover. Either way
+        // the player MUST be reparented out (parkPlayer) so it survives this page's destruction.
+        var keep = app.backend.backgroundAudio && page.useGst && gplayer.playing
+        if (keep) {
+            gplayer.setVideoActive(false)
+            app.parkPlayer()
+            nowPlayingConn.target = null    // release page control → bgConn takes over
+            app.bgAudioActive = true
+        } else {
+            gplayer.stop()
+            app.parkPlayer()
+            nowPlayingConn.target = null
             app.nowPlaying.active = false
-        if (app.activePlayer === gplayer)
-            app.activePlayer = null
-        mediaPlayer.stop()
-        gplayer.stop()
+            app.nowPlaying.videoId = ""
+        }
     }
 }

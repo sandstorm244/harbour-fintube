@@ -1354,5 +1354,118 @@ class YtmCookieModule(unittest.TestCase):
         self.assertIn("signed-in", res["error"].lower())
 
 
+class CommentsThreads(unittest.TestCase):
+    """comments() nests replies under their parent thread and bounds the reply walk."""
+    def setUp(self):
+        self._path = youfish._ytdlp_path
+        self._run = youfish.subprocess.run
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+
+    def tearDown(self):
+        youfish._ytdlp_path = self._path
+        youfish.subprocess.run = self._run
+
+    def _mock(self, payload):
+        self.captured = {}
+        def fake_run(cmd, **kw):
+            self.captured["cmd"] = cmd
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        youfish.subprocess.run = fake_run
+
+    def _xargs(self):
+        cmd = self.captured["cmd"]
+        return cmd[cmd.index("--extractor-args") + 1]
+
+    def test_replies_nest_under_parent_in_order(self):
+        self._mock({"comment_count": 99, "comments": [
+            {"id": "a", "parent": "root", "text": "top A", "author": "Ann"},
+            {"id": "a.1", "parent": "a", "text": "reply A1", "author": "Bo"},
+            {"id": "a.2", "parent": "a", "text": "reply A2", "author": "Cy"},
+            {"id": "b", "parent": "root", "text": "top B", "author": "Di"},
+        ]})
+        res = youfish.comments("vid")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["total"], 99)
+        self.assertEqual([c["text"] for c in res["comments"]], ["top A", "top B"])
+        a = res["comments"][0]
+        self.assertEqual([r["text"] for r in a["replies"]], ["reply A1", "reply A2"])
+        self.assertEqual(a["reply_count"], 2)
+        self.assertEqual(res["comments"][1]["replies"], [])   # B has no replies
+        self.assertEqual(res["comments"][1]["reply_count"], 0)
+
+    def test_reply_count_prefers_youtube_total_when_larger(self):
+        # yt-dlp reports 40 replies exist but we only fetched 1 (budget) → show the real 40.
+        self._mock({"comments": [
+            {"id": "a", "parent": "root", "text": "t", "reply_count": 40},
+            {"id": "a.1", "parent": "a", "text": "r"},
+        ]})
+        c = youfish.comments("vid")["comments"][0]
+        self.assertEqual(len(c["replies"]), 1)
+        self.assertEqual(c["reply_count"], 40)
+
+    def test_with_replies_flag_shapes_extractor_args(self):
+        self._mock({"comments": []})
+        youfish.comments("vid", limit=50, with_replies=True)
+        on = self._xargs()
+        self.assertIn("max_comments=%d,50,%d,%d"
+                      % (50 + youfish._REPLY_BUDGET, youfish._REPLY_BUDGET,
+                         youfish._REPLIES_PER_THREAD), on)
+        youfish.comments("vid", limit=50, with_replies=False)
+        self.assertIn("max_comments=50,50,0,0", self._xargs())
+
+    def test_error_return(self):
+        def fail(cmd, **kw):
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="nope")
+        youfish.subprocess.run = fail
+        res = youfish.comments("vid")
+        self.assertFalse(res["ok"])
+        self.assertIn("nope", res["error"])
+
+
+class VideoInfo(unittest.TestCase):
+    """video_info() returns metadata even for an unplayable (formats-less) video."""
+    def setUp(self):
+        self._path = youfish._ytdlp_path
+        self._run = youfish.subprocess.run
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+
+    def tearDown(self):
+        youfish._ytdlp_path = self._path
+        youfish.subprocess.run = self._run
+
+    def _mock(self, payload):
+        youfish.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=0, stdout=json.dumps(payload), stderr="")
+
+    def test_metadata_and_chapters_no_formats(self):
+        self._mock({
+            "title": "Hello", "uploader": "Chan", "channel_id": "UC1",
+            "channel_url": "https://youtube.com/@chan", "description": "desc here",
+            "duration": 212, "view_count": 12345, "like_count": 678,
+            "upload_date": "20260101", "thumbnail": "http://t/x.jpg",
+            "chapters": [{"start_time": 0, "title": "Intro"},
+                         {"start_time": 60, "title": "Part 2"},
+                         {"title": "no-start drop"}],
+            # deliberately NO "formats" → resolve() would fail, video_info() must not.
+        })
+        res = youfish.video_info("vid")
+        self.assertTrue(res["ok"], res)
+        info = res["info"]
+        self.assertEqual(info["title"], "Hello")
+        self.assertEqual(info["uploader"], "Chan")
+        self.assertEqual(info["view_count"], 12345)
+        self.assertEqual(info["like_count"], 678)
+        self.assertEqual(info["upload_date"], "20260101")
+        self.assertEqual(len(info["chapters"]), 2)          # the no-start chapter is dropped
+        self.assertEqual(info["chapters"][1]["title"], "Part 2")
+
+    def test_error_return(self):
+        youfish.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=1, stdout="", stderr="blocked")
+        res = youfish.video_info("vid")
+        self.assertFalse(res["ok"])
+        self.assertIn("blocked", res["error"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

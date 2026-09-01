@@ -1963,6 +1963,50 @@ def resolve(video_id):
         return {"ok": False, "error": str(ex)}
 
 
+def video_info(video_id):
+    """Lightweight metadata for the info-only view (title, channel, description, chapters, stats)
+    — no playback. Deliberately skips format selection, the PO-token sidecar and resolve()'s
+    HD-pair client retries: it's cheaper, and it still returns metadata when the video isn't
+    playable here (geo-blocked / bot-walled), which is exactly when you might still want to read
+    its description and comments. Mirrors comments(): _COMMON_ARGS + cookies + a --skip-download
+    JSON dump, nothing player-specific."""
+    path = _ytdlp_path()
+    if not path:
+        return {"ok": False, "error": "yt-dlp not found"}
+    url = video_id
+    if "://" not in url:
+        url = "https://www.youtube.com/watch?v=" + video_id
+    try:
+        with _cookies_args() as cargs:
+            proc = subprocess.run(
+                [path, *_COMMON_ARGS, *cargs, "--skip-download",
+                 "--dump-single-json", "--", url],
+                capture_output=True, text=True, timeout=90)
+        if proc.returncode != 0:
+            return {"ok": False, "error": (proc.stderr.strip()[:300] or "info failed")}
+        data = json.loads(proc.stdout)
+        chapters = [{"start": c.get("start_time") or 0, "title": c.get("title") or ""}
+                    for c in (data.get("chapters") or []) if c.get("start_time") is not None]
+        return {"ok": True, "info": {
+            "title": data.get("title", ""),
+            "is_live": bool(data.get("is_live")) or (data.get("live_status") == "is_live"),
+            "uploader": data.get("uploader") or data.get("channel") or "",
+            "channel_id": data.get("channel_id") or data.get("uploader_id") or "",
+            "channel_url": data.get("channel_url") or data.get("uploader_url") or "",
+            "description": data.get("description") or "",
+            "duration": data.get("duration") or 0,
+            "chapters": chapters,
+            "thumbnail": data.get("thumbnail") or "",
+            "view_count": data.get("view_count") or 0,
+            "like_count": data.get("like_count") or 0,
+            "upload_date": data.get("upload_date") or "",   # YYYYMMDD
+        }}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "info timed out"}
+    except Exception as ex:
+        return {"ok": False, "error": str(ex)}
+
+
 def _pick(formats, itags):
     """First format (in itag-preference order) that exists and has a direct URL."""
     by_itag = {f.get("format_id"): f for f in formats}
@@ -2230,6 +2274,9 @@ _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
                       "portrait_fullscreen": False,
                       # Playback speed remembered across videos (applied to each new one).
                       "playback_rate": 1.0,
+                      # Keep audio playing (video decoder frozen) when you leave the video page to
+                      # browse elsewhere in the app — the cover + lockscreen controls drive it.
+                      "background_audio": True,
                       # Preferred caption language code, remembered across videos ("" = off).
                       # On load the player auto-selects a matching track/translation if one exists.
                       "caption_lang": "",
@@ -3738,12 +3785,22 @@ def feed_durations(limit_per_channel=30, force=False):
     return result()
 
 
-def comments(video_id, limit=50):
-    """Fetch up to `limit` top-level comments (top-sorted, replies skipped) for a video.
+# Reply fetching multiplies the continuation walk, so it's globally budgeted: yt-dlp walks
+# top threads first, so the most-visible threads get their replies and deeper ones don't —
+# keeping an on-demand load bounded rather than paging every thread's replies.
+_REPLIES_PER_THREAD = 12   # cap replies fetched from any one comment thread
+_REPLY_BUDGET = 150        # global reply cap across all threads for one comments() call
+
+
+def comments(video_id, limit=50, with_replies=True):
+    """Fetch up to `limit` top-level comments (top-sorted) for a video, each carrying a bounded
+    set of its replies under `replies` (+ `reply_count`).
 
     Comment extraction walks YouTube's continuation tokens, so it's slow — this is called
-    on demand (tap to load), never as part of resolve(). We fetch one capped batch and the
-    UI reveals it a few at a time as the user scrolls.
+    on demand (tap to load), never as part of resolve(). Replies add more walking, capped by
+    _REPLY_BUDGET / _REPLIES_PER_THREAD (or off entirely via with_replies=False). The UI
+    reveals the batch a few at a time as the user scrolls, and reveals each thread's replies
+    on tap.
     """
     path = _ytdlp_path()
     if not path:
@@ -3755,34 +3812,58 @@ def comments(video_id, limit=50):
         n = max(1, int(limit))
     except (TypeError, ValueError):
         n = 50
-    # max_comments = total,max-parents,max-replies,max-replies-per-thread — parents only.
-    xargs = "youtube:max_comments=%d,%d,0,0;comment_sort=top" % (n, n)
+    # max_comments = total, max-parents, max-replies (global), max-replies-per-thread.
+    if with_replies:
+        xargs = ("youtube:max_comments=%d,%d,%d,%d;comment_sort=top"
+                 % (n + _REPLY_BUDGET, n, _REPLY_BUDGET, _REPLIES_PER_THREAD))
+    else:
+        xargs = "youtube:max_comments=%d,%d,0,0;comment_sort=top" % (n, n)
     try:
         with _cookies_args() as cargs:
             proc = subprocess.run(
                 [path, *_COMMON_ARGS, *cargs, "--skip-download", "--write-comments",
                  "--extractor-args", xargs, "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=180)
         if proc.returncode != 0:
             return {"ok": False, "error": (proc.stderr.strip()[:300] or "comments failed")}
         data = json.loads(proc.stdout)
         raw = data.get("comments") or []
-        out = []
-        for c in raw:
-            parent = c.get("parent")
-            if parent and parent != "root":
-                continue  # defensive: skip replies even though we asked for none
-            out.append({
+
+        def _fmt(c):
+            return {
+                "id": c.get("id") or "",
                 "author": c.get("author") or "",
                 "text": c.get("text") or "",
                 "likes": c.get("like_count") or 0,
                 "time": c.get("_time_text") or "",
                 "thumbnail": c.get("author_thumbnail") or "",
                 "is_uploader": bool(c.get("author_is_uploader")),
-            })
+            }
+
+        # yt-dlp returns a FLAT list; a reply carries parent == its top-level comment's id
+        # ("root" marks a top-level comment). Group replies under their parent, order preserved.
+        replies_by_parent = {}
+        for c in raw:
+            parent = c.get("parent")
+            if parent and parent != "root":
+                replies_by_parent.setdefault(parent, []).append(c)
+
+        out = []
+        for c in raw:
+            parent = c.get("parent")
+            if parent and parent != "root":
+                continue                      # a reply — attached to its parent below
+            item = _fmt(c)
+            kids = replies_by_parent.get(c.get("id")) or []
+            item["replies"] = [_fmt(k) for k in kids]
+            # `reply_count` is YouTube's real thread total when yt-dlp reports it (may exceed the
+            # budgeted count we fetched); the UI shows however many `replies` it actually got.
+            rc = c.get("reply_count")
+            item["reply_count"] = rc if isinstance(rc, int) and rc >= len(kids) else len(kids)
+            out.append(item)
             if len(out) >= n:
                 break
-        # comment_count is YouTube's real total; `count` is how many we actually fetched.
+        # comment_count is YouTube's real total; `count` is how many top-level we actually fetched.
         return {"ok": True, "comments": out, "count": len(out),
                 "total": data.get("comment_count") or 0}
     except subprocess.TimeoutExpired:

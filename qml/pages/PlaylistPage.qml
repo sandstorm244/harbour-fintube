@@ -120,6 +120,11 @@ Page {
                     }
                 }
                 MenuItem {
+                    text: "Video details"
+                    onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
+                        { videoId: model.id, title: model.title, infoOnly: true })
+                }
+                MenuItem {
                     text: "Download audio"
                     onClicked: {
                         var vid = model.id, t = model.title

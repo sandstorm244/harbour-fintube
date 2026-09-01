@@ -122,6 +122,16 @@ Page {
             }
 
             TextSwitch {
+                text: "Background audio"
+                description: "Keep audio playing when you leave the video to browse elsewhere in "
+                             + "the app. Control it from the cover and the lockscreen; reopen the "
+                             + "video to pick playback back up where it is."
+                automaticCheck: false
+                checked: app.backend.backgroundAudio
+                onClicked: app.backend.setBackgroundAudio(!app.backend.backgroundAudio)
+            }
+
+            TextSwitch {
                 text: "Portrait fullscreen"
                 description: "Let the fullscreen button fill the screen while staying in portrait, "
                              + "instead of rotating to landscape. Tap the video's fullscreen "

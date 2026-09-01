@@ -35,6 +35,7 @@ Item {
     property string defaultQuality: "720" // baseline video height cap ("1080"/"720"/…/"0"=best)
     property bool hwDecode: false        // hardware video decode (droidvdec); experimental
     property bool keepDisplayOn: false   // hold the display awake while a video plays
+    property bool backgroundAudio: true  // keep audio playing when you leave the video page
     property bool portraitFullscreen: false  // fullscreen without rotating to landscape
     property bool eqEnabled: false       // 10-band equalizer on/off
     property var  eqBands: [0,0,0,0,0,0,0,0,0,0]  // per-band gain (dB), applied by the C++ player
@@ -98,6 +99,13 @@ Item {
         })
     }
 
+    // Lightweight metadata for the info-only view (no playback) — title, channel, description,
+    // chapters, stats. Result {ok, info|error} straight to the caller's callback. Works even when
+    // the video isn't playable here (geo-blocked / bot-walled), unlike resolve().
+    function videoInfo(videoId, callback) {
+        py.call("youfish.video_info", [videoId], function(res) { callback(res || {}) })
+    }
+
     // Re-run the yt-dlp presence/version check (called on launch and on demand).
     function recheck() {
         py.call("youfish.ytdlp_version", [], function(v) {
@@ -124,6 +132,7 @@ Item {
             backend.defaultQuality = s.default_quality || "720"
             backend.hwDecode = !!s.hw_decode
             backend.keepDisplayOn = !!s.keep_display_on
+            backend.backgroundAudio = (s.background_audio === undefined) ? true : !!s.background_audio
             backend.eqEnabled = !!s.eq_enabled
             if (s.eq_bands && s.eq_bands.length === 10)
                 backend.eqBands = s.eq_bands
@@ -170,6 +179,12 @@ Item {
     function setKeepDisplayOn(on) {
         py.call("youfish.set_setting", ["keep_display_on", !!on], function(s) {
             if (s) backend.keepDisplayOn = !!s.keep_display_on
+        })
+    }
+
+    function setBackgroundAudio(on) {
+        py.call("youfish.set_setting", ["background_audio", !!on], function(s) {
+            if (s) backend.backgroundAudio = !!s.background_audio
         })
     }
 
@@ -388,8 +403,17 @@ Item {
 
     // On-demand comment fetch (slow — walks YouTube continuations). Result to the caller's
     // callback so it lands on the video page that asked. One capped batch; the UI paginates.
+    // Fast first paint: top-level comments only (no replies → no extra continuation walk). The
+    // video page then tops up replies in the background (fetchCommentReplies) and merges them in,
+    // so comments appear without waiting on the reply walk.
     function fetchComments(videoId, limit, callback) {
-        py.call("youfish.comments", [videoId, limit || 50], function(res) {
+        py.call("youfish.comments", [videoId, limit || 50, false], function(res) {
+            callback(res || {})
+        })
+    }
+    // Background reply top-up: the same top comments, now carrying their nested replies, to merge.
+    function fetchCommentReplies(videoId, limit, callback) {
+        py.call("youfish.comments", [videoId, limit || 50, true], function(res) {
             callback(res || {})
         })
     }

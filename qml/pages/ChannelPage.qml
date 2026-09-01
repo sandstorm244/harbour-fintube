@@ -243,6 +243,11 @@ Page {
                     }
                 }
                 MenuItem {
+                    text: "Video details"
+                    onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
+                        { videoId: model.id, title: model.title, infoOnly: true })
+                }
+                MenuItem {
                     text: "Add to playlist"
                     onClicked: pageStack.push(Qt.resolvedUrl("AddToPlaylistPage.qml"),
                         { video: { id: model.id, title: model.title, uploader: model.uploader || "",

@@ -2,6 +2,7 @@ import QtQuick 2.0
 import Sailfish.Silica 1.0
 import Nemo.DBus 2.0
 import Sailfish.Pickers 1.0
+import FinTube 1.0
 import "pages"
 import "cover"
 
@@ -12,18 +13,29 @@ ApplicationWindow {
     property alias backend: backend
     // App-level "what's playing", reachable as `app.nowPlaying`.
     property alias nowPlaying: nowPlaying
+    // The single, persistent GStreamer player. It lives here (not inside VideoPage) so audio keeps
+    // playing when you leave the video page to browse elsewhere: VideoPage reparents it into its
+    // video box while open and hands it back to playerHolder on close. Reachable as `app.gplayer`.
+    property alias gplayer: gplayer
+    // Audio-effects target for the Equalizer / volume-boost pages — always the singleton player
+    // (its C++ setters are cheap no-ops until a pipeline is built).
+    readonly property alias activePlayer: gplayer
+    // True while gplayer plays in the background with no VideoPage attached — the app-level
+    // controller (bgConn) then drives cover / lockscreen toggle+stop in the page's place.
+    property bool bgAudioActive: false
+    // Last resolve()d info, kept so reopening the still-playing video repopulates its page
+    // (description, comments, quality/caption menus) instantly — no re-resolve, no restart.
+    property var lastResolvedInfo: null
+    property string lastResolvedId: ""
     // The most recently left video, for quick-resume from the home page: {id, title, channel}.
     property var lastVideo: null
     // Autoplay queue for playlist playback: [{id,title}, …] + the index currently playing.
     property var playQueue: []
     property int playQueueIndex: -1
-    // The C++ VideoPlayer of the currently-active video page (or null). Lets the Equalizer /
-    // volume-boost settings reach the live audio pipeline. The active page registers/clears it.
-    property var activePlayer: null
 
-    // Push the persisted equalizer + volume-boost settings onto the live player (if any). The
-    // C++ setters are cheap no-ops when the pipeline isn't built yet — the values persist and
-    // apply at its next build — so this is safe to call any time.
+    // Push the persisted equalizer + volume-boost settings onto the live player. The C++ setters
+    // are cheap no-ops when the pipeline isn't built yet — the values persist and apply at its
+    // next build — so this is safe to call any time.
     function applyAudioFx() {
         if (!activePlayer)
             return
@@ -32,6 +44,16 @@ ApplicationWindow {
         for (var i = 0; i < 10; i++)
             activePlayer.setEqBand(i, b[i] || 0)
         activePlayer.setBoost(backend.boostGain)
+    }
+
+    // Hand the singleton player back to its off-screen home (VideoPage calls this on close, since
+    // playerHolder is a private id of this component). Does NOT stop playback — the caller decides
+    // whether audio keeps going in the background or is stopped.
+    function parkPlayer() {
+        gplayer.anchors.fill = undefined
+        gplayer.visible = false
+        gplayer.parent = playerHolder
+        gplayer.anchors.fill = playerHolder
     }
 
     // Re-apply live whenever a setting changes (e.g. from the Equalizer page or the boost slider).
@@ -119,12 +141,12 @@ ApplicationWindow {
 
     allowedOrientations: defaultAllowedOrientations
 
-    // The active video page keeps this in sync; the cover (and, later, MPRIS) read it.
-    // stopRequested lets a newly-started video tell the previous one to stop, so only one
-    // pipeline ever plays at a time.
+    // The active video page keeps this in sync; the cover + MPRIS read it. stopRequested lets a
+    // newly-started source tell the previous one to stop, so only one thing ever plays at a time.
     QtObject {
         id: nowPlaying
         property bool active: false
+        property string videoId: ""      // the gplayer video currently loaded ("" = none/other source)
         property string title: ""
         property string channel: ""
         property bool playing: false
@@ -133,6 +155,42 @@ ApplicationWindow {
     }
 
     Backend { id: backend }
+
+    // Off-screen home for the singleton player when no VideoPage is showing it (audio keeps
+    // playing here; the video branch is frozen). VideoPage reparents gplayer into its video box.
+    Item { id: playerHolder; visible: false; width: 0; height: 0 }
+
+    VideoPlayer {
+        id: gplayer
+        parent: playerHolder
+        anchors.fill: parent
+        visible: false
+        // Set before playback so the player picks its FBO render target + pipeline branch.
+        hwDecode: backend.hwDecode
+    }
+
+    // Background controller: while gplayer plays with no VideoPage attached (bgAudioActive), the
+    // page's own nowPlaying handler is gone, so the app drives cover / lockscreen toggle + stop.
+    Connections {
+        target: app.bgAudioActive ? nowPlaying : null
+        onToggleRequested: gplayer.playing ? gplayer.pause() : gplayer.play()
+        onStopRequested: {
+            gplayer.stop()
+            nowPlaying.active = false
+            nowPlaying.videoId = ""
+            app.bgAudioActive = false
+        }
+    }
+    // Keep the cover / lockscreen play-state honest while backgrounded (a page in front does its
+    // own sync). If the backgrounded track ends, reflect the stop but leave the cover claimed.
+    Connections {
+        target: gplayer
+        onPlayingChanged: if (app.bgAudioActive) nowPlaying.playing = gplayer.playing
+        onEnded: if (app.bgAudioActive) nowPlaying.playing = false
+        // No page is attached to recover a background stall (a 403 etc.), so just reflect that it
+        // stopped — reopening the video re-resolves and resumes from the saved position.
+        onErrorOccurred: if (app.bgAudioActive) nowPlaying.playing = false
+    }
 
     // Optional MPRIS (lockscreen) controls, isolated so a missing plugin degrades quietly.
     Loader {

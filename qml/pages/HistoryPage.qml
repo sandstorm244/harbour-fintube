@@ -57,6 +57,11 @@ Page {
                         app.backend.setWatched(model.id, !(e && e.w), model.title, model.channel || "")
                     }
                 }
+                MenuItem {
+                    text: "Video details"
+                    onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
+                        { videoId: model.id, title: model.title, infoOnly: true })
+                }
             }
 
             Rectangle {
