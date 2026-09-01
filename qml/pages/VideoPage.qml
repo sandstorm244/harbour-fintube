@@ -1603,11 +1603,15 @@ Page {
         page.persistPosition()
         if (page.videoId.length > 0)        // remember it for quick-resume from home
             app.lastVideo = { id: page.videoId, title: page.title, channel: page.channel }
-        // Keep audio playing in the background when enabled and actually playing: freeze the (now
+        // Keep the pipeline alive when leaving — whether PLAYING or PAUSED. A paused video you
+        // navigate away from should REATTACH where it is on reopen (resume with one tap), not
+        // reload from scratch; a playing one keeps going as background audio. Freeze the (now
         // unseen) video branch, hand the player back to its off-screen home, and let the app-level
         // controller drive the cover/lockscreen. Otherwise stop and release the cover. Either way
         // the player MUST be reparented out (parkPlayer) so it survives this page's destruction.
-        var keep = app.backend.backgroundAudio && page.useGst && gplayer.playing
+        // (A never-started video — no pipeline, position 0 — isn't worth holding → stop.)
+        var keep = app.backend.backgroundAudio && page.useGst
+                   && (gplayer.playing || gplayer.position > 0)
         if (keep) {
             gplayer.setVideoActive(false)
             app.parkPlayer()
