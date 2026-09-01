@@ -24,10 +24,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import youfish  # noqa: E402
 
 
-def vf(fid, height, vcodec, fps=30, url="v"):
+def vf(fid, height, vcodec, fps=30, url="v", note=None):
     """A video-only format."""
-    return {"format_id": fid, "height": height, "vcodec": vcodec, "acodec": "none",
-            "fps": fps, "url": url, "http_headers": {"User-Agent": "UA"}}
+    f = {"format_id": fid, "height": height, "vcodec": vcodec, "acodec": "none",
+         "fps": fps, "url": url, "http_headers": {"User-Agent": "UA"}}
+    if note is not None:
+        f["format_note"] = note
+    return f
 
 
 def af(fid, abr, acodec, url="a", note=None, lang_pref=None, lang=None):
@@ -217,7 +220,21 @@ class ResolveSmoke(unittest.TestCase):
                           vf("136", 720, "avc1"), af("251", 160, "opus", lang_pref=10)])
         res = youfish.resolve("vid")
         heights = [q["label"] for q in res["info"]["qualities"]]
-        self.assertEqual(heights, ["1080p", "720p"])               # one rung per resolution
+        self.assertEqual(heights, ["1080p", "720p"])               # 30fps, no-premium → one per res
+
+    def test_quality_menu_surfaces_fps_and_premium(self):
+        self._mock_ytdlp([
+            vf("137", 1080, "avc1", 30),
+            vf("299", 1080, "avc1", 60),                           # 1080p60 (free, 60fps source)
+            vf("620", 1080, "avc1", 60, note="Premium"),           # enhanced-bitrate premium
+            vf("136", 720, "avc1", 30),
+            af("251", 160, "opus", lang_pref=10)])
+        labels = [q["label"] for q in youfish.resolve("vid")["info"]["qualities"]]
+        self.assertIn("1080p", labels)                             # 30fps rung still there
+        self.assertIn("1080p60", labels)                           # 60fps its own row
+        self.assertTrue(any("Premium" in l for l in labels))       # premium its own row
+        self.assertEqual(labels[0], "1080p60 Premium")             # premium first, then higher fps
+        self.assertEqual(labels[-1], "720p")                       # lowest resolution last
 
     def test_audio_tracks_one_per_language_original_first(self):
         # A dubbed video: two rungs each of English (source) + Portuguese; the picker collapses to

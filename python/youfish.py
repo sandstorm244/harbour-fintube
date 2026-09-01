@@ -1859,22 +1859,35 @@ def resolve(video_id):
                 muxed_url = muxed["url"]
             else:
                 muxed_url = _proxied(muxed["url"], video_id, muxed.get("format_id"), http_ua)
-        # Quality menu: one entry per resolution, highest first. _video_candidates is already
-        # sorted (resolution high→low, then preferred codec, then lower fps), so deduping by
-        # height keeps the FIRST track at each resolution — the preferred codec (H.264 in software
-        # mode, VP9 in hardware mode) at its lower framerate — matching how it actually decodes.
+        # Quality menu. Distinct rows per (resolution, high-fps, premium): a 60fps upload gets its
+        # own "1080p60" entry, and a premium enhanced-bitrate track its own "… Premium" entry,
+        # instead of all collapsing into one "1080p". _video_candidates still preferred-codec-sorts
+        # and caps at 1080p; deduping on the composite key keeps the FIRST (preferred codec) of each
+        # variant. NOTE: this only shapes the MENU — the DEFAULT pick (_pick_video) is untouched, so
+        # playback still starts on the decode-light 30fps H.264 rung; 60fps/Premium are opt-in taps.
         qualities = []
-        seen_heights = set()
+        seen_q = set()
         for qf in _video_candidates(formats):
             qh = qf.get("height") or 0
-            if qh in seen_heights:
+            qfps = qf.get("fps") or 0
+            q_premium = "premium" in (qf.get("format_note") or "").lower()
+            key = (qh, qfps > 30, q_premium)
+            if key in seen_q:
                 continue
-            seen_heights.add(qh)
+            seen_q.add(key)
+            label = "%dp" % qh
+            if qfps > 30:
+                label += "%d" % round(qfps)      # 1080p -> 1080p60 / 1080p50
+            if q_premium:
+                label += " Premium"
             qualities.append({
                 "itag": str(qf.get("format_id") or ""),
-                "label": "%dp" % qh,
+                "label": label,
                 "video_url": _proxied(qf["url"], video_id, qf.get("format_id"), http_ua),
+                "height": qh, "fps": qfps, "premium": q_premium,
             })
+        # Menu order: resolution high→low, then Premium first, then higher fps first.
+        qualities.sort(key=lambda q: (-q["height"], 0 if q["premium"] else 1, -q["fps"]))
         # Audio-track picker: one entry per available LANGUAGE (best rung of each), original/default
         # first — mirrors _pick_audio's ordering. Dubbed videos only; single-language videos yield
         # <=1 entry and the UI hides the row. Each URL is proxied like the main audio track.
