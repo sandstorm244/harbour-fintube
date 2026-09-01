@@ -585,6 +585,9 @@ Page {
             if (page.channelUrl.length > 0 || page.channelId.length > 0)
                 app.backend.fetchChannelAvatar(page.channelUrl || page.channelId,
                     function(r) { if (page && r && r.thumbnail) page.channelAvatar = r.thumbnail })
+            // The details view exists to READ — pull comments in automatically (still on-demand on a
+            // normal watch page, where a tap-to-load keeps every playback fast).
+            page.loadComments()
         })
     }
 
@@ -1285,57 +1288,6 @@ Page {
                 }
             }
 
-            // Action bar — YouTube-style quick actions under the channel line, kept OUT of the
-            // pulley so they're one tap (not a pull-down). Share opens the native SFOS share sheet.
-            Row {
-                x: Theme.horizontalPageMargin
-                spacing: Theme.paddingLarge
-                visible: page.videoId.length > 0
-
-                Column {
-                    width: Theme.iconSizeMedium + Theme.paddingLarge
-                    IconButton {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        icon.source: "image://theme/icon-m-link"
-                        onClicked: page.videoAction("open")
-                    }
-                    Label {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: "Open"
-                        font.pixelSize: Theme.fontSizeTiny
-                        color: Theme.secondaryColor
-                    }
-                }
-                Column {
-                    width: Theme.iconSizeMedium + Theme.paddingLarge
-                    IconButton {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        icon.source: "image://theme/icon-m-clipboard"
-                        onClicked: page.videoAction("copy")
-                    }
-                    Label {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: "Copy"
-                        font.pixelSize: Theme.fontSizeTiny
-                        color: Theme.secondaryColor
-                    }
-                }
-                Column {
-                    width: Theme.iconSizeMedium + Theme.paddingLarge
-                    IconButton {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        icon.source: "image://theme/icon-m-share"
-                        onClicked: page.videoAction("share")
-                    }
-                    Label {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: "Share"
-                        font.pixelSize: Theme.fontSizeTiny
-                        color: Theme.secondaryColor
-                    }
-                }
-            }
-
             // (Resolution picker moved into the video overlay — the quality pill, left of
             //  the speed pill; tapping it opens a menu of resolutions. See TransportControls.)
 
@@ -1364,6 +1316,63 @@ Page {
                     color: Theme.highlightColor
                 }
                 onClicked: page.descExpanded = !page.descExpanded
+            }
+
+            // Action bar — Open / Copy / Share, sitting between the description and the comments.
+            // Kept OUT of the pulley so they're one tap. Share opens the native SFOS share sheet.
+            Row {
+                x: Theme.horizontalPageMargin
+                spacing: Theme.paddingMedium
+                visible: page.videoId.length > 0
+
+                Column {
+                    width: Theme.iconSizeSmall + Theme.paddingLarge
+                    IconButton {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        width: Theme.iconSizeSmall + Theme.paddingSmall; height: width
+                        icon.source: "image://theme/icon-m-link"
+                        icon.sourceSize: Qt.size(Theme.iconSizeSmall, Theme.iconSizeSmall)
+                        onClicked: page.videoAction("open")
+                    }
+                    Label {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Open"
+                        font.pixelSize: Theme.fontSizeTiny
+                        color: Theme.secondaryColor
+                    }
+                }
+                Column {
+                    width: Theme.iconSizeSmall + Theme.paddingLarge
+                    IconButton {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        width: Theme.iconSizeSmall + Theme.paddingSmall; height: width
+                        icon.source: "image://theme/icon-m-clipboard"
+                        icon.sourceSize: Qt.size(Theme.iconSizeSmall, Theme.iconSizeSmall)
+                        onClicked: page.videoAction("copy")
+                    }
+                    Label {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Copy"
+                        font.pixelSize: Theme.fontSizeTiny
+                        color: Theme.secondaryColor
+                    }
+                }
+                Column {
+                    width: Theme.iconSizeSmall + Theme.paddingLarge
+                    IconButton {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        width: Theme.iconSizeSmall + Theme.paddingSmall; height: width
+                        icon.source: "image://theme/icon-m-share"
+                        icon.sourceSize: Qt.size(Theme.iconSizeSmall, Theme.iconSizeSmall)
+                        onClicked: page.videoAction("share")
+                    }
+                    Label {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Share"
+                        font.pixelSize: Theme.fontSizeTiny
+                        color: Theme.secondaryColor
+                    }
+                }
             }
 
             // ---- Comments: tap the header to load, then they reveal on scroll ----
