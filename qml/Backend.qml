@@ -106,6 +106,7 @@ Item {
     property real playbackRate: 1.0      // remembered playback speed, carried to each new video
     property int historyLimit: 500       // max watch-history entries kept (Settings → Content)
     property string captionLang: ""      // preferred caption language, carried to each new video ("" = off)
+    property string audioLang: ""        // preferred audio (dub) language, carried to each new video ("" = original)
     function loadSettings() {
         py.call("youfish.get_settings", [], function(s) {
             if (!s) return
@@ -125,6 +126,7 @@ Item {
             backend.boostGain = s.boost_gain || 1.0
             backend.historyLimit = s.history_limit || 500
             backend.captionLang = s.caption_lang || ""
+            backend.audioLang = s.audio_lang || ""
         })
     }
 
@@ -268,6 +270,15 @@ Item {
     function setCaptionLang(lang) {
         py.call("youfish.set_setting", ["caption_lang", lang || ""], function(s) {
             if (s) backend.captionLang = s.caption_lang || ""
+        })
+    }
+
+    // Remember the audio (dub) language across videos ("" = the video's original source audio).
+    // resolve() starts a matching dub on the next video when one exists; the player's Audio picker
+    // also swaps live. Most people who want a dub want it everywhere.
+    function setAudioLang(lang) {
+        py.call("youfish.set_setting", ["audio_lang", lang || ""], function(s) {
+            if (s) backend.audioLang = s.audio_lang || ""
         })
     }
 

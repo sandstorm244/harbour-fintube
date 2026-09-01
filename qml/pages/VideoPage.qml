@@ -21,7 +21,6 @@ Page {
     property real videoDuration: 0    // seconds, from yt-dlp — scrubber fallback
     property var qualities: []        // [{itag,label,video_url}], highest first
     property string currentQuality: ""
-    property int pendingSeekMs: -1    // position to restore after a quality switch
     property int resumeMs: 0          // saved watch position to resume from (0 = none)
     property var sponsorSegments: []  // SponsorBlock [{start,end,category}] in seconds
     property string skipHint: ""      // transient "Skipped …" overlay text
@@ -48,7 +47,6 @@ Page {
     property string downloadHint: ""  // transient "Downloaded"/"Failed" text
 
     property real playbackRate: app.backend.playbackRate || 1.0   // remembered across videos
-    property var speedSteps: [1.0, 1.25, 1.5, 2.0, 0.75]
     property var chapters: []         // [{start,title}] in seconds, from yt-dlp
     property string currentChapter: {
         if (page.chapters.length === 0) return ""
@@ -161,10 +159,29 @@ Page {
         if (!page.useGst || !q || !q.video_url || gplayer.videoUrl === q.video_url)
             return
         page.currentQuality = q.label
-        page.pendingSeekMs = page.positionMs
+        var at = page.positionMs          // capture before stop() zeroes the position
         gplayer.stop()
         gplayer.videoUrl = q.video_url
         gplayer.play()
+        gplayer.seekWhenReady(at)         // restored at preroll, once both branches are up
+    }
+
+    // Switch audio track on a multi-language (dubbed) video: swap the audio-only source, keep the
+    // video, restore position. Twin of switchQuality; dual-source GStreamer path only. The chosen
+    // language is remembered so the next video starts on it (setAudioLang → engine _pick_audio).
+    function switchAudio(a) {
+        // Dual-source only: bail on the muxed/HLS fallback path (audioUrl empty), where swapping in
+        // a separate audio source would wire the muxed URL as the video branch and stall the pipeline.
+        if (!page.useGst || gplayer.audioUrl.length === 0
+                || !a || !a.audio_url || gplayer.audioUrl === a.audio_url)
+            return
+        transport.currentAudioItag = a.itag || ""
+        app.backend.setAudioLang(a.lang || "")
+        var at = page.positionMs          // capture before stop() zeroes the position
+        gplayer.stop()
+        gplayer.audioUrl = a.audio_url
+        gplayer.play()
+        gplayer.seekWhenReady(at)         // restored at preroll, once both branches are up
     }
 
     // Pick a caption track (or null = Off). `persist` records it as the cross-video preference;
@@ -295,8 +312,7 @@ Page {
     // fix it. Do that automatically: re-resolve for fresh URLs and reload, resuming where we
     // stalled. Bounded, and the budget resets once playback is healthy again (see below).
     function recoverPlayback(message) {
-        transport.qualityMenuOpen = false   // don't let an open menu outlive the reload/re-resolve
-        transport.captionMenuOpen = false
+        transport.playbackMenuOpen = false   // don't let an open menu outlive the reload/re-resolve
         // Backgrounded/locked: the network (and any reload) will just fail again — and the
         // stall was almost certainly caused by the blank itself (WiFi power-save / a frozen
         // fetch). Defer the reload to resume, and don't spend the retry budget on it.
@@ -350,14 +366,13 @@ Page {
         })
     }
 
-    // Cycle playback speed through a sensible set (GStreamer path only).
-    function cycleSpeed() {
+    // Set playback speed from the gear menu (GStreamer path only); remembered for the next video.
+    function setSpeed(rate) {
         if (!page.useGst)
             return
-        var idx = page.speedSteps.indexOf(page.playbackRate)
-        page.playbackRate = page.speedSteps[(idx + 1) % page.speedSteps.length]
-        gplayer.rate = page.playbackRate
-        app.backend.setPlaybackRate(page.playbackRate)   // remember it for the next video
+        page.playbackRate = rate
+        gplayer.rate = rate
+        app.backend.setPlaybackRate(rate)   // remember it for the next video
     }
 
     // Video-level quick actions (the action bar under the channel line). "share" fires the
@@ -471,18 +486,6 @@ Page {
         return "" + n
     }
 
-    // After a quality switch the new pipeline needs a beat before it will accept a seek.
-    Timer {
-        id: resumeSeekTimer
-        interval: 500
-        onTriggered: {
-            if (page.pendingSeekMs >= 0) {
-                gplayer.seek(page.pendingSeekMs)
-                page.pendingSeekMs = -1
-            }
-        }
-    }
-
     Connections {
         // A null target = disconnected (Connections.enabled needs Qt 5.7; SFOS is 5.6).
         // Once resolved we stop listening, so a still-open page underneath doesn't grab
@@ -520,6 +523,10 @@ Page {
             transport.captionTranslations = info.translations || []
             page.selectCaption(null, false)
             page.autoSelectCaption(transport.captionTracks, transport.captionTranslations)
+            // Audio tracks (dubs): the engine already started the remembered/original language, so
+            // just hand the list over and mark which itag is playing for the picker's highlight.
+            transport.audioTracks = info.audio_tracks || []
+            transport.currentAudioItag = info.audio_itag || ""
             if (page.channelUrl.length > 0 || page.channelId.length > 0)
                 app.backend.fetchChannelAvatar(page.channelUrl || page.channelId,
                     function(res) { if (page && res && res.thumbnail) page.channelAvatar = res.thumbnail })
@@ -530,10 +537,9 @@ Page {
                 gplayer.audioUrl = info.audio_url
                 gplayer.videoUrl = info.video_url
                 gplayer.play()
-                // Resume: seek to the saved spot once the pipeline reports a duration
-                // (reusing the quality-switch restore path).
+                // Resume: seek to the saved spot once the pipeline has prerolled (both branches up).
                 if (page.resumeMs > 0)
-                    page.pendingSeekMs = page.resumeMs
+                    gplayer.seekWhenReady(page.resumeMs)
             } else if (info.muxed_url && info.muxed_url.length > 0) {
                 // A muxed stream (both tracks in one URL). HLS (m3u8) is adaptive and plays
                 // natively through QtMultimedia; a progressive muxed URL (itag 18 — often the
@@ -551,7 +557,7 @@ Page {
                     gplayer.videoUrl = info.muxed_url
                     gplayer.play()
                     if (page.resumeMs > 0)
-                        page.pendingSeekMs = page.resumeMs
+                        gplayer.seekWhenReady(page.resumeMs)
                 }
             } else {
                 page.errorText = "no playable stream"
@@ -562,18 +568,15 @@ Page {
         onResolveError: {
             page.resolving = false
             page.errorText = message
-            transport.qualityMenuOpen = false
-            transport.captionMenuOpen = false
+            transport.playbackMenuOpen = false
         }
     }
 
     Connections {
         target: gplayer
         onErrorOccurred: page.recoverPlayback(message)
-        // Duration becoming known means the pipeline has prerolled and can seek — the moment to
-        // restore position after a quality switch. (Speed is handled in the C++ player at preroll.)
-        onDurationChanged: if (page.pendingSeekMs >= 0 && gplayer.duration > 0)
-                               resumeSeekTimer.restart()
+        // Position restore after a switch/resume now happens in the C++ player at preroll
+        // (seekWhenReady → ASYNC_DONE), where BOTH branches are guaranteed linked — no QML timer.
     }
 
     // Whenever playback stops — paused or ended — surface the controls (the auto-hide
@@ -588,8 +591,7 @@ Page {
     // The quality menu lives inside the controls overlay, so if the controls hide for any
     // reason, close the menu with them — otherwise the open flag leaves an invisible, dead menu.
     onControlsShownChanged: if (!page.controlsShown) {
-        transport.qualityMenuOpen = false
-        transport.captionMenuOpen = false
+        transport.playbackMenuOpen = false
     }
 
     // Position ticks (500ms) drive the SponsorBlock auto-skip check. They also clear the
@@ -673,7 +675,7 @@ Page {
         interval: 250
         // Don't let a single-tap toggle (from a fall-through tap on empty video) hide the
         // controls while the quality menu is open — that would strand the menu invisible.
-        onTriggered: if (!transport.qualityMenuOpen && !transport.captionMenuOpen)
+        onTriggered: if (!transport.playbackMenuOpen)
                          page.controlsShown = !page.controlsShown
     }
     // Fire the accumulated seek once the taps settle (avoids a burst of flush-seeks).
@@ -865,8 +867,10 @@ Page {
             fullscreen: page.landscape || page.portraitFull
             onSeekRequested: page.seekTo(ms)
             onTogglePlay: page.togglePlay()
-            onCycleSpeed: page.cycleSpeed()
+            onSpeedSelected: page.setSpeed(rate)
             onQualitySelected: page.switchQuality(q)
+            audioEnabled: page.useGst && gplayer.audioUrl.length > 0
+            onAudioSelected: page.switchAudio(a)
             onCaptionChosen: page.selectCaption(track, true)
             onToggleFullscreen: page.toggleFullscreen()
             onInteracted: page.controlsShown = true
@@ -908,7 +912,7 @@ Page {
     Timer {
         interval: 3500
         running: page.controlsShown && page.isPlaying
-                 && !transport.qualityMenuOpen && !transport.captionMenuOpen
+                 && !transport.playbackMenuOpen
         onTriggered: page.controlsShown = false
     }
 
@@ -1254,10 +1258,9 @@ Page {
     MouseArea {
         anchors { left: parent.left; right: parent.right
                   top: videoBox.bottom; bottom: parent.bottom }
-        enabled: transport.qualityMenuOpen || transport.captionMenuOpen
+        enabled: transport.playbackMenuOpen
         onClicked: {
-            transport.qualityMenuOpen = false
-            transport.captionMenuOpen = false
+            transport.playbackMenuOpen = false
         }
     }
 

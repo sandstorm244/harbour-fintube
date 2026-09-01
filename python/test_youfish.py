@@ -30,7 +30,7 @@ def vf(fid, height, vcodec, fps=30, url="v"):
             "fps": fps, "url": url, "http_headers": {"User-Agent": "UA"}}
 
 
-def af(fid, abr, acodec, url="a", note=None, lang_pref=None):
+def af(fid, abr, acodec, url="a", note=None, lang_pref=None, lang=None):
     """An audio-only format."""
     f = {"format_id": fid, "abr": abr, "acodec": acodec, "vcodec": "none", "url": url,
          "http_headers": {"User-Agent": "UA"}}
@@ -38,6 +38,8 @@ def af(fid, abr, acodec, url="a", note=None, lang_pref=None):
         f["format_note"] = note
     if lang_pref is not None:
         f["language_preference"] = lang_pref
+    if lang is not None:
+        f["language"] = lang
     return f
 
 
@@ -128,6 +130,47 @@ class AudioCandidates(unittest.TestCase):
         self.assertIsNone(youfish._pick_audio([vf("137", 1080, "avc1")]))
 
 
+class AudioLangName(unittest.TestCase):
+    def test_strips_bitrate_tier(self):
+        self.assertEqual(youfish._audio_lang_name({"format_note": "German, low"}), "German")
+        self.assertEqual(youfish._audio_lang_name({"format_note": "Portuguese, high"}), "Portuguese")
+
+    def test_keeps_region_parens_drops_role_marker(self):
+        self.assertEqual(youfish._audio_lang_name(
+            {"format_note": "Chinese (Simplified), medium"}), "Chinese (Simplified)")
+        self.assertEqual(youfish._audio_lang_name(
+            {"format_note": "English original (default), low"}), "English")
+
+    def test_falls_back_to_code_then_placeholder(self):
+        self.assertEqual(youfish._audio_lang_name({"format_note": "", "language": "ja"}), "ja")
+        self.assertEqual(youfish._audio_lang_name({}), "Audio")
+
+    def test_bare_tier_note_never_masquerades_as_name(self):
+        # A note that is ONLY a tier word (no comma) must not leak as the language name.
+        self.assertEqual(youfish._audio_lang_name({"format_note": "medium", "language": "de"}), "de")
+        self.assertEqual(youfish._audio_lang_name({"format_note": "low"}), "Audio")
+
+
+class PickAudioPreferredLang(unittest.TestCase):
+    def _dubs(self):
+        return [af("251-en", 160, "opus", lang_pref=10, lang="en"),   # source/original
+                af("251-pt", 158, "opus", lang_pref=-1, lang="pt"),
+                af("251-es", 158, "opus", lang_pref=-1, lang="es-419")]
+
+    def test_no_preference_picks_source(self):
+        self.assertEqual(youfish._pick_audio(self._dubs())["format_id"], "251-en")
+
+    def test_exact_preference_picks_that_dub(self):
+        self.assertEqual(youfish._pick_audio(self._dubs(), "pt")["format_id"], "251-pt")
+
+    def test_base_code_fallback(self):
+        # remembered "es" matches the offered "es-419"
+        self.assertEqual(youfish._pick_audio(self._dubs(), "es")["format_id"], "251-es")
+
+    def test_missing_preference_falls_back_to_source(self):
+        self.assertEqual(youfish._pick_audio(self._dubs(), "de")["format_id"], "251-en")
+
+
 # --- resolve() smoke tests (externals mocked) ------------------------------------------------- #
 
 class ResolveSmoke(unittest.TestCase):
@@ -175,6 +218,64 @@ class ResolveSmoke(unittest.TestCase):
         res = youfish.resolve("vid")
         heights = [q["label"] for q in res["info"]["qualities"]]
         self.assertEqual(heights, ["1080p", "720p"])               # one rung per resolution
+
+    def test_audio_tracks_one_per_language_original_first(self):
+        # A dubbed video: two rungs each of English (source) + Portuguese; the picker collapses to
+        # one entry per language, best rung, original/default first.
+        self._mock_ytdlp([vf("137", 1080, "avc1"),
+                          af("140-en", 129, "mp4a.40.2", lang_pref=10, lang="en",
+                             note="English original (default), medium"),
+                          af("251-en", 124, "opus", lang_pref=10, lang="en",
+                             note="English original (default), medium"),
+                          af("251-pt", 128, "opus", lang_pref=-1, lang="pt",
+                             note="Portuguese, medium"),
+                          af("249-pt", 48, "opus", lang_pref=-1, lang="pt",
+                             note="Portuguese, low")])
+        info = youfish.resolve("vid")["info"]
+        tracks = info["audio_tracks"]
+        self.assertEqual([t["lang"] for t in tracks], ["en", "pt"])   # original language first
+        self.assertEqual(tracks[0]["name"], "English")
+        self.assertTrue(tracks[0]["is_original"])
+        self.assertEqual(tracks[1]["name"], "Portuguese")
+        self.assertFalse(tracks[1]["is_original"])
+        self.assertEqual(tracks[0]["itag"], "140-en")                 # best rung (129 aac > 124 opus)
+        self.assertTrue(tracks[0]["audio_url"])
+        self.assertEqual(info["audio_itag"], "140-en")               # started on the original
+
+    def test_untagged_original_prepended_as_original(self):
+        # A dubbed video whose SOURCE audio yt-dlp left untagged: it's what plays, so it must appear
+        # (as "Original"), highlighted, even though it carries no language tag.
+        self._mock_ytdlp([vf("137", 1080, "avc1"),
+                          af("251-src", 160, "opus", lang_pref=10),   # original, NO language tag
+                          af("251-pt", 158, "opus", lang_pref=-1, lang="pt",
+                             note="Portuguese, medium")])
+        info = youfish.resolve("vid")["info"]
+        tracks = info["audio_tracks"]
+        self.assertEqual([t["lang"] for t in tracks], ["", "pt"])     # original prepended, blank lang
+        self.assertEqual(tracks[0]["itag"], "251-src")
+        self.assertEqual(tracks[0]["name"], "Original")
+        self.assertFalse(tracks[0]["is_original"])                    # no double "(original)" marker
+        self.assertTrue(tracks[0]["audio_url"])
+        self.assertEqual(info["audio_itag"], "251-src")              # playing track is highlightable
+
+    def test_audio_tracks_empty_when_untagged(self):
+        # A normal single-audio video has many audio rungs, all with NO language tag. None are a dub
+        # choice, so audio_tracks stays empty (the UI hides the row) — never one bogus entry / rung.
+        self._mock_ytdlp([vf("137", 1080, "avc1"),
+                          af("139", 48, "mp4a.40.5"), af("249", 50, "opus"),
+                          af("250", 70, "opus"), af("140", 128, "mp4a.40.2"),
+                          af("251", 160, "opus")])
+        info = youfish.resolve("vid")["info"]
+        self.assertEqual(info["audio_tracks"], [])
+
+    def test_resolve_honours_remembered_audio_lang(self):
+        youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False,
+                                        "audio_lang": "pt"}
+        self._mock_ytdlp([vf("137", 1080, "avc1"),
+                          af("251-en", 160, "opus", lang_pref=10, lang="en"),
+                          af("251-pt", 158, "opus", lang_pref=-1, lang="pt")])
+        info = youfish.resolve("vid")["info"]
+        self.assertEqual(info["audio_itag"], "251-pt")               # started on the remembered dub
 
     def test_resolve_error_surfaces(self):
         def fail_run(cmd, **kwargs):

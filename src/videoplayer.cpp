@@ -228,6 +228,25 @@ void VideoPlayer::seek(qint64 positionMs)
     emit positionChanged();
 }
 
+void VideoPlayer::seekWhenReady(qint64 positionMs)
+{
+    // Resume / quality-switch / audio-switch restore. A dual-source seek is sent to each sink
+    // branch independently (see sendSeek); if a branch hasn't linked its pad yet the seek returns
+    // FALSE for that branch while the other jumps — desyncing A/V (seen as "video= 1 audio= 0" in
+    // the log, worst on slow-buffering dub audio). So seek now only if the pipeline has already
+    // prerolled; otherwise stash it and let the ASYNC_DONE handler apply it once BOTH branches are
+    // up. That is the correct readiness barrier — a fixed timer only guessed at it.
+    if (positionMs < 0)
+        return;
+    if (m_prerolled) {
+        sendSeek(positionMs);
+        m_position = positionMs;
+        emit positionChanged();
+    } else {
+        m_pendingSeekMs = positionMs;
+    }
+}
+
 void VideoPlayer::sendSeek(qint64 positionMs)
 {
     const gint64 t = (gint64)positionMs * GST_MSECOND;
@@ -313,6 +332,7 @@ void VideoPlayer::buildPipeline()
     // toggle, already OR'd with the YOUFISH_HWDEC env override at construction.
     m_hwDecode = m_hwDecodeReq;
     m_rateEngaged = false;   // re-engage the remembered speed on this fresh pipeline (at ASYNC_DONE)
+    m_prerolled = false;     // fresh pipeline hasn't prerolled; defer any seekWhenReady until it has
 
     m_pipeline = gst_pipeline_new("youfish-player");
     m_videoBin = gst_element_factory_make("uridecodebin", "videosrc");
@@ -603,6 +623,8 @@ void VideoPlayer::teardown()
     m_videoInput = m_videoSink = m_hwDec = nullptr;
     m_videoActive = true;
     m_muxed = false;
+    m_prerolled = false;
+    m_pendingSeekMs = -1;    // a deferred seek belongs to the torn-down pipeline; drop it
 }
 
 void VideoPlayer::setError(const QString &message)
@@ -789,19 +811,33 @@ gboolean VideoPlayer::onBusMessage(GstBus *, GstMessage *msg, gpointer self)
         }
         break;
     case GST_MESSAGE_ASYNC_DONE:
-        // Preroll finished — both sink branches are ready, but no PLAYING frame has reached the
-        // appsink yet (it only pushes new-sample in PLAYING). If a non-default speed is set, engage
-        // it ONCE here: the flush-seek reaches BOTH branches together (fixing the audio-at-one-rate
-        // / video-at-another split from applying it mid-preroll) and lands before the first visible
-        // frame, so there's no dark flash. The seek's own later ASYNC_DONE is skipped by the flag.
-        if (!player->m_rateEngaged && !qFuzzyCompare(player->m_rate, 1.0)
-                && GST_MESSAGE_SRC(msg) == GST_OBJECT(player->m_pipeline)) {
-            player->m_rateEngaged = true;
-            gint64 pos = 0;
-            if (!gst_element_query_position(player->m_pipeline, GST_FORMAT_TIME, &pos) || pos < 0)
-                pos = 0;
-            player->sendSeek(pos / GST_MSECOND);
-            YLOG << "[youfish] engaged start speed x" << player->m_rate;
+        // Preroll finished — both sink branches are linked + ready, but no PLAYING frame has
+        // reached the appsink yet (it only pushes new-sample in PLAYING). This is the correct
+        // barrier for a deferred seek: applying a resume/switch seek earlier (on a fixed timer)
+        // raced a slow-buffering branch — the audio seek returned FALSE while video jumped, and
+        // lip-sync desynced. Apply a pending seek here (it carries m_rate via sendSeek, so it also
+        // engages a non-default start speed together on BOTH branches, landing before the first
+        // visible frame → no dark flash, no rate split); otherwise, if only a non-default speed is
+        // set, engage it once as before. The seek's own later ASYNC_DONE is a no-op (pending
+        // cleared, m_rateEngaged set).
+        if (GST_MESSAGE_SRC(msg) == GST_OBJECT(player->m_pipeline)) {
+            player->m_prerolled = true;
+            if (player->m_pendingSeekMs >= 0) {
+                const qint64 target = player->m_pendingSeekMs;
+                player->m_pendingSeekMs = -1;
+                player->m_rateEngaged = true;      // this seek carries m_rate → speed engaged too
+                player->sendSeek(target);
+                player->m_position = target;
+                emit player->positionChanged();
+                YLOG << "[youfish] deferred seek ->" << target << "ms at preroll (both branches up)";
+            } else if (!player->m_rateEngaged && !qFuzzyCompare(player->m_rate, 1.0)) {
+                player->m_rateEngaged = true;
+                gint64 pos = 0;
+                if (!gst_element_query_position(player->m_pipeline, GST_FORMAT_TIME, &pos) || pos < 0)
+                    pos = 0;
+                player->sendSeek(pos / GST_MSECOND);
+                YLOG << "[youfish] engaged start speed x" << player->m_rate;
+            }
         }
         break;
     case GST_MESSAGE_BUFFERING: {
@@ -810,6 +846,20 @@ gboolean VideoPlayer::onBusMessage(GstBus *, GstMessage *msg, gpointer self)
         YLOG << "[youfish] buffering" << percent << "% (from" << src << ")";
         break;
     }
+    // Routine per-stream chatter (tags, stream-status, latency, clock/segment resets, …) fires
+    // constantly and floods the debug log; swallow it silently. Anything unexpected still logs.
+    case GST_MESSAGE_TAG:
+    case GST_MESSAGE_STREAM_STATUS:
+    case GST_MESSAGE_STREAM_START:
+    case GST_MESSAGE_LATENCY:
+    case GST_MESSAGE_NEW_CLOCK:
+    case GST_MESSAGE_RESET_TIME:
+    case GST_MESSAGE_DURATION_CHANGED:
+    case GST_MESSAGE_NEED_CONTEXT:
+    case GST_MESSAGE_HAVE_CONTEXT:
+    case GST_MESSAGE_ELEMENT:
+    case GST_MESSAGE_QOS:
+        break;
     default:
         YLOG << "[youfish] bus msg" << GST_MESSAGE_TYPE_NAME(msg) << "from" << src;
         break;

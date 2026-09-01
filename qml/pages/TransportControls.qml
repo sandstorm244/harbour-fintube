@@ -19,37 +19,53 @@ Item {
     property var qualities: []         // [{itag,label,video_url}] highest-first
     property string currentQuality: "" // label of the track playing now
     property bool qualityEnabled: true // only when the switchable (GStreamer/DASH) path is live
-    property bool qualityMenuOpen: false // parent reads this to hold the controls open
+
+    // ALL playback settings collapsed behind ONE ⚙ gear — Subtitles, Quality, Speed (Audio later) —
+    // so nothing crowds the overlay or the SFOS back-gesture corner. A multi-level menu: a main
+    // list, a per-setting drill-in, and (for captions) a further Translate drill-in.
+    property var speeds: [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+    property bool playbackMenuOpen: false // parent reads this to hold the controls open
+    property string playbackSection: ""   // "" main | "captions" | "translate" | "quality" | "speed"
 
     // Captions. tracks = the short real list (Off + manual + one ASR/lang); translations = the
     // big auto-translate set, demoted behind the "Translate…" drill-in so the menu never explodes.
     property var captionTracks: []          // [{lang,name,kind,url}]
     property var captionTranslations: []    // [{lang,name,url}]
     property string currentCaptionLang: ""  // lang of the active track ("" = off)
-    property bool captionMenuOpen: false    // parent reads this to hold the controls open
-    property bool captionTranslateOpen: false // menu is on the translate (level-2) list
     property string captionFilter: ""       // live filter over the translate list
+
+    // Audio (dub) tracks — only present on multi-language videos. One entry per language.
+    property var audioTracks: []            // [{lang,name,is_original,itag,audio_url}]
+    property string currentAudioItag: ""    // itag of the audio track playing now
+    property bool audioEnabled: true        // only in dual-source mode (swappable audio branch)
 
     signal seekRequested(int ms)
     signal togglePlay()
-    signal cycleSpeed()
+    signal speedSelected(real rate)
     signal qualitySelected(var q)
+    // Chosen audio track: an entry object {lang,name,itag,audio_url,...}.
+    signal audioSelected(var a)
     // Chosen caption: a track object {lang,name,url,...}, or null for "Off".
     signal captionChosen(var track)
     signal toggleFullscreen()
     signal interacted()
 
     property bool captionAvailable: captionTracks.length > 0 || captionTranslations.length > 0
-    // Only one pill menu open at a time — opening one closes the other. Closing the caption menu
-    // also drops it back to level 1.
-    onCaptionMenuOpenChanged: {
-        if (captionMenuOpen) root.qualityMenuOpen = false
-        else root.captionTranslateOpen = false
+    // Only offer the Audio row when the video has a language CHOICE (dubs) AND we're in the
+    // dual-source path whose audio branch can actually be swapped (not a muxed/HLS fallback).
+    property bool audioAvailable: audioEnabled && audioTracks.length > 1
+
+    // Display name of the audio track currently playing (matched by itag), for the Audio row.
+    function currentAudioName() {
+        for (var i = 0; i < root.audioTracks.length; i++)
+            if (root.audioTracks[i].itag === root.currentAudioItag)
+                return root.audioTracks[i].name
+        return ""
     }
-    onQualityMenuOpenChanged: if (qualityMenuOpen) root.captionMenuOpen = false
-    // Leaving the translate list (back, or the whole menu closing) resets the filter + field so
-    // the search always reopens empty and in sync with the (now-cleared) filter.
-    onCaptionTranslateOpenChanged: if (!captionTranslateOpen) {
+    onPlaybackMenuOpenChanged: if (!playbackMenuOpen) root.playbackSection = ""   // reopen on main
+    // Off the translate level, reset its filter + field so the search always reopens empty and in
+    // sync with the (cleared) filter.
+    onPlaybackSectionChanged: if (playbackSection !== "translate") {
         root.captionFilter = ""
         captionSearch.text = ""
     }
@@ -73,12 +89,13 @@ Item {
     // A Canvas drops its buffer when the app is backgrounded, so the drawn glyphs come back
     // blank. Repaint them when the app returns to the foreground and when the controls are
     // re-shown (the parent toggles `enabled`).
-    onEnabledChanged: if (enabled) { glyph.requestPaint(); fsGlyph.requestPaint() }
+    onEnabledChanged: if (enabled) { glyph.requestPaint(); fsGlyph.requestPaint(); gearGlyph.requestPaint() }
     Connections {
         target: Qt.application
         onActiveChanged: if (Qt.application.active) {
             glyph.requestPaint()
             fsGlyph.requestPaint()
+            gearGlyph.requestPaint()
         }
     }
 
@@ -129,115 +146,69 @@ Item {
         }
     }
 
-    // Playback-speed pill in the TOP-RIGHT corner — deliberately the opposite corner from
-    // the bottom-right fullscreen button so the two aren't fat-fingered.
+    // Settings GEAR in the TOP-RIGHT corner — opposite the bottom-right fullscreen button so the
+    // two aren't fat-fingered. Collapses Quality + Speed (later Audio) into one uncluttered button;
+    // tapping opens the playback menu.
     Rectangle {
-        id: speedButton
-        visible: root.speedEnabled
+        id: gearButton
+        visible: (root.qualityEnabled && root.qualities.length > 0) || root.speedEnabled
+                 || root.captionAvailable || root.audioAvailable
         anchors {
             right: parent.right; top: parent.top
             rightMargin: Theme.horizontalPageMargin; topMargin: Theme.paddingMedium
         }
         radius: Theme.paddingSmall
-        color: "#80000000"
-        width: speedLabel.width + 2 * Theme.paddingMedium
-        height: speedLabel.height + 2 * Theme.paddingMedium
-        Label {
-            id: speedLabel
+        color: root.playbackMenuOpen ? "#B0000000" : "#80000000"
+        width: gearGlyph.width + 2 * Theme.paddingMedium
+        height: gearGlyph.width + 2 * Theme.paddingMedium
+        // A drawn gear (like the play/fullscreen glyphs) — no dependence on a theme icon.
+        Canvas {
+            id: gearGlyph
             anchors.centerIn: parent
-            text: (root.playbackRate === Math.floor(root.playbackRate)
-                   ? root.playbackRate.toFixed(0) : ("" + root.playbackRate)) + "×"
-            font.pixelSize: Theme.fontSizeSmall
-            font.bold: root.playbackRate !== 1.0
-            color: root.playbackRate !== 1.0 ? Theme.highlightColor : "white"
+            width: Theme.iconSizeSmall * 0.72
+            height: width
+            property bool lit: root.playbackMenuOpen
+            onLitChanged: requestPaint()
+            onWidthChanged: requestPaint()
+            Component.onCompleted: requestPaint()
+            onPaint: {
+                var ctx = getContext("2d")
+                ctx.reset()
+                ctx.strokeStyle = lit ? Theme.highlightColor : "white"
+                ctx.lineWidth = Math.max(1.5, width * 0.11)
+                ctx.lineJoin = "round"
+                ctx.lineCap = "round"
+                var cx = width / 2, cy = height / 2
+                var R = width * 0.46, r = width * 0.31   // tooth-tip and valley radii
+                var teeth = 8
+                ctx.beginPath()
+                for (var i = 0; i <= teeth * 2; i++) {   // alternate tip/valley → a toothed ring
+                    var ang = Math.PI * i / teeth
+                    var rad = (i % 2 === 0) ? R : r
+                    var x = cx + rad * Math.cos(ang), yy = cy + rad * Math.sin(ang)
+                    if (i === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy)
+                }
+                ctx.closePath()
+                ctx.stroke()
+                ctx.beginPath()                          // hub
+                ctx.arc(cx, cy, width * 0.14, 0, 2 * Math.PI)
+                ctx.stroke()
+            }
         }
-        // Forgiving hit area: expand outward (up/down + the outer, right edge) but NOT toward
-        // the quality pill, so the two adjacent targets never contest the gap between them.
         MouseArea {
             anchors.fill: parent
             anchors.topMargin: -Theme.paddingSmall
             anchors.bottomMargin: -Theme.paddingSmall
             anchors.rightMargin: -Theme.paddingSmall
-            onClicked: { root.cycleSpeed(); root.interacted() }
-        }
-    }
-
-    // Quality pill — sits just LEFT of the speed pill. Unlike speed (a quick cycle), tapping
-    // this opens a small overlay menu of resolutions, so picking 1080p is one deliberate tap
-    // rather than cycling through every step.
-    Rectangle {
-        id: qualityButton
-        visible: root.qualityEnabled && root.qualities.length > 0
-        anchors {
-            right: speedButton.left; rightMargin: Theme.paddingSmall
-            top: speedButton.top
-        }
-        radius: Theme.paddingSmall
-        color: root.qualityMenuOpen ? "#B0000000" : "#80000000"
-        width: qualityLabel.width + 2 * Theme.paddingMedium
-        height: qualityLabel.height + 2 * Theme.paddingMedium
-        Label {
-            id: qualityLabel
-            anchors.centerIn: parent
-            text: root.currentQuality.length > 0 ? root.currentQuality : "Auto"
-            font.pixelSize: Theme.fontSizeSmall
-            color: root.qualityMenuOpen ? Theme.highlightColor : "white"
-        }
-        // Forgiving hit area: expand outward (up/down + the outer, left edge) but NOT toward
-        // the speed pill, so the two adjacent targets never contest the gap between them.
-        MouseArea {
-            anchors.fill: parent
-            anchors.topMargin: -Theme.paddingSmall
-            anchors.bottomMargin: -Theme.paddingSmall
-            anchors.leftMargin: -Theme.paddingSmall
             onClicked: {
-                root.qualityMenuOpen = !root.qualityMenuOpen
+                root.playbackMenuOpen = !root.playbackMenuOpen
                 root.interacted()
             }
         }
     }
 
-    // Caption (CC) pill in the TOP-LEFT corner — the opposite side from the speed/quality
-    // cluster so the four pills never crowd one finger. Tapping opens the two-tier menu.
-    Rectangle {
-        id: ccButton
-        visible: root.captionAvailable
-        // Inset EXTRA from the left edge: the top-left corner is SailfishOS's back-gesture hot
-        // corner (Lipstick lights it + can steal the tap), so keep the pill clear of it. Vertical
-        // position unchanged (level with the top-right pills).
-        anchors {
-            left: parent.left; top: parent.top
-            leftMargin: Theme.horizontalPageMargin + Theme.paddingLarge
-            topMargin: Theme.paddingMedium
-        }
-        radius: Theme.paddingSmall
-        color: root.captionMenuOpen ? "#B0000000" : "#80000000"
-        width: ccLabel.width + 2 * Theme.paddingMedium
-        height: ccLabel.height + 2 * Theme.paddingMedium
-        Label {
-            id: ccLabel
-            anchors.centerIn: parent
-            // "CC" when off; "CC · EN" (the base language) when a track is active.
-            text: root.currentCaptionLang.length > 0
-                  ? "CC · " + root.currentCaptionLang.split("-")[0].toUpperCase()
-                  : "CC"
-            font.pixelSize: Theme.fontSizeSmall
-            font.bold: root.currentCaptionLang.length > 0
-            color: root.currentCaptionLang.length > 0 || root.captionMenuOpen
-                   ? Theme.highlightColor : "white"
-        }
-        // Forgiving hit area, but grown AWAY from the top-left corner (down + right, into the
-        // video) — never up/left toward the OS edge-gesture bands, which would re-contest the tap.
-        MouseArea {
-            anchors.fill: parent
-            anchors.bottomMargin: -Theme.paddingSmall
-            anchors.rightMargin: -Theme.paddingSmall
-            onClicked: {
-                root.captionMenuOpen = !root.captionMenuOpen
-                root.interacted()
-            }
-        }
-    }
+    // (No CC pill — captions live in the gear's Subtitles row now, so the top-left back-gesture
+    // corner stays clear.)
 
     // --- thin scrubber pinned to the bottom, over a subtle gradient scrim ---
     Item {
@@ -371,227 +342,398 @@ Item {
         }
     }
 
-    // Quality menu — a compact overlay list under the top-right pills, present only while
-    // open. Declared LAST so it draws over the scrubber and buttons; a full-surface scrim
-    // dims the video and swallows the outside tap that closes it (so that same tap does not
-    // also toggle the controls beneath).
+    // Playback menu — the gear's two-tier sheet. Level 1: Quality / Speed rows (each with its
+    // current value + a chevron). Level 2: the drill-in list for the chosen setting. A full-surface
+    // scrim dims the video and swallows the outside tap that closes it.
     Item {
-        id: qualityMenu
+        id: playbackMenu
         anchors.fill: parent
-        visible: root.qualityMenuOpen
+        visible: root.playbackMenuOpen
 
         MouseArea {                                  // scrim: tap outside to dismiss
             anchors.fill: parent
-            onClicked: { root.qualityMenuOpen = false; root.interacted() }
-        }
-        Rectangle { anchors.fill: parent; color: "#40000000" }   // subtle dim behind the list
-
-        Rectangle {
-            id: qualityPanel
-            // speedButton lives under root, not this panel's parent (qualityMenu), so it can't
-            // be an anchor *target* here — QML only anchors to a parent/sibling. qualityMenu
-            // fills root, so speedButton's geometry is in the same coordinate space: drop the
-            // panel just below the pills with a plain y binding (which may reference any item).
-            anchors { right: parent.right; rightMargin: Theme.horizontalPageMargin }
-            y: speedButton.y + speedButton.height + Theme.paddingSmall
-            radius: Theme.paddingSmall
-            color: "#E6000000"
-            width: qualityColumn.width + 2 * Theme.paddingMedium
-            // Cap to the room below the pills: in portrait the video is only a strip, so a
-            // long resolution list scrolls inside the panel instead of spilling over the
-            // description beneath it. In fullscreen there's ample height and it never scrolls.
-            height: Math.min(qualityColumn.height + 2 * Theme.paddingSmall,
-                             root.height - y - Theme.paddingMedium)
-            clip: true
-            SilicaFlickable {
-                anchors.fill: parent
-                anchors.topMargin: Theme.paddingSmall
-                anchors.bottomMargin: Theme.paddingSmall
-                contentHeight: qualityColumn.height
-                Column {
-                    id: qualityColumn
-                    x: Theme.paddingMedium        // inset both sides (panel adds 2×paddingMedium)
-                    Repeater {
-                        model: root.qualities
-                        delegate: Rectangle {
-                            // min width keeps the short labels (144p) as wide as the long ones,
-                            // so the rows read as a tidy column rather than a ragged one.
-                            width: Math.max(rowLabel.width + 2 * Theme.paddingMedium,
-                                            Theme.itemSizeExtraSmall * 1.6)
-                            height: Theme.itemSizeExtraSmall
-                            color: rowArea.pressed ? "#33FFFFFF" : "transparent"
-                            Label {
-                                id: rowLabel
-                                anchors {
-                                    left: parent.left; leftMargin: Theme.paddingMedium
-                                    verticalCenter: parent.verticalCenter
-                                }
-                                text: modelData.label
-                                font.pixelSize: Theme.fontSizeSmall
-                                font.bold: modelData.label === root.currentQuality
-                                color: modelData.label === root.currentQuality
-                                       ? Theme.highlightColor : "white"
-                            }
-                            MouseArea {
-                                id: rowArea
-                                anchors.fill: parent
-                                onClicked: {
-                                    root.qualityMenuOpen = false
-                                    root.qualitySelected(modelData)
-                                    root.interacted()
-                                }
-                            }
-                        }
-                    }
-                }
-                VerticalScrollDecorator {}
-            }
-        }
-    }
-
-    // Caption menu — two tiers. Level 1: Off + the short real-track list + a "Translate…"
-    // drill-in. Level 2: a filtered search over the ~100 auto-translations, so the list never
-    // explodes. Anchored under the top-LEFT CC pill; declared LAST so it draws over everything.
-    Item {
-        id: captionMenu
-        anchors.fill: parent
-        visible: root.captionMenuOpen
-
-        MouseArea {                                  // scrim: tap outside to dismiss
-            anchors.fill: parent
-            onClicked: { root.captionMenuOpen = false; root.interacted() }
+            onClicked: { root.playbackMenuOpen = false; root.interacted() }
         }
         Rectangle { anchors.fill: parent; color: "#40000000" }
 
         Rectangle {
-            id: captionPanel
-            // ccButton is an uncle (lives under root, not captionMenu), so it can't be an anchor
-            // target — but captionMenu fills root, so plain bindings place the panel under it (and
-            // aligned to its inset-from-the-corner left edge).
-            anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin + Theme.paddingLarge }
-            y: ccButton.y + ccButton.height + Theme.paddingSmall
+            id: playbackPanel
+            // gearButton is an uncle (under root, not this menu), so anchor to the right edge and
+            // drop the panel under the gear with a plain y binding (bindings may reference any id).
+            anchors { right: parent.right; rightMargin: Theme.horizontalPageMargin }
+            y: gearButton.y + gearButton.height + Theme.paddingSmall
             radius: Theme.paddingSmall
             color: "#E6000000"
-            width: Math.min(root.width - 2 * Theme.horizontalPageMargin, root.width * 0.66)
-            // Level 1 sizes to its content; level 2 (search) fills the room below the pill so the
-            // language list has space to scroll. Both are CAPPED at that room (never taller) — in
-            // portrait the video is a short strip, and any overflow would render below videoBox
-            // where the dismiss MouseArea swallows the taps (a row there couldn't be selected).
-            height: root.captionTranslateOpen
-                    ? root.height - y - Theme.paddingMedium
-                    : Math.min(mainColumn.height + 2 * Theme.paddingSmall,
+            width: Math.min(root.width - 2 * Theme.horizontalPageMargin, root.width * 0.52)
+            // Main list sizes to content; a drill-in list fills the room below the gear so a long
+            // resolution/speed list scrolls inside the panel (in portrait the video is a strip).
+            height: root.playbackSection === ""
+                    ? Math.min(mainCol.height + 2 * Theme.paddingSmall,
                                root.height - y - Theme.paddingMedium)
+                    : root.height - y - Theme.paddingMedium
             clip: true
 
-            // --- Level 1: Off + real tracks + Translate… ---
+            // --- Level 1: Subtitles / Quality / Speed rows (scrolls if all three don't fit) ---
             SilicaFlickable {
-                id: mainView
-                visible: !root.captionTranslateOpen
+                visible: root.playbackSection === ""
                 anchors.fill: parent
                 anchors.topMargin: Theme.paddingSmall
                 anchors.bottomMargin: Theme.paddingSmall
-                contentHeight: mainColumn.height
+                contentHeight: mainCol.height
                 Column {
-                    id: mainColumn
-                    width: captionPanel.width
-                    Rectangle {                              // Off
-                        width: parent.width; height: Theme.itemSizeExtraSmall
-                        color: offArea.pressed ? "#33FFFFFF" : "transparent"
-                        Label {
-                            anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
-                                      verticalCenter: parent.verticalCenter }
-                            text: "Off"
-                            font.pixelSize: Theme.fontSizeSmall
-                            font.bold: root.currentCaptionLang === ""
-                            color: root.currentCaptionLang === "" ? Theme.highlightColor : "white"
-                        }
-                        MouseArea {
-                            id: offArea; anchors.fill: parent
-                            onClicked: { root.captionMenuOpen = false
-                                         root.captionChosen(null); root.interacted() }
-                        }
+                    id: mainCol
+                    width: playbackPanel.width
+                Rectangle {                              // Subtitles row
+                    visible: root.captionAvailable
+                    width: mainCol.width; height: Theme.itemSizeExtraSmall
+                    color: cRow.pressed ? "#33FFFFFF" : "transparent"
+                    Label {
+                        anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                  verticalCenter: parent.verticalCenter }
+                        text: "Subtitles"; font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
-                    Repeater {                               // manual + one ASR per language
-                        model: root.captionTracks
-                        delegate: Rectangle {
-                            width: mainColumn.width; height: Theme.itemSizeExtraSmall
-                            color: trackArea.pressed ? "#33FFFFFF" : "transparent"
-                            Label {
-                                anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
-                                          right: parent.right; rightMargin: Theme.paddingMedium
-                                          verticalCenter: parent.verticalCenter }
-                                truncationMode: TruncationMode.Fade
-                                // Flag the auto-generated track unless its name already says so.
-                                text: modelData.name + (modelData.kind === "asr"
-                                      && modelData.name.toLowerCase().indexOf("auto") < 0
-                                      ? "  ·  auto" : "")
-                                font.pixelSize: Theme.fontSizeSmall
-                                font.bold: modelData.lang === root.currentCaptionLang
-                                color: modelData.lang === root.currentCaptionLang
-                                       ? Theme.highlightColor : "white"
-                            }
-                            MouseArea {
-                                id: trackArea; anchors.fill: parent
-                                onClicked: { root.captionMenuOpen = false
-                                             root.captionChosen(modelData); root.interacted() }
-                            }
-                        }
+                    Label {
+                        anchors { right: cChev.left; rightMargin: Theme.paddingSmall
+                                  verticalCenter: parent.verticalCenter }
+                        // "Off", or the active base-language code (EN, PT…).
+                        text: root.currentCaptionLang.length > 0
+                              ? root.currentCaptionLang.split("-")[0].toUpperCase() : "Off"
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: root.currentCaptionLang.length > 0 ? Theme.highlightColor : "#99FFFFFF"
                     }
-                    Rectangle {                              // Translate… drill-in
-                        visible: root.captionTranslations.length > 0
-                        width: mainColumn.width; height: Theme.itemSizeExtraSmall
-                        color: translateArea.pressed ? "#33FFFFFF" : "transparent"
-                        Rectangle {                          // hairline divider above it
-                            anchors { left: parent.left; right: parent.right; top: parent.top }
-                            height: 1; color: "#22FFFFFF"
-                        }
-                        Label {
-                            anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
-                                      verticalCenter: parent.verticalCenter }
-                            text: "Translate…"
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: "white"
-                        }
-                        Label {
-                            anchors { right: parent.right; rightMargin: Theme.horizontalPageMargin
-                                      verticalCenter: parent.verticalCenter }
-                            text: "›"; font.pixelSize: Theme.fontSizeLarge; color: "#99FFFFFF"
-                        }
-                        MouseArea {
-                            id: translateArea; anchors.fill: parent
-                            onClicked: { root.captionTranslateOpen = true; root.interacted() }
-                        }
+                    Label { id: cChev
+                        anchors { right: parent.right; rightMargin: Theme.horizontalPageMargin
+                                  verticalCenter: parent.verticalCenter }
+                        text: "›"; font.pixelSize: Theme.fontSizeLarge; color: "#99FFFFFF" }
+                    MouseArea { id: cRow; anchors.fill: parent
+                        onClicked: { root.playbackSection = "captions"; root.interacted() } }
+                }
+                Rectangle {                              // Audio row (dubbed videos only)
+                    visible: root.audioAvailable
+                    width: mainCol.width; height: Theme.itemSizeExtraSmall
+                    color: aRow.pressed ? "#33FFFFFF" : "transparent"
+                    Label {
+                        anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                  verticalCenter: parent.verticalCenter }
+                        text: "Audio"; font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
+                    Label {
+                        anchors { right: aChev.left; rightMargin: Theme.paddingSmall
+                                  verticalCenter: parent.verticalCenter
+                                  left: parent.left; leftMargin: root.width * 0.28 }
+                        text: root.currentAudioName()
+                        truncationMode: TruncationMode.Fade; horizontalAlignment: Text.AlignRight
+                        font.pixelSize: Theme.fontSizeSmall; color: Theme.highlightColor
+                    }
+                    Label { id: aChev
+                        anchors { right: parent.right; rightMargin: Theme.horizontalPageMargin
+                                  verticalCenter: parent.verticalCenter }
+                        text: "›"; font.pixelSize: Theme.fontSizeLarge; color: "#99FFFFFF" }
+                    MouseArea { id: aRow; anchors.fill: parent
+                        onClicked: { root.playbackSection = "audio"; root.interacted() } }
+                }
+                Rectangle {                              // Quality row
+                    visible: root.qualityEnabled && root.qualities.length > 0
+                    width: mainCol.width; height: Theme.itemSizeExtraSmall
+                    color: qRow.pressed ? "#33FFFFFF" : "transparent"
+                    Label {
+                        anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                  verticalCenter: parent.verticalCenter }
+                        text: "Quality"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                    }
+                    Label {
+                        anchors { right: qChev.left; rightMargin: Theme.paddingSmall
+                                  verticalCenter: parent.verticalCenter }
+                        text: root.currentQuality.length > 0 ? root.currentQuality : "Auto"
+                        font.pixelSize: Theme.fontSizeSmall; color: Theme.highlightColor
+                    }
+                    Label { id: qChev
+                        anchors { right: parent.right; rightMargin: Theme.horizontalPageMargin
+                                  verticalCenter: parent.verticalCenter }
+                        text: "›"; font.pixelSize: Theme.fontSizeLarge; color: "#99FFFFFF" }
+                    MouseArea { id: qRow; anchors.fill: parent
+                        onClicked: { root.playbackSection = "quality"; root.interacted() } }
+                }
+                Rectangle {                              // Speed row
+                    visible: root.speedEnabled
+                    width: mainCol.width; height: Theme.itemSizeExtraSmall
+                    color: sRow.pressed ? "#33FFFFFF" : "transparent"
+                    Label {
+                        anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                  verticalCenter: parent.verticalCenter }
+                        text: "Speed"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                    }
+                    Label {
+                        anchors { right: sChev.left; rightMargin: Theme.paddingSmall
+                                  verticalCenter: parent.verticalCenter }
+                        text: root.fmtRate(root.playbackRate)
+                        font.pixelSize: Theme.fontSizeSmall; color: Theme.highlightColor
+                    }
+                    Label { id: sChev
+                        anchors { right: parent.right; rightMargin: Theme.horizontalPageMargin
+                                  verticalCenter: parent.verticalCenter }
+                        text: "›"; font.pixelSize: Theme.fontSizeLarge; color: "#99FFFFFF" }
+                    MouseArea { id: sRow; anchors.fill: parent
+                        onClicked: { root.playbackSection = "speed"; root.interacted() } }
+                }
                 }
                 VerticalScrollDecorator {}
             }
 
-            // --- Level 2: filtered translation search ---
+            // --- Level 2: Quality list ---
             Item {
-                id: translateView
-                visible: root.captionTranslateOpen
+                visible: root.playbackSection === "quality"
                 anchors.fill: parent
-
-                Rectangle {                                  // back + title
-                    id: tHeader
+                Rectangle {
+                    id: qBack
                     anchors { left: parent.left; right: parent.right; top: parent.top }
                     height: Theme.itemSizeExtraSmall
-                    color: backArea.pressed ? "#33FFFFFF" : "transparent"
+                    color: qBackArea.pressed ? "#33FFFFFF" : "transparent"
                     Label {
                         anchors { left: parent.left; leftMargin: Theme.paddingMedium
                                   verticalCenter: parent.verticalCenter }
-                        text: "‹  Translate to"
-                        font.pixelSize: Theme.fontSizeSmall
-                        color: "white"
+                        text: "‹  Quality"; font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
-                    MouseArea {
-                        id: backArea; anchors.fill: parent
-                        onClicked: { root.captionTranslateOpen = false; root.interacted() }
+                    MouseArea { id: qBackArea; anchors.fill: parent
+                        onClicked: { root.playbackSection = ""; root.interacted() } }
+                }
+                SilicaFlickable {
+                    anchors { left: parent.left; right: parent.right
+                              top: qBack.bottom; bottom: parent.bottom }
+                    clip: true
+                    contentHeight: qCol.height
+                    Column {
+                        id: qCol
+                        width: parent.width
+                        Repeater {
+                            model: root.qualities
+                            delegate: Rectangle {
+                                width: qCol.width; height: Theme.itemSizeExtraSmall
+                                color: qItemArea.pressed ? "#33FFFFFF" : "transparent"
+                                Label {
+                                    anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                              verticalCenter: parent.verticalCenter }
+                                    text: modelData.label
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    font.bold: modelData.label === root.currentQuality
+                                    color: modelData.label === root.currentQuality
+                                           ? Theme.highlightColor : "white"
+                                }
+                                MouseArea { id: qItemArea; anchors.fill: parent
+                                    onClicked: { root.playbackMenuOpen = false
+                                                 root.qualitySelected(modelData); root.interacted() } }
+                            }
+                        }
                     }
+                    VerticalScrollDecorator {}
+                }
+            }
+
+            // --- Level 2: Audio (dub) list ---
+            Item {
+                visible: root.playbackSection === "audio"
+                anchors.fill: parent
+                Rectangle {
+                    id: aBack
+                    anchors { left: parent.left; right: parent.right; top: parent.top }
+                    height: Theme.itemSizeExtraSmall
+                    color: aBackArea.pressed ? "#33FFFFFF" : "transparent"
+                    Label {
+                        anchors { left: parent.left; leftMargin: Theme.paddingMedium
+                                  verticalCenter: parent.verticalCenter }
+                        text: "‹  Audio"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                    }
+                    MouseArea { id: aBackArea; anchors.fill: parent
+                        onClicked: { root.playbackSection = ""; root.interacted() } }
+                }
+                SilicaFlickable {
+                    anchors { left: parent.left; right: parent.right
+                              top: aBack.bottom; bottom: parent.bottom }
+                    clip: true
+                    contentHeight: aCol.height
+                    Column {
+                        id: aCol
+                        width: parent.width
+                        Repeater {
+                            model: root.audioTracks
+                            delegate: Rectangle {
+                                width: aCol.width; height: Theme.itemSizeExtraSmall
+                                color: aItemArea.pressed ? "#33FFFFFF" : "transparent"
+                                Label {
+                                    anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                              right: parent.right; rightMargin: Theme.horizontalPageMargin
+                                              verticalCenter: parent.verticalCenter }
+                                    text: modelData.name + (modelData.is_original ? "  (original)" : "")
+                                    truncationMode: TruncationMode.Fade
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    font.bold: modelData.itag === root.currentAudioItag
+                                    color: modelData.itag === root.currentAudioItag
+                                           ? Theme.highlightColor : "white"
+                                }
+                                MouseArea { id: aItemArea; anchors.fill: parent
+                                    onClicked: { root.playbackMenuOpen = false
+                                                 root.audioSelected(modelData); root.interacted() } }
+                            }
+                        }
+                    }
+                    VerticalScrollDecorator {}
+                }
+            }
+
+            // --- Level 2: Speed list ---
+            Item {
+                visible: root.playbackSection === "speed"
+                anchors.fill: parent
+                Rectangle {
+                    id: sBack
+                    anchors { left: parent.left; right: parent.right; top: parent.top }
+                    height: Theme.itemSizeExtraSmall
+                    color: sBackArea.pressed ? "#33FFFFFF" : "transparent"
+                    Label {
+                        anchors { left: parent.left; leftMargin: Theme.paddingMedium
+                                  verticalCenter: parent.verticalCenter }
+                        text: "‹  Speed"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                    }
+                    MouseArea { id: sBackArea; anchors.fill: parent
+                        onClicked: { root.playbackSection = ""; root.interacted() } }
+                }
+                SilicaFlickable {
+                    anchors { left: parent.left; right: parent.right
+                              top: sBack.bottom; bottom: parent.bottom }
+                    clip: true
+                    contentHeight: sCol.height
+                    Column {
+                        id: sCol
+                        width: parent.width
+                        Repeater {
+                            model: root.speeds
+                            delegate: Rectangle {
+                                width: sCol.width; height: Theme.itemSizeExtraSmall
+                                color: sItemArea.pressed ? "#33FFFFFF" : "transparent"
+                                Label {
+                                    anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                              verticalCenter: parent.verticalCenter }
+                                    text: root.fmtRate(modelData) + (modelData === 1.0 ? "  (Normal)" : "")
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    font.bold: modelData === root.playbackRate
+                                    color: modelData === root.playbackRate
+                                           ? Theme.highlightColor : "white"
+                                }
+                                MouseArea { id: sItemArea; anchors.fill: parent
+                                    onClicked: { root.playbackMenuOpen = false
+                                                 root.speedSelected(modelData); root.interacted() } }
+                            }
+                        }
+                    }
+                    VerticalScrollDecorator {}
+                }
+            }
+
+            // --- Level 2: Subtitles — Off + real tracks + a Translate… drill-in ---
+            Item {
+                visible: root.playbackSection === "captions"
+                anchors.fill: parent
+                Rectangle {
+                    id: capBack
+                    anchors { left: parent.left; right: parent.right; top: parent.top }
+                    height: Theme.itemSizeExtraSmall
+                    color: capBackArea.pressed ? "#33FFFFFF" : "transparent"
+                    Label {
+                        anchors { left: parent.left; leftMargin: Theme.paddingMedium
+                                  verticalCenter: parent.verticalCenter }
+                        text: "‹  Subtitles"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                    }
+                    MouseArea { id: capBackArea; anchors.fill: parent
+                        onClicked: { root.playbackSection = ""; root.interacted() } }
+                }
+                SilicaFlickable {
+                    anchors { left: parent.left; right: parent.right
+                              top: capBack.bottom; bottom: parent.bottom }
+                    clip: true
+                    contentHeight: capCol.height
+                    Column {
+                        id: capCol
+                        width: parent.width
+                        Rectangle {                          // Off
+                            width: capCol.width; height: Theme.itemSizeExtraSmall
+                            color: capOffArea.pressed ? "#33FFFFFF" : "transparent"
+                            Label {
+                                anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                          verticalCenter: parent.verticalCenter }
+                                text: "Off"; font.pixelSize: Theme.fontSizeSmall
+                                font.bold: root.currentCaptionLang === ""
+                                color: root.currentCaptionLang === "" ? Theme.highlightColor : "white"
+                            }
+                            MouseArea { id: capOffArea; anchors.fill: parent
+                                onClicked: { root.playbackMenuOpen = false
+                                             root.captionChosen(null); root.interacted() } }
+                        }
+                        Repeater {                           // manual + one ASR per language
+                            model: root.captionTracks
+                            delegate: Rectangle {
+                                width: capCol.width; height: Theme.itemSizeExtraSmall
+                                color: capTrackArea.pressed ? "#33FFFFFF" : "transparent"
+                                Label {
+                                    anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                              right: parent.right; rightMargin: Theme.paddingMedium
+                                              verticalCenter: parent.verticalCenter }
+                                    truncationMode: TruncationMode.Fade
+                                    text: modelData.name + (modelData.kind === "asr"
+                                          && modelData.name.toLowerCase().indexOf("auto") < 0
+                                          ? "  ·  auto" : "")
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    font.bold: modelData.lang === root.currentCaptionLang
+                                    color: modelData.lang === root.currentCaptionLang
+                                           ? Theme.highlightColor : "white"
+                                }
+                                MouseArea { id: capTrackArea; anchors.fill: parent
+                                    onClicked: { root.playbackMenuOpen = false
+                                                 root.captionChosen(modelData); root.interacted() } }
+                            }
+                        }
+                        Rectangle {                          // Translate… drill-in
+                            visible: root.captionTranslations.length > 0
+                            width: capCol.width; height: Theme.itemSizeExtraSmall
+                            color: capTrArea.pressed ? "#33FFFFFF" : "transparent"
+                            Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top }
+                                        height: 1; color: "#22FFFFFF" }
+                            Label {
+                                anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
+                                          verticalCenter: parent.verticalCenter }
+                                text: "Translate…"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                            }
+                            Label {
+                                anchors { right: parent.right; rightMargin: Theme.horizontalPageMargin
+                                          verticalCenter: parent.verticalCenter }
+                                text: "›"; font.pixelSize: Theme.fontSizeLarge; color: "#99FFFFFF" }
+                            MouseArea { id: capTrArea; anchors.fill: parent
+                                onClicked: { root.playbackSection = "translate"; root.interacted() } }
+                        }
+                    }
+                    VerticalScrollDecorator {}
+                }
+            }
+
+            // --- Level 3: Translate — a filtered search over the ~100 auto-translations ---
+            Item {
+                visible: root.playbackSection === "translate"
+                anchors.fill: parent
+                Rectangle {
+                    id: trBack
+                    anchors { left: parent.left; right: parent.right; top: parent.top }
+                    height: Theme.itemSizeExtraSmall
+                    color: trBackArea.pressed ? "#33FFFFFF" : "transparent"
+                    Label {
+                        anchors { left: parent.left; leftMargin: Theme.paddingMedium
+                                  verticalCenter: parent.verticalCenter }
+                        text: "‹  Translate to"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                    }
+                    MouseArea { id: trBackArea; anchors.fill: parent
+                        onClicked: { root.playbackSection = "captions"; root.interacted() } }
                 }
                 SearchField {
                     id: captionSearch
-                    anchors { left: parent.left; right: parent.right; top: tHeader.bottom }
+                    anchors { left: parent.left; right: parent.right; top: trBack.bottom }
                     placeholderText: "Language"
                     onTextChanged: root.captionFilter = text
                 }
@@ -599,15 +741,15 @@ Item {
                     anchors { left: parent.left; right: parent.right
                               top: captionSearch.bottom; bottom: parent.bottom }
                     clip: true
-                    contentHeight: translateCol.height
+                    contentHeight: trCol.height
                     Column {
-                        id: translateCol
+                        id: trCol
                         width: parent.width
                         Repeater {
                             model: root.filteredTranslations()
                             delegate: Rectangle {
-                                width: translateCol.width; height: Theme.itemSizeExtraSmall
-                                color: trArea.pressed ? "#33FFFFFF" : "transparent"
+                                width: trCol.width; height: Theme.itemSizeExtraSmall
+                                color: trItemArea.pressed ? "#33FFFFFF" : "transparent"
                                 Label {
                                     anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
                                               right: parent.right; rightMargin: Theme.paddingMedium
@@ -619,11 +761,9 @@ Item {
                                     color: modelData.lang === root.currentCaptionLang
                                            ? Theme.highlightColor : "white"
                                 }
-                                MouseArea {
-                                    id: trArea; anchors.fill: parent
-                                    onClicked: { root.captionMenuOpen = false
-                                                 root.captionChosen(modelData); root.interacted() }
-                                }
+                                MouseArea { id: trItemArea; anchors.fill: parent
+                                    onClicked: { root.playbackMenuOpen = false
+                                                 root.captionChosen(modelData); root.interacted() } }
                             }
                         }
                     }
@@ -632,6 +772,7 @@ Item {
             }
         }
     }
+
 
     function fmt(ms) {
         if (!ms || ms < 0)
@@ -642,5 +783,10 @@ Item {
         var sec = s % 60
         function p(n) { return (n < 10 ? "0" : "") + n }
         return (h > 0 ? h + ":" + p(m) : "" + m) + ":" + p(sec)
+    }
+
+    // "1×", "1.25×", "0.5×" — whole rates drop the decimal.
+    function fmtRate(r) {
+        return (r === Math.floor(r) ? r.toFixed(0) : ("" + r)) + "×"
     }
 }

@@ -129,6 +129,27 @@ def _audio_orig_pref(f):
     return 0
 
 
+# Bitrate-tier words yt-dlp appends to an audio format_note ("German, low"). Stripped to leave
+# the bare language name for the audio picker.
+_AUDIO_TIER_RE = re.compile(r",\s*(?:ultralow|low|medium|high)\s*$", re.I)
+
+
+def _audio_lang_name(f):
+    """Human language label for an audio track. yt-dlp's format_note is already a localized
+    language name followed by a bitrate tier — 'German, low', 'Chinese (Simplified), medium',
+    'English original (default), low'. Strip the trailing tier and the 'original (default)'
+    role marker (surfaced separately via is_original); fall back to the language code."""
+    note = _AUDIO_TIER_RE.sub("", (f.get("format_note") or "").strip())
+    note = re.sub(r"\s*\boriginal\b", "", note, flags=re.I)
+    note = re.sub(r"\s*\(default\)", "", note, flags=re.I)
+    note = note.strip().strip(",").strip()
+    # A note that was ONLY a tier word (no comma — e.g. "medium") slips past the tier regex above;
+    # reject a bare tier so it never masquerades as a language name.
+    if re.fullmatch(r"(?:ultralow|low|medium|high)", note, flags=re.I):
+        note = ""
+    return note or (f.get("language") or "").strip() or "Audio"
+
+
 def _audio_candidates(formats):
     """Playable audio-only tracks (opus/AAC, with a direct URL), best-first. Ordered by bitrate
     high→low (opus preferred at a tie — better quality per bit; original/default language over
@@ -1756,12 +1777,13 @@ def resolve(video_id):
         if data is None:
             return {"ok": False, "error": err}
         formats = data.get("formats", [])
+        _s = get_settings()
         try:
-            cap = int(get_settings().get("default_quality") or 0)
+            cap = int(_s.get("default_quality") or 0)
         except (TypeError, ValueError):
             cap = 0
         video = _pick_video(formats, cap)   # capped by the user's Default-quality setting
-        audio = _pick_audio(formats)
+        audio = _pick_audio(formats, _s.get("audio_lang") or "")   # honour remembered dub language
         muxed = _pick(formats, _MUXED_ITAGS)
         if not muxed and not (video and audio):
             return {"ok": False,
@@ -1796,6 +1818,46 @@ def resolve(video_id):
                 "label": "%dp" % qh,
                 "video_url": _proxied(qf["url"], video_id, qf.get("format_id"), http_ua),
             })
+        # Audio-track picker: one entry per available LANGUAGE (best rung of each), original/default
+        # first — mirrors _pick_audio's ordering. Dubbed videos only; single-language videos yield
+        # <=1 entry and the UI hides the row. Each URL is proxied like the main audio track.
+        audio_url = _proxied(audio["url"], video_id, audio.get("format_id"), http_ua) if audio else ""
+        audio_tracks = []
+        seen_alang = set()
+        for af in _audio_candidates(formats):
+            alang = (af.get("language") or "").strip()
+            # Only LANGUAGE-TAGGED tracks are a dub choice. A normal single-audio video tags none of
+            # its (many) rungs — skipping them keeps audio_tracks empty so the UI hides the row;
+            # a dubbed video tags every track (original included), one entry per language.
+            if not alang:
+                continue
+            akey = alang.lower()
+            if akey in seen_alang:
+                continue
+            seen_alang.add(akey)
+            audio_tracks.append({
+                "lang": alang,
+                "name": _audio_lang_name(af),
+                "is_original": _audio_orig_pref(af) > 0,
+                "itag": str(af.get("format_id") or ""),
+                "audio_url": _proxied(af["url"], video_id, af.get("format_id"), http_ua),
+            })
+        # A dubbed video whose ORIGINAL source audio yt-dlp left untagged is skipped above — yet it
+        # is what's actually playing. When the picked track isn't already listed, prepend it as the
+        # "Original" so it's shown, highlighted, and reselectable (its lang is usually "" → the next
+        # video's _pick_audio treats that as "use the original"). Keeps the invariant that whatever
+        # is playing always has a row. Only fires once a genuine dub list already exists.
+        if audio_tracks and audio and \
+                str(audio.get("format_id") or "") not in {t["itag"] for t in audio_tracks}:
+            a_lang = (audio.get("language") or "").strip()
+            audio_tracks.insert(0, {
+                "lang": a_lang,
+                "name": _audio_lang_name(audio) if a_lang else "Original",
+                # name already reads "Original" here, so don't also append the "(original)" marker.
+                "is_original": bool(a_lang) and _audio_orig_pref(audio) > 0,
+                "itag": str(audio.get("format_id") or ""),
+                "audio_url": audio_url,
+            })
         chapters = [{"start": c.get("start_time") or 0, "title": c.get("title") or ""}
                     for c in (data.get("chapters") or []) if c.get("start_time") is not None]
         # Captions ride along in the same dump — no extra yt-dlp spawn. `tracks` is the short
@@ -1816,8 +1878,9 @@ def resolve(video_id):
             # libsoup HTTP stack (not a fixable header — curl/urllib both get 206), so
             # souphttpsrc fetches localhost and urllib does the real request.
             "video_url": _proxied(video["url"], video_id, video.get("format_id"), http_ua) if video else "",
-            "audio_url": _proxied(audio["url"], video_id, audio.get("format_id"), http_ua) if audio else "",
+            "audio_url": audio_url,
             "qualities": qualities,
+            "audio_tracks": audio_tracks,
             "tracks": tracks,
             "translations": translations,
             "http_ua": http_ua,
@@ -1856,11 +1919,26 @@ def _pick_video(formats, cap=0):
     return cands[0]                            # cap below everything offered → highest available
 
 
-def _pick_audio(formats):
+def _pick_audio(formats, prefer_lang=""):
     """Best audio track with a URL — the top of the property-based audio ladder (see
-    _audio_candidates: highest bitrate, opus preferred at a tie, original/default language)."""
+    _audio_candidates: highest bitrate, opus preferred at a tie, original/default language).
+
+    With a preferred language (the persisted audio_lang) picks the best rung of THAT language when
+    the video dubs it — exact BCP-47 match first, then base code (a remembered 'en' matches
+    'en-US') — else falls back to the top of the ladder (original/default source audio)."""
     cands = _audio_candidates(formats)
-    return cands[0] if cands else None
+    if not cands:
+        return None
+    want = (prefer_lang or "").strip().lower()
+    if want:
+        for f in cands:
+            if (f.get("language") or "").strip().lower() == want:
+                return f
+        base = want.split("-")[0]
+        for f in cands:
+            if (f.get("language") or "").strip().lower().split("-")[0] == base:
+                return f
+    return cands[0]
 
 
 def _norm_url(u):
@@ -2085,6 +2163,10 @@ _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
                       # Preferred caption language code, remembered across videos ("" = off).
                       # On load the player auto-selects a matching track/translation if one exists.
                       "caption_lang": "",
+                      # Preferred audio (dub) language code, remembered across videos ("" = the
+                      # video's original/default source audio). resolve() starts a matching dub when
+                      # the video offers one; the player's Audio picker also switches live.
+                      "audio_lang": "",
                       "player_client": "",
                       # yt-dlp update channel: "stable" (default) or "nightly" (YouTube fixes
                       # land days sooner, less tested). Drives ytdlp_update()'s --update-to target.

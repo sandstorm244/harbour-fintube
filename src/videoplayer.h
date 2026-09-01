@@ -57,6 +57,11 @@ public:
     Q_INVOKABLE void pause();
     Q_INVOKABLE void stop();
     Q_INVOKABLE void seek(qint64 positionMs);
+    // Restore a position as soon as the pipeline can take it. Unlike seek(), which needs a live
+    // pipeline NOW, this defers until preroll (both branches' pads linked) if we're not ready yet —
+    // used for resume-from-saved-position and quality/audio-track switches, where seeking too early
+    // let one branch (esp. a slow-buffering dub) miss the seek and desync.
+    Q_INVOKABLE void seekWhenReady(qint64 positionMs);
     // Freeze/thaw just the video branch (audio keeps playing) when the app is hidden, so we
     // don't decode frames nobody can see. Auto-driven from QML by the app's active state.
     Q_INVOKABLE void setVideoActive(bool active);
@@ -114,6 +119,8 @@ private:
     qint64 m_duration = 0;
     qreal m_rate = 1.0;
     bool m_rateEngaged = false;   // non-default start speed engaged once, during preroll
+    bool m_prerolled = false;     // pipeline has finished preroll (both branches' pads linked)
+    qint64 m_pendingSeekMs = -1;  // deferred seekWhenReady() target, applied at preroll (-1 = none)
     bool m_videoActive = true;
     bool m_muxed = false;   // single-source mode: m_videoBin carries both video + audio
     bool m_hwDecode = false;// effective mode this build (m_hwDecodeReq, reset each buildPipeline)
