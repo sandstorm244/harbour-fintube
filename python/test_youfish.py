@@ -1459,6 +1459,31 @@ class VideoInfo(unittest.TestCase):
         self.assertEqual(len(info["chapters"]), 2)          # the no-start chapter is dropped
         self.assertEqual(info["chapters"][1]["title"], "Part 2")
 
+    def test_uses_android_client_primary(self):
+        calls = []
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps({"title": "X"}), stderr="")
+        youfish.subprocess.run = fake
+        youfish.video_info("vid")
+        xargs = calls[0][calls[0].index("--extractor-args") + 1]
+        self.assertIn("player_client=android", xargs)       # fast mobile-API client first
+        self.assertEqual(len(calls), 1)                     # primary ok → no fallback call
+
+    def test_falls_back_to_default_when_android_fails(self):
+        calls = []
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            if len(calls) == 1:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="android boom")
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps({"title": "Fell back"}), stderr="")
+        youfish.subprocess.run = fake
+        res = youfish.video_info("vid")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["info"]["title"], "Fell back")
+        self.assertEqual(len(calls), 2)                     # android failed → default retry
+        self.assertNotIn("--extractor-args", calls[1])      # fallback pins no client
+
     def test_error_return(self):
         youfish.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
             returncode=1, stdout="", stderr="blocked")

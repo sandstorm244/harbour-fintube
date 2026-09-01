@@ -256,7 +256,8 @@ Page {
                     MenuItem {
                         text: "Video details"
                         onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
-                            { videoId: item.vidId, title: item.vidTitle, infoOnly: true })
+                            { videoId: item.vidId, title: item.vidTitle, infoOnly: true,
+                              infoThumbnail: item.vidThumb })
                     }
                     MenuItem {
                         text: "Add to playlist"

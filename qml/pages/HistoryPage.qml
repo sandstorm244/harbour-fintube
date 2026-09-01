@@ -60,7 +60,8 @@ Page {
                 MenuItem {
                     text: "Video details"
                     onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
-                        { videoId: model.id, title: model.title, infoOnly: true })
+                        { videoId: model.id, title: model.title, infoOnly: true,
+                          infoThumbnail: model.thumbnail || "" })
                 }
             }
 

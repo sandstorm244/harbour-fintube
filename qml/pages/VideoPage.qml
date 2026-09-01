@@ -577,7 +577,8 @@ Page {
             page.videoDuration = info.duration || 0
             page.chapters = info.chapters || []
             if (page.title.length === 0) page.title = info.title || ""
-            page.infoThumbnail = info.thumbnail || ""
+            // Keep the instant list thumbnail if the fetch has none; else swap in the higher-res one.
+            page.infoThumbnail = info.thumbnail || page.infoThumbnail
             page.viewCount = info.view_count || 0
             page.likeCount = info.like_count || 0
             page.uploadDate = info.upload_date || ""
