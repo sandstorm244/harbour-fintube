@@ -685,6 +685,228 @@ class ParseJson3(unittest.TestCase):
         self.assertAlmostEqual(cues[0]["dur"], 2.0, places=2)               # 0->2s merged
 
 
+class SubscriptionFeed(unittest.TestCase):
+    """subscription_feed is built from each channel's yt-dlp /videos tab (YouTube retired RSS):
+    merged newest-first, durations inline, members-only dropped, cached briefly."""
+    def setUp(self):
+        self._saved = {n: getattr(youfish, n)
+                       for n in ("_ytdlp_path", "list_subscriptions", "get_settings", "_data_dir")}
+        self._run = youfish.subprocess.run
+        self._cache, self._state = youfish._feed_cache, youfish._feed_state
+        self._open = youfish.urllib.request.urlopen
+        self._tmp = tempfile.mkdtemp(prefix="feed-")
+        youfish._feed_cache = {}                        # per-channel: {cid: {"ts", "rows"}}
+        youfish._feed_state = {"loaded": False}
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        youfish.get_settings = lambda: {"hide_watched": False}
+        youfish._data_dir = lambda: self._tmp          # disk feed-cache writes into a tempdir
+        # RSS fallback network is inert by default (raises) so tests stay offline; a test that
+        # exercises the fallback overrides urlopen itself.
+        def _no_rss(req, timeout=0):
+            raise youfish.urllib.error.URLError("no rss in test")
+        youfish.urllib.request.urlopen = _no_rss
+
+    def tearDown(self):
+        for n, f in self._saved.items():
+            setattr(youfish, n, f)
+        youfish.subprocess.run = self._run
+        youfish._feed_cache, youfish._feed_state = self._cache, self._state
+        youfish.urllib.request.urlopen = self._open
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _mock(self, channels):
+        """channels: {channel_id: [flat-entry, ...]}; fake_run dispatches on the URL's channel id."""
+        def fake_run(cmd, **kw):
+            url = cmd[-1]
+            cid = next((c for c in channels if c in url), None)
+            data = {"channel": cid, "entries": channels.get(cid, [])}
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr="")
+        youfish.subprocess.run = fake_run
+
+    def test_merged_newest_first_durations_inline(self):
+        now = int(time.time())
+        self._mock({
+            "UC_AAA": [{"id": "aaaaaaaaaa1", "title": "A new", "timestamp": now - 3600, "duration": 120},
+                       {"id": "aaaaaaaaaa2", "title": "A old", "timestamp": now - 9 * 86400, "duration": 200}],
+            "UC_BBB": [{"id": "bbbbbbbbbb1", "title": "B mid", "timestamp": now - 2 * 86400, "duration": 300}],
+        })
+        youfish.list_subscriptions = lambda: [{"id": "UC_AAA"}, {"id": "UC_BBB"}]
+        res = youfish.subscription_feed(force=True)
+        self.assertTrue(res["ok"])
+        self.assertEqual([i["title"] for i in res["items"]], ["A new", "B mid", "A old"])  # cross-channel sort
+        self.assertEqual(res["items"][0]["duration"], 120)          # duration inline, no 2nd pass
+        self.assertEqual(res["items"][0]["channel_id"], "UC_AAA")
+
+    def test_members_only_dropped(self):
+        now = int(time.time())
+        self._mock({"UC_AAA": [
+            {"id": "okokokokok1", "title": "ok", "timestamp": now, "duration": 10},
+            {"id": "memememem01", "title": "members", "timestamp": now, "duration": 10,
+             "availability": "subscriber_only"}]})
+        youfish.list_subscriptions = lambda: [{"id": "UC_AAA"}]
+        res = youfish.subscription_feed(force=True)
+        self.assertEqual([i["title"] for i in res["items"]], ["ok"])
+
+    def test_cache_hit_skips_ytdlp(self):
+        now = int(time.time())
+        self._mock({"UC_AAA": [{"id": "cccccccccc1", "title": "c", "timestamp": now, "duration": 10}]})
+        youfish.list_subscriptions = lambda: [{"id": "UC_AAA"}]
+        youfish.subscription_feed(force=True)                       # populate cache
+        calls = [0]
+        prev = youfish.subprocess.run
+        def counting(cmd, **kw):
+            calls[0] += 1
+            return prev(cmd, **kw)
+        youfish.subprocess.run = counting
+        res = youfish.subscription_feed(force=False)
+        self.assertTrue(res.get("cached"))
+        self.assertEqual(calls[0], 0)                               # served from cache, no spawn
+
+    def test_no_subs_is_empty(self):
+        youfish.list_subscriptions = lambda: []
+        self.assertEqual(youfish.subscription_feed(force=True), {"ok": True, "items": []})
+
+    def test_channel_failure_contributes_nothing(self):
+        # yt-dlp fails AND the RSS fallback fails (urlopen raises, per setUp) → nothing from UC_BAD.
+        now = int(time.time())
+        def fake_run(cmd, **kw):
+            if "UC_BAD" in cmd[-1]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="gone")
+            data = {"channel": "UC_OK", "entries":
+                    [{"id": "okokokokok1", "title": "ok", "timestamp": now, "duration": 10}]}
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr="")
+        youfish.subprocess.run = fake_run
+        youfish.list_subscriptions = lambda: [{"id": "UC_BAD"}, {"id": "UC_OK"}]
+        res = youfish.subscription_feed(force=True)
+        self.assertEqual([i["title"] for i in res["items"]], ["ok"])  # bad channel dropped, feed still built
+
+    def test_rss_fallback_when_ytdlp_returns_nothing(self):
+        # yt-dlp yields nothing for the channel → fall back to its RSS feed (dur/live absent).
+        self._mock({"UC_R": []})              # yt-dlp returns an empty tab
+        rss = ('<feed><entry><yt:videoId>rssvid00001</yt:videoId><title>RSS vid</title>'
+               '<published>2026-08-30T12:00:00+00:00</published>'
+               '<author><name>RSS Chan</name></author>'
+               '<media:statistics views="42"/></entry></feed>')
+        def fake_open(req, timeout=0):
+            import io
+            class R(io.BytesIO):
+                def __enter__(s): return s
+                def __exit__(s, *a): return False
+            return R(rss.encode())
+        youfish.urllib.request.urlopen = fake_open
+        youfish.list_subscriptions = lambda: [{"id": "UC_R"}]
+        res = youfish.subscription_feed(force=True)
+        self.assertEqual([i["title"] for i in res["items"]], ["RSS vid"])
+        it = res["items"][0]
+        self.assertEqual(it["duration"], 0)          # RSS has no duration
+        self.assertEqual(it["live"], 0)              # …nor live status
+        self.assertEqual(it["views"], 42)
+
+    def test_disk_cache_survives_worker_restart(self):
+        # A cold launch (fresh in-memory cache) hydrates the per-channel cache from disk and shows
+        # it WITHOUT spawning yt-dlp — the stale-while-revalidate win.
+        now = int(time.time())
+        self._mock({"UC_D": [{"id": "diskvid0001", "title": "disk", "timestamp": now, "duration": 9}]})
+        youfish.list_subscriptions = lambda: [{"id": "UC_D"}]
+        youfish.subscription_feed(force=True)                 # build + persist to disk
+        self.assertTrue(os.path.exists(youfish._feed_cache_path()))
+        youfish._feed_cache = {}                              # simulate an app relaunch...
+        youfish._feed_state = {"loaded": False}               # ...forcing a fresh hydrate from disk
+        calls = [0]
+        prev = youfish.subprocess.run
+        def counting(cmd, **kw):
+            calls[0] += 1
+            return prev(cmd, **kw)
+        youfish.subprocess.run = counting
+        res = youfish.subscription_feed(force=False)
+        self.assertTrue(res.get("cached"))
+        self.assertEqual([i["title"] for i in res["items"]], ["disk"])   # served from disk
+        self.assertEqual(calls[0], 0)                         # no yt-dlp spawn on cold launch
+
+    def test_stale_flag_set_when_a_channel_is_due(self):
+        now = int(time.time())
+        self._mock({"UC_S": [{"id": "stalevid001", "title": "s", "timestamp": now, "duration": 9}]})
+        youfish.list_subscriptions = lambda: [{"id": "UC_S"}]
+        youfish.subscription_feed(force=True)                 # fresh, hot channel → not due
+        self.assertFalse(youfish.subscription_feed(force=False)["stale"])
+        youfish._feed_cache["UC_S"]["ts"] = time.time() - 3600   # age past the 10-min hot TTL
+        res = youfish.subscription_feed(force=False)
+        self.assertTrue(res["cached"] and res["stale"])       # served but flagged for bg refresh
+
+    def test_background_refresh_skips_dormant_fetches_hot(self):
+        now = int(time.time())
+        self._mock({
+            "UC_HOT": [{"id": "hotvideo001", "title": "hot", "timestamp": now, "duration": 9}],
+            "UC_DORM": [{"id": "dormvideo01", "title": "dorm", "timestamp": now - 90 * 86400, "duration": 9}],
+        })
+        youfish.list_subscriptions = lambda: [{"id": "UC_HOT"}, {"id": "UC_DORM"}]
+        youfish.subscription_feed(force=True)                 # build both
+        # 40 min later: HOT (10-min TTL) is due, DORMANT (24-h TTL) is not.
+        for cid in ("UC_HOT", "UC_DORM"):
+            youfish._feed_cache[cid]["ts"] = time.time() - 40 * 60
+        fetched = []
+        prev = youfish.subprocess.run
+        def spy(cmd, **kw):
+            fetched.append(next((c for c in ("UC_HOT", "UC_DORM") if c in cmd[-1]), "?"))
+            return prev(cmd, **kw)
+        youfish.subprocess.run = spy
+        youfish.subscription_feed(force=True)                 # background refresh (refresh_all=False)
+        self.assertEqual(fetched, ["UC_HOT"])                 # only the hot channel re-fetched
+
+    def test_refresh_all_refetches_even_dormant(self):
+        now = int(time.time())
+        self._mock({"UC_DORM": [{"id": "dormvideo01", "title": "d", "timestamp": now - 90 * 86400, "duration": 9}]})
+        youfish.list_subscriptions = lambda: [{"id": "UC_DORM"}]
+        youfish.subscription_feed(force=True)                 # build (dormant, not due)
+        calls = [0]
+        prev = youfish.subprocess.run
+        def counting(cmd, **kw):
+            calls[0] += 1
+            return prev(cmd, **kw)
+        youfish.subprocess.run = counting
+        youfish.subscription_feed(force=True, refresh_all=True)   # pull-to-refresh
+        self.assertEqual(calls[0], 1)                         # dormant re-fetched anyway
+
+    def test_failed_refresh_keeps_last_good(self):
+        now = int(time.time())
+        self._mock({"UC_K": [{"id": "keepvideo01", "title": "keep", "timestamp": now, "duration": 9}]})
+        youfish.list_subscriptions = lambda: [{"id": "UC_K"}]
+        youfish.subscription_feed(force=True)                 # cache a good entry
+        youfish._feed_cache["UC_K"]["ts"] = time.time() - 3600   # make it due
+        # Now both sources fail for this channel (yt-dlp rc!=0, RSS raises per setUp).
+        youfish.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(returncode=1, stdout="", stderr="x")
+        res = youfish.subscription_feed(force=True)
+        self.assertEqual([i["title"] for i in res["items"]], ["keep"])   # last-good retained, not blanked
+
+    def test_empty_channel_not_refetched_every_refresh(self):
+        # A channel that returns nothing is stamped so it retries hourly, not on every refresh
+        # (else it'd thrash yt-dlp and pin the feed 'stale' forever).
+        self._mock({"UC_E": []})                              # yt-dlp empty; RSS also fails (setUp)
+        youfish.list_subscriptions = lambda: [{"id": "UC_E"}]
+        youfish.subscription_feed(force=True)                 # first fetch → empty, but stamped
+        self.assertIn("UC_E", youfish._feed_cache)
+        self.assertFalse(youfish.subscription_feed(force=False)["stale"])   # not perpetually stale
+        calls = [0]
+        prev = youfish.subprocess.run
+        def counting(cmd, **kw):
+            calls[0] += 1
+            return prev(cmd, **kw)
+        youfish.subprocess.run = counting
+        youfish.subscription_feed(force=True)                 # a refresh moments later
+        self.assertEqual(calls[0], 0)                         # within the 1-h retry window → skipped
+
+    def test_live_stream_pinned_to_top(self):
+        now = int(time.time())
+        self._mock({"UC_L": [
+            {"id": "olduploadd01", "title": "old upload", "timestamp": now - 30 * 86400, "duration": 100},
+            {"id": "livestream01", "title": "LIVE now", "live_status": "is_live"},   # no timestamp
+        ]})
+        youfish.list_subscriptions = lambda: [{"id": "UC_L"}]
+        res = youfish.subscription_feed(force=True)
+        self.assertEqual([i["title"] for i in res["items"]], ["LIVE now", "old upload"])  # live pinned top
+        self.assertEqual(res["items"][0]["live"], 1)
+
+
 class CaptionCuesCache(unittest.TestCase):
     """caption_cues fetches once, caches on success, and leaves failures retryable."""
     def setUp(self):

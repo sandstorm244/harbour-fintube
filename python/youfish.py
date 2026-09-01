@@ -1969,29 +1969,6 @@ def _rel_date(e):
     return _rel_from_ts(ts) if ts else ""
 
 
-def _channel_dates(channel_id):
-    """{video_id: "3 weeks ago"} for a channel's recent uploads, from its RSS feed — exact
-    publish dates the flat listing omits. The feed only carries the latest ~15 videos."""
-    if not channel_id or not str(channel_id).startswith("UC"):
-        return {}
-    _force_ipv4()
-    url = "https://www.youtube.com/feeds/videos.xml?channel_id=%s" % channel_id
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            xml = r.read().decode("utf-8", "replace")
-    except Exception:
-        return {}
-    out = {}
-    for vid, pub in re.findall(
-            r"<yt:videoId>([\w-]+)</yt:videoId>.*?<published>([^<]+)</published>",
-            xml, re.S):
-        rel = _rel_from_iso(pub)
-        if rel:
-            out[vid] = rel
-    return out
-
-
 def _iso_ts(iso):
     """Unix timestamp from an ISO-8601 UTC string (for sorting), 0 if unparseable."""
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})", iso or "")
@@ -2648,8 +2625,9 @@ def toggle_subscription(channel_id, name="", url="", thumbnail=""):
                      "url": url, "thumbnail": thumbnail})
         subscribed = True
     _save_subscriptions(subs)
-    _feed_cache["ts"] = 0.0             # subs changed → rebuild the home feed next time
-    _feed_durations_cache["ts"] = 0.0   # …and its duration map
+    # (No feed-cache poke needed: a NEW channel is uncached → due → pulled in on the next refresh;
+    # an UNSUBSCRIBED one is excluded by _merged_feed_items(ids) and pruned on the next fetch.)
+    _feed_durations_cache["ts"] = 0.0   # invalidate the (separate) duration map
     return {"ok": True, "subscribed": subscribed, "subscriptions": subs}
 
 
@@ -2779,8 +2757,7 @@ def _import_newpipe_db(con):
         subs_added += 1
     if subs_added:
         _save_subscriptions(subs)
-        _feed_cache["ts"] = 0.0
-        _feed_durations_cache["ts"] = 0.0
+        _feed_durations_cache["ts"] = 0.0   # new subs are auto-due in the per-channel feed cache
 
     # ---- watch history + resume points --------------------------------------
     # stream_state.progress_time is the resume position in MILLISECONDS; NewPipe clears it once a
@@ -3007,6 +2984,7 @@ def channel_videos(channel, start=1, n=30):
         n = max(1, int(n))
         proc = subprocess.run(
             [path, *_COMMON_ARGS, "--flat-playlist",
+             "--extractor-args", "youtubetab:approximate_date",   # upload dates inline (RSS is gone)
              "--playlist-items", "%d:%d" % (start, start + n - 1),
              "--dump-single-json", "--", url],
             capture_output=True, text=True, timeout=90)
@@ -3032,12 +3010,7 @@ def channel_videos(channel, start=1, n=30):
             "posted": _rel_date(e),
             "live": 1 if (e.get("live_status") == "is_live" or e.get("is_live")) else 0,
         } for e in entries]
-        # Flat entries lack dates; fill the recent ones from the channel's RSS feed.
-        if start <= 1:
-            dates = _channel_dates(data.get("channel_id") or "")
-            for it in items:
-                if not it["posted"] and it["id"] in dates:
-                    it["posted"] = dates[it["id"]]
+        # Dates come inline now (approximate_date extractor arg) — no RSS date-fill needed.
         return {"ok": True, "items": items, "has_more": has_more, "channel": {
             "id": data.get("channel_id") or data.get("id") or "",
             "name": data.get("channel") or data.get("uploader") or data.get("title") or "",
@@ -3050,62 +3023,230 @@ def channel_videos(channel, start=1, n=30):
         return {"ok": False, "error": str(ex)}
 
 
-_feed_cache = {"ts": 0.0, "items": []}
+def _feed_fetch_channel(path, cid, per_channel):
+    """One subscribed channel's recent uploads → [(sort_ts, item), ...]. yt-dlp's /videos tab is
+    the PRIMARY source (rich: duration + live + approximate date inline, Shorts excluded); the
+    channel's RSS feed is the automatic FALLBACK for when /videos returns nothing (YouTube breaks
+    RSS and the tab endpoint intermittently — mirrors how NewPipe/FreeTube cross-fall-back). Any
+    total failure of both contributes nothing."""
+    rows = _feed_from_ytdlp(path, cid, per_channel)
+    return rows if rows else _feed_from_rss(cid, per_channel)
 
 
-def subscription_feed(limit=100, force=False):
-    """Compile subscribed channels' recent uploads into one feed, newest first. Built from
-    each channel's RSS feed (fast + carries dates/views), fetched in parallel and cached
-    briefly so returning to the home page is instant."""
+def _feed_from_ytdlp(path, cid, per_channel):
+    """PRIMARY: a channel's /videos tab via yt-dlp (flat). Duration/live/approximate-date inline;
+    the tab excludes Shorts itself, so no separate durations or Shorts pass is needed."""
+    url = "https://www.youtube.com/channel/%s/videos" % cid
+    try:
+        proc = subprocess.run(
+            [path, *_COMMON_ARGS, "--flat-playlist",
+             "--extractor-args", "youtubetab:approximate_date",
+             "--playlist-items", "1:%d" % per_channel,
+             "--dump-single-json", "--", url],
+            capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            return []
+        data = json.loads(proc.stdout)
+    except Exception:
+        return []
+    chan = data.get("channel") or data.get("uploader") or ""
+    rows = []
+    for e in (data.get("entries") or []):
+        vid = e.get("id")
+        if not vid or _is_members_only(e):
+            continue
+        ls = e.get("live_status")
+        live = 1 if (ls == "is_live" or e.get("is_live")) else 0
+        # Live/upcoming items carry no upload timestamp — key them by NOW so they ride the top (newer
+        # than any real upload), NOT the bottom where a 0 key would sink them. Using now (not a huge
+        # now+1e9 sentinel) means an ended stream that then fails to refetch AGES and sinks on its
+        # own, instead of staying pinned above everyone else's fresh uploads forever.
+        ts = e.get("timestamp")
+        sort_ts = ts if ts else (time.time() if ls in ("is_live", "is_upcoming") else 0)
+        rows.append((sort_ts, {
+            "id": vid,
+            "title": e.get("title") or "(untitled)",
+            "uploader": e.get("uploader") or e.get("channel") or chan,
+            "duration": e.get("duration") or 0,
+            "thumbnail": _video_thumb(vid) or _pick_thumb(e),
+            "views": e.get("view_count") or 0,
+            "posted": _rel_date(e),
+            "live": live,
+            "channel_id": cid,
+        }))
+    return rows
+
+
+def _feed_from_rss(cid, per_channel):
+    """FALLBACK: a channel's RSS feed (feeds/videos.xml). Fast + exact dates but — the fast-mode
+    tradeoff NewPipe/FreeTube also live with — NO duration or live status (both come back 0). Same
+    item shape as the yt-dlp path so the merged feed stays uniform."""
+    if not str(cid).startswith("UC"):
+        return []
+    _force_ipv4()
+    url = "https://www.youtube.com/feeds/videos.xml?channel_id=%s" % cid
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            ents = _parse_feed_entries(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return []
+    rows = []
+    for e in ents[:per_channel]:
+        vid = e["id"]
+        rows.append((_iso_ts(e.get("published")), {
+            "id": vid,
+            "title": e["title"],
+            "uploader": e["uploader"],
+            "duration": 0,                         # RSS carries no length (fast-mode tradeoff)
+            "thumbnail": _video_thumb(vid),
+            "views": e.get("views") or 0,
+            "posted": _rel_from_iso(e.get("published")),
+            "live": 0,                             # …nor live status
+            "channel_id": cid,
+        }))
+    return rows
+
+
+# Feed cache — PER CHANNEL, in ONE file: {cid: {"ts": fetched_at, "rows": [[sort_ts, item], ...]}}.
+# Per-channel entries let a refresh re-fetch only channels likely to have something new (adaptive
+# TTL) and keep a channel's last-good videos when its own fetch fails (resilience).
+_feed_cache = {}
+_feed_state = {"loaded": False}
+
+
+def _feed_cache_path():
+    return os.path.join(_data_dir(), "feed_cache.json")
+
+
+def _channel_ttl(newest_ts):
+    """Adaptive refresh interval for one channel, from the age of its newest upload — hot channels
+    refresh often, dormant ones coast on a long TTL, so a refresh only spawns yt-dlp for channels
+    that plausibly posted since last time."""
+    age = time.time() - (newest_ts or 0)
+    if age < 2 * 86400:
+        return 10 * 60        # posted in the last 2 days → check every 10 min
+    if age < 14 * 86400:
+        return 60 * 60        # last 2 weeks → hourly
+    if age < 60 * 86400:
+        return 6 * 3600       # last 2 months → every 6 h
+    return 24 * 3600          # dormant → daily
+
+
+def _channel_due(cid, now):
+    """A channel needs re-fetching: never cached, or past its (adaptive) TTL. An entry with NO rows
+    (a new sub whose fetch failed, or a channel with no uploads) retries hourly — often enough to
+    recover, but not on every refresh (which would thrash it and pin the feed 'stale' forever)."""
+    ent = _feed_cache.get(cid)
+    if not ent:
+        return True
+    rows = ent.get("rows") or []
+    if not rows:
+        return (now - ent.get("ts", 0)) > 3600
+    newest = max(r[0] for r in rows)
+    return (now - ent.get("ts", 0)) > _channel_ttl(newest)
+
+
+def _merged_feed_items(ids):
+    """Every subscribed channel's cached rows, merged newest-first → [item, ...]. Skips any
+    malformed row so a hand-edited / corrupted cache file can't crash the sort."""
+    rows = []
+    for cid in ids:
+        ent = _feed_cache.get(cid)
+        if not ent:
+            continue
+        for r in (ent.get("rows") or []):
+            if isinstance(r, (list, tuple)) and len(r) == 2 and isinstance(r[0], (int, float)):
+                rows.append(r)
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return [r[1] for r in rows]
+
+
+def _load_feed_cache():
+    """Per-channel feed cache from disk (so a cold launch shows the previous feed instantly)."""
+    out = {}
+    try:
+        with open(_feed_cache_path()) as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            for cid, ent in d.items():
+                if isinstance(ent, dict) and isinstance(ent.get("rows"), list):
+                    out[cid] = {"ts": float(ent.get("ts") or 0.0), "rows": ent["rows"]}
+    except Exception:
+        pass
+    return out
+
+
+def _save_feed_cache():
+    try:
+        with open(_feed_cache_path(), "w") as f:
+            json.dump(_feed_cache, f)
+    except Exception:
+        pass
+
+
+def _feed_hydrate():
+    if not _feed_state["loaded"]:
+        _feed_cache.update(_load_feed_cache())
+        _feed_state["loaded"] = True
+
+
+def subscription_feed(limit=100, force=False, refresh_all=False):
+    """Subscribed channels' recent uploads, newest first — built per channel from yt-dlp /videos
+    (+ RSS fallback, see _feed_fetch_channel), cached PER CHANNEL to disk and served
+    stale-while-revalidate.
+
+    - normal load (force=False): return the merged cache IMMEDIATELY with a `stale` flag (true when
+      any channel is past its adaptive TTL); the caller refreshes in the background.
+    - background refresh (force=True): re-fetch only channels that are DUE (adaptive per-channel TTL)
+      — hot channels often, dormant ones rarely.
+    - pull-to-refresh (refresh_all=True): re-fetch every channel.
+    A channel whose fetch fails keeps its last-good videos instead of dropping out of the feed."""
     subs = list_subscriptions()
     ids = [s.get("id") for s in subs if str(s.get("id") or "").startswith("UC")]
     if not ids:
         return {"ok": True, "items": []}
-    if (not force and _feed_cache["items"]
-            and time.time() - _feed_cache["ts"] < 300):
+    _feed_hydrate()
+    now = time.time()
+    have_cache = any((_feed_cache.get(c) or {}).get("rows") for c in ids)
+    if not force and have_cache:
         return {"ok": True,
-                "items": _feed_hide_watched(_feed_shorts_filter(
-                    _feed_with_durations(_feed_cache["items"])))[:int(limit)],
-                "cached": True}
-    _force_ipv4()
-
-    def fetch(cid):
-        url = "https://www.youtube.com/feeds/videos.xml?channel_id=%s" % cid
+                "items": _feed_hide_watched(_merged_feed_items(ids))[:int(limit)],
+                "cached": True,
+                "stale": any(_channel_due(c, now) for c in ids)}
+    path = _ytdlp_path()
+    if not path:
+        return {"ok": False, "error": "yt-dlp not found", "items": []}
+    due = ids if refresh_all else [c for c in ids if _channel_due(c, now)]
+    if due:
+        per_channel = 15
+        results = {}
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
-            with urllib.request.urlopen(req, timeout=10) as r:
-                ents = _parse_feed_entries(r.read().decode("utf-8", "replace"))
-            for e in ents:
-                e["channel_id"] = cid          # lets feed_durations fetch only channels with new videos
-            return ents
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(due))) as ex:
+                for cid, rows in zip(due, ex.map(
+                        lambda c: _feed_fetch_channel(path, c, per_channel), due)):
+                    results[cid] = rows
         except Exception:
-            return []
-
-    entries = []
-    try:
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, len(ids))) as ex:
-            for res in ex.map(fetch, ids):
-                entries.extend(res)
-    except Exception:
-        for cid in ids:
-            entries.extend(fetch(cid))
-
-    entries.sort(key=lambda e: _iso_ts(e.get("published")), reverse=True)
-    items = [{
-        "id": e["id"],
-        "title": e["title"],
-        "uploader": e["uploader"],
-        "duration": 0,
-        "thumbnail": _video_thumb(e["id"]),
-        "views": e.get("views") or 0,
-        "posted": _rel_from_iso(e.get("published")),
-        "channel_id": e.get("channel_id", ""),
-    } for e in entries]
-    _feed_cache["ts"] = time.time()
-    _feed_cache["items"] = items
+            for cid in due:
+                results[cid] = _feed_fetch_channel(path, cid, per_channel)
+        for cid, rows in results.items():
+            if rows:                          # success → replace + stamp
+                _feed_cache[cid] = {"ts": now, "rows": rows}
+            else:
+                # Empty (a transient failure, or a channel with no uploads): KEEP any last-good
+                # videos (resilience — the channel doesn't vanish) but stamp the attempt so it
+                # retries on its TTL instead of re-fetching every refresh + pinning 'stale' forever.
+                ent = _feed_cache.get(cid) or {}
+                _feed_cache[cid] = {"ts": now, "rows": ent.get("rows") or []}
+    for cid in list(_feed_cache):             # drop unsubscribed channels
+        if cid not in ids:
+            del _feed_cache[cid]
+    _save_feed_cache()
     return {"ok": True,
-            "items": _feed_hide_watched(_feed_shorts_filter(_feed_with_durations(items)))[:int(limit)]}
+            "items": _feed_hide_watched(_merged_feed_items(ids))[:int(limit)],
+            "cached": False,
+            "stale": any(_channel_due(c, now) for c in ids)}
 
 
 _feed_durations_cache = {"ts": 0.0, "map": {}, "shorts": set()}

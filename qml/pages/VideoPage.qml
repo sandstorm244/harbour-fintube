@@ -338,6 +338,7 @@ Page {
         page.commentsLoading = true
         page.commentsError = ""
         app.backend.fetchComments(page.videoId, 50, function(res) {
+            if (!page) return              // page torn down before the (slow) comment fetch returned
             page.commentsLoading = false
             if (res && res.ok) {
                 page.comments = res.comments || []
@@ -521,7 +522,7 @@ Page {
             page.autoSelectCaption(transport.captionTracks, transport.captionTranslations)
             if (page.channelUrl.length > 0 || page.channelId.length > 0)
                 app.backend.fetchChannelAvatar(page.channelUrl || page.channelId,
-                    function(res) { if (res && res.thumbnail) page.channelAvatar = res.thumbnail })
+                    function(res) { if (page && res && res.thumbnail) page.channelAvatar = res.thumbnail })
             if (info.video_url && info.video_url.length > 0
                     && info.audio_url && info.audio_url.length > 0) {
                 page.useGst = true
@@ -695,11 +696,16 @@ Page {
         // resolve() is slow, so kicking it off inside the position callback guarantees
         // resumeMs is set before onResolved fires (otherwise the seek target is still 0).
         app.backend.resumePosition(videoId, function(sec) {
+            if (!page) return              // page torn down before this async reply landed
             page.resumeMs = (sec || 0) * 1000
             app.backend.resolve(videoId)
-            // Queue sponsor segments AFTER resolve so they don't delay the (slow) resolve.
+            // Queue sponsor segments AFTER resolve so they don't delay the (slow) resolve. Guard
+            // against the page being torn down before this async reply lands (swipe-out / error
+            // recovery) — writing to the destroyed page throws "Cannot write property of null".
             if (app.backend.sponsorBlock)
-                app.backend.sponsorSegments(videoId, function(segs) { page.sponsorSegments = segs || [] })
+                app.backend.sponsorSegments(videoId, function(segs) {
+                    if (page) page.sponsorSegments = segs || []
+                })
         })
     }
 

@@ -271,10 +271,11 @@ Item {
         })
     }
 
-    // Home feed: subscribed channels' recent uploads merged newest-first (from Python,
-    // via each channel's RSS). `force` bypasses the short backend cache.
-    function subscriptionFeed(force, callback) {
-        py.call("youfish.subscription_feed", [100, !!force], function(res) {
+    // Home feed: subscribed channels' recent uploads merged newest-first (from Python, per-channel
+    // yt-dlp /videos + RSS fallback). `force` refreshes DUE channels (adaptive per-channel TTL);
+    // `refreshAll` (pull-to-refresh) re-fetches every channel. Served stale-while-revalidate.
+    function subscriptionFeed(force, refreshAll, callback) {
+        py.call("youfish.subscription_feed", [100, !!force, !!refreshAll], function(res) {
             callback(res || {})
         })
     }

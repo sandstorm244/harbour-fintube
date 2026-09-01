@@ -32,39 +32,46 @@ Page {
     function loadFeed(force) {
         if (feedModel.count === 0)
             page.loading = true
-        app.backend.subscriptionFeed(force, function(res) {
+        // A user-driven load (pull-to-refresh) forces EVERY channel; the initial load just reads
+        // the cache (stale-while-revalidate) and lets the background refresh handle due channels.
+        app.backend.subscriptionFeed(force, force, function(res) {
             page.loading = false
             page.lastSubsCount = app.backend.subscriptions.length
             feedModel.clear()
             var items = (res && res.items) ? res.items : []
             for (var i = 0; i < items.length; i++)
                 feedModel.append(items[i])
-            if (feedModel.count > 0)
-                page.fillDurations(force)
+            // Stale-while-revalidate: the response may be a cached (even hours-old) feed shown
+            // instantly on a cold launch. If it's stale, fetch a fresh one in the background and
+            // swap it in silently — so the user never stares at a spinner while yt-dlp runs.
+            if (!force && res && res.cached && res.stale)
+                page.refreshFeedInBackground()
         })
     }
 
-    // RSS has no video length or Shorts flag; pull both from yt-dlp in the background. Drop the
-    // durations into the rows so the length badges appear a moment after the feed, and remove any
-    // row now known to be a Short (channel /shorts-tab membership — reliable regardless of length).
-    function fillDurations(force) {
-        app.backend.feedDurations(force, function(map, shorts) {
-            var shortSet = Object.create(null)   // no prototype → an id like "constructor" can't false-hit
-            if (app.backend.hideShorts && shorts)
-                for (var s = 0; s < shorts.length; s++)
-                    shortSet[shorts[s]] = true
-            for (var i = feedModel.count - 1; i >= 0; i--) {   // backwards → safe removal
-                var it = feedModel.get(i)
-                if (shortSet[it.id]) {
-                    feedModel.remove(i)
-                    continue
-                }
-                var d = map ? map[it.id] : undefined
-                if (d !== undefined && d > 0 && it.duration !== d)
-                    feedModel.setProperty(i, "duration", d)
-            }
+    // Background refresh (no spinner). Repopulates only when the feed actually changed up top, so
+    // an unchanged feed doesn't reset the user's scroll position out from under them.
+    function refreshFeedInBackground() {
+        app.backend.subscriptionFeed(true, false, function(res) {   // DUE channels only (adaptive TTL)
+            var items = (res && res.items) ? res.items : []
+            if (items.length === 0)
+                return
+            // Repopulate only if the id SEQUENCE actually changed — catches any new / removed /
+            // reordered video anywhere in the list (not just a new top one), while still skipping a
+            // true no-op so an unchanged feed doesn't reset the user's scroll.
+            var changed = items.length !== feedModel.count
+            for (var j = 0; !changed && j < items.length; j++)
+                if (feedModel.get(j).id !== items[j].id)
+                    changed = true
+            if (!changed)
+                return
+            feedModel.clear()
+            for (var i = 0; i < items.length; i++)
+                feedModel.append(items[i])
         })
     }
+    // (The feed is built from each channel's /videos tab — duration inline, Shorts excluded by the
+    // tab — so length badges show WITH the feed; no separate durations pass needed.)
 
     Component.onCompleted: loadFeed(false)
 
