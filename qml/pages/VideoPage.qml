@@ -1171,6 +1171,11 @@ Page {
 
         PullDownMenu {
             MenuItem {
+                text: "Related videos"
+                onClicked: pageStack.push(Qt.resolvedUrl("RelatedPage.qml"),
+                    { videoId: page.videoId, seedTitle: page.title })
+            }
+            MenuItem {
                 text: "Download audio"
                 enabled: !page.downloading
                 onClicked: page.startDownload("audio")

@@ -73,9 +73,17 @@ Item {
     // One page of search results → the caller's callback (page-scoped, and drives the
     // scroll-to-load-more paging in SearchPage, mirroring channelVideos). `start` is the
     // 1-based first index. Callback gets the raw result {ok, items, has_more, ...}.
-    function searchPage(query, kind, start, callback) {
+    function searchPage(query, kind, start, filters, callback) {
         if (!query) { callback({}); return }
-        py.call("youfish.search", [query, 15, kind || "video", start || 1], function(res) {
+        py.call("youfish.search", [query, 15, kind || "video", start || 1, filters || {}], function(res) {
+            callback(res || {})
+        })
+    }
+
+    // Recommendations for a video (its autoplay Mix), via the flat-playlist path — see RelatedPage.
+    function relatedVideos(videoId, callback) {
+        if (!videoId) { callback({}); return }
+        py.call("youfish.related", [videoId, 20], function(res) {
             callback(res || {})
         })
     }

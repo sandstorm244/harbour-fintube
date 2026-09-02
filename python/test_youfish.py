@@ -10,6 +10,7 @@ covered so it can't come back. youfish.py imports `pyotherside` only inside func
 `import youfish` is safe here.
 """
 
+import base64
 import json
 import os
 import shutil
@@ -19,6 +20,7 @@ import sys
 import tempfile
 import types
 import unittest
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import youfish  # noqa: E402
@@ -1490,6 +1492,121 @@ class VideoInfo(unittest.TestCase):
         res = youfish.video_info("vid")
         self.assertFalse(res["ok"])
         self.assertIn("blocked", res["error"])
+
+
+class SearchDate(unittest.TestCase):
+    """search() passes youtubetab:approximate_date so flat results carry a post date (`posted`)."""
+    def setUp(self):
+        self._path = youfish._ytdlp_path
+        self._run = youfish.subprocess.run
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+
+    def tearDown(self):
+        youfish._ytdlp_path = self._path
+        youfish.subprocess.run = self._run
+
+    def test_passes_approximate_date_and_maps_posted(self):
+        calls = []
+        ts = int(time.time()) - 400 * 24 * 3600           # ~1.1 years ago
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
+                "entries": [{"id": "abc12345678", "title": "T", "channel": "C",
+                             "view_count": 100, "timestamp": ts}]}))
+        youfish.subprocess.run = fake
+        res = youfish.search("query", n=3)
+        self.assertTrue(res["ok"], res)
+        # the extractor-arg that unlocks the date is present ...
+        xargs = calls[0][calls[0].index("--extractor-args") + 1]
+        self.assertIn("approximate_date", xargs)
+        # ... and a flat entry's timestamp is surfaced as a human "posted" string
+        self.assertTrue(res["items"][0]["posted"])
+        self.assertEqual(res["items"][0]["views"], 100)
+
+
+class SearchFilterSp(unittest.TestCase):
+    """_search_filter_sp() reproduces YouTube's own sp protobuf codes."""
+    @staticmethod
+    def _dec(sp):
+        return base64.b64decode(urllib.parse.unquote(sp))
+
+    def test_matches_known_youtube_codes(self):
+        # duration <4min alone → 12 02 18 01 (YouTube's EgIYAQ==)
+        self.assertEqual(self._dec(youfish._search_filter_sp(dur=1)), b"\x12\x02\x18\x01")
+        # sort by view count alone → 08 03 (YouTube's CAM=)
+        self.assertEqual(self._dec(youfish._search_filter_sp(sort=3)), b"\x08\x03")
+        # today + video-only → sub{ uploaded=2, type=1 } → 12 04 08 02 10 01
+        self.assertEqual(self._dec(youfish._search_filter_sp(date=2, video_only=True)),
+                         b"\x12\x04\x08\x02\x10\x01")
+        # sort + date + dur together → top sort then sub{ date, dur }
+        self.assertEqual(self._dec(youfish._search_filter_sp(sort=2, date=4, dur=2)),
+                         b"\x08\x02\x12\x04\x08\x04\x18\x02")
+
+    def test_empty_when_nothing_set(self):
+        self.assertEqual(youfish._search_filter_sp(), "")
+
+
+class SearchFiltersRouting(unittest.TestCase):
+    """search() uses the sp= results URL only when a filter is set, else plain ytsearch."""
+    def setUp(self):
+        self._path = youfish._ytdlp_path
+        self._run = youfish.subprocess.run
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        self.calls = []
+        def fake(cmd, **kw):
+            self.calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({"entries": []}))
+        youfish.subprocess.run = fake
+
+    def tearDown(self):
+        youfish._ytdlp_path = self._path
+        youfish.subprocess.run = self._run
+
+    def _target(self):
+        return self.calls[0][-1]        # after the "--" separator
+
+    def test_unfiltered_uses_ytsearch(self):
+        youfish.search("cats", n=5)
+        self.assertTrue(self._target().startswith("ytsearch"))
+
+    def test_filtered_uses_results_url_with_sp(self):
+        youfish.search("cats", n=5, filters={"sort": 3})
+        self.assertIn("/results?search_query=", self._target())
+        self.assertIn("&sp=", self._target())
+
+
+class Related(unittest.TestCase):
+    """related() pulls the RD mix flat and drops the seed video."""
+    def setUp(self):
+        self._path = youfish._ytdlp_path
+        self._run = youfish.subprocess.run
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        self.calls = []
+
+    def tearDown(self):
+        youfish._ytdlp_path = self._path
+        youfish.subprocess.run = self._run
+
+    def test_builds_rd_url_and_drops_seed(self):
+        def fake(cmd, **kw):
+            self.calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
+                "entries": [
+                    {"id": "SEED0000000", "title": "seed"},           # the seed → dropped
+                    {"id": "aaa11111111", "title": "A", "view_count": 5},
+                    {"id": "bbb22222222", "title": "B"},
+                ]}))
+        youfish.subprocess.run = fake
+        res = youfish.related("SEED0000000", n=10)
+        self.assertTrue(res["ok"], res)
+        ids = [it["id"] for it in res["items"]]
+        self.assertEqual(ids, ["aaa11111111", "bbb22222222"])         # seed dropped, order kept
+        self.assertIn("list=RDSEED0000000", self.calls[0][-1])        # RD mix of the seed video
+
+    def test_error_when_no_id(self):
+        youfish.subprocess.run = lambda *a, **k: types.SimpleNamespace(
+            returncode=0, stdout="{}", stderr="")
+        self.assertFalse(youfish.related("")["ok"])
 
 
 if __name__ == "__main__":

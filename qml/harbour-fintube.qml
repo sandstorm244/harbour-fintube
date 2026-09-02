@@ -56,6 +56,19 @@ ApplicationWindow {
         gplayer.anchors.fill = playerHolder
     }
 
+    // Fully tear down background audio: stop the pipeline and drop the now-playing claim (cover /
+    // MPRIS clear). Used by the lockscreen/cover Stop AND the resume-bar ✕, so dismissing the bar
+    // actually stops the audio instead of leaving it playing headless. Clearing bgAudioActive +
+    // nowPlaying.videoId also makes VideoPage's reattach guard fail, so reopening the video does a
+    // clean fresh resolve rather than adopting a dead pipeline.
+    function stopBackgroundAudio() {
+        gplayer.stop()
+        nowPlaying.active = false
+        nowPlaying.videoId = ""
+        nowPlaying.playing = false
+        app.bgAudioActive = false
+    }
+
     // Re-apply live whenever a setting changes (e.g. from the Equalizer page or the boost slider).
     Connections {
         target: backend
@@ -174,12 +187,7 @@ ApplicationWindow {
     Connections {
         target: app.bgAudioActive ? nowPlaying : null
         onToggleRequested: gplayer.playing ? gplayer.pause() : gplayer.play()
-        onStopRequested: {
-            gplayer.stop()
-            nowPlaying.active = false
-            nowPlaying.videoId = ""
-            app.bgAudioActive = false
-        }
+        onStopRequested: app.stopBackgroundAudio()
     }
     // Keep the cover / lockscreen play-state honest while backgrounded (a page in front does its
     // own sync). If the backgrounded track ends, reflect the stop but leave the cover claimed.
@@ -289,14 +297,27 @@ ApplicationWindow {
             onClicked: pageStack.push(Qt.resolvedUrl("pages/VideoPage.qml"),
                 { videoId: lastVideo.id, title: lastVideo.title || "" })
         }
-        Image {
+        IconButton {
             id: rbIcon
             anchors {
                 left: parent.left; leftMargin: Theme.horizontalPageMargin
                 verticalCenter: parent.verticalCenter
             }
-            source: "image://theme/icon-m-play"
-            width: Theme.iconSizeMedium; height: width
+            // Play/pause the BACKGROUND audio in place: pause a playing one, or resume a paused-but-
+            // still-parked one (leaving a paused video also keeps it, bgAudioActive stays true). When
+            // nothing is live (the bar is a pure quick-resume after a non-kept leave), reopen the
+            // video to start it. Sits above the bar's reopen MouseArea, so only the icon toggles.
+            icon.source: (app.bgAudioActive && app.gplayer.playing)
+                         ? "image://theme/icon-m-pause" : "image://theme/icon-m-play"
+            onClicked: {
+                if (app.bgAudioActive) {
+                    if (app.gplayer.playing) app.gplayer.pause()
+                    else app.gplayer.play()
+                } else if (app.lastVideo && app.lastVideo.id) {
+                    pageStack.push(Qt.resolvedUrl("pages/VideoPage.qml"),
+                        { videoId: app.lastVideo.id, title: app.lastVideo.title || "" })
+                }
+            }
         }
         Column {
             anchors {
@@ -325,7 +346,13 @@ ApplicationWindow {
                 verticalCenter: parent.verticalCenter
             }
             icon.source: "image://theme/icon-m-clear"
-            onClicked: app.lastVideo = null
+            // ✕ = dismiss AND stop: if the video is still playing headless in the background, tear
+            // the pipeline down (not just hide the bar) so the audio actually stops.
+            onClicked: {
+                if (app.bgAudioActive)
+                    app.stopBackgroundAudio()
+                app.lastVideo = null
+            }
         }
     }
 

@@ -21,6 +21,7 @@ import atexit
 import calendar
 import contextlib
 import ctypes
+import base64
 import hashlib
 import html
 import http.server
@@ -1624,6 +1625,48 @@ _SEARCH_SP = {
 }
 
 
+def _pb_varint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7f
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _pb_field(num, val):
+    """One protobuf varint field (wire type 0): tag byte then the varint value."""
+    return bytes([num << 3]) + _pb_varint(val)
+
+
+# YouTube's search `sp` param is a tiny protobuf, base64- then percent-encoded. Field layout is
+# CONFIRMED by decoding YouTube's own codes (channel = EgIQAg== = 12 02 10 02; dur<4min = EgIYAQ==
+# = 12 02 18 01; sort-by-views = CAM= = 08 03):
+#   top field 1  = sort_by   (1 rating, 2 upload-date, 3 view-count; 0/relevance omitted)
+#   sub  field 1 = uploaded  (1 hour, 2 today, 3 week, 4 month, 5 year)
+#   sub  field 2 = type      (1 video, 2 channel, 3 playlist)
+#   sub  field 3 = duration  (1 <4min, 2 >20min, 3 4-20min)
+def _search_filter_sp(sort=0, date=0, dur=0, video_only=False):
+    """Build the `sp=` value (percent-encoded) for a filtered search, or "" when nothing is set.
+    video_only pins type=video so the results page returns clean video rows, not mixed shelves."""
+    top = _pb_field(1, sort) if sort else b""
+    sub = b""
+    if date:
+        sub += _pb_field(1, date)         # fields kept in ascending order, as YouTube emits them
+    if video_only:
+        sub += _pb_field(2, 1)
+    if dur:
+        sub += _pb_field(3, dur)
+    if sub:
+        top += bytes([(2 << 3) | 2]) + _pb_varint(len(sub)) + sub   # field 2, length-delimited
+    if not top:
+        return ""
+    return urllib.parse.quote(base64.b64encode(top).decode("ascii"), safe="")
+
+
 def parse_youtube_url(url):
     """Classify an incoming YouTube link → {kind, id, url}. kind ∈ video|channel|playlist|"".
 
@@ -1655,15 +1698,25 @@ def parse_youtube_url(url):
     return {"kind": "", "id": "", "url": u}
 
 
-def search(query, n=15, kind="video", start=1):
+def search(query, n=15, kind="video", start=1, filters=None):
     """One page of search results. `start` is the 1-based index of the first result wanted, so
     the UI can page in more as it scrolls (mirrors channel_videos). Members-only videos are
-    dropped (they can't be played without the membership); Shorts too when hide_shorts is on."""
+    dropped (they can't be played without the membership); Shorts too when hide_shorts is on.
+
+    `filters` (video kind only) = {"sort","date","dur"} in yt `sp` values; when any is set the
+    query runs through the results page with an `sp=` filter instead of plain ytsearch."""
     path = _ytdlp_path()
     if not path:
         return {"ok": False, "error": "yt-dlp not found"}
     if kind not in ("video", "channel"):
         kind = "video"
+    f = filters or {}
+    try:
+        fsort = int(f.get("sort") or 0)
+        fdate = int(f.get("date") or 0)
+        fdur = int(f.get("dur") or 0)
+    except (TypeError, ValueError):
+        fsort = fdate = fdur = 0
     try:
         start = max(1, int(start))
         n = max(1, int(n))
@@ -1671,13 +1724,25 @@ def search(query, n=15, kind="video", start=1):
         if kind == "channel":
             target = ("https://www.youtube.com/results?search_query=%s&sp=%s"
                       % (urllib.parse.quote(query), _SEARCH_SP["channel"]))
+        elif fsort or fdate or fdur:
+            # A filter is set → run the results page with an sp= filter (video-only). Paging still
+            # works: --playlist-items below slices [start:end] out of the paginated results.
+            sp = _search_filter_sp(fsort, fdate, fdur, video_only=True)
+            target = ("https://www.youtube.com/results?search_query=%s&sp=%s"
+                      % (urllib.parse.quote(query), sp))
         else:
             # ytsearch<end> fetches enough hits to cover the wanted window; --playlist-items
             # then returns just [start:end], so paging deeper is a bigger fetch sliced tighter.
             target = "ytsearch%d:%s" % (end, query)
+        # `approximate_date` makes the Youtube(Tab) extractor emit an approximate `timestamp`
+        # parsed from each result's "N years ago" text (publishedTimeText). Without it that field
+        # is dropped and the row shows views but no post date. It only gates PARSING of data
+        # already in the flat response — no extra request, so it's free. (Namespaced to youtubetab;
+        # a harmless no-op on the channel-results path, which carries no per-item date.)
+        xargs = ["--extractor-args", "youtubetab:approximate_date"]
         with _cookies_args() as cargs:
             proc = subprocess.run(
-                [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
+                [path, *_COMMON_ARGS, *cargs, *xargs, "--flat-playlist",
                  "--playlist-items", "%d:%d" % (start, end),
                  "--dump-single-json", "--", target],
                 capture_output=True, text=True, timeout=90)
@@ -1700,6 +1765,47 @@ def search(query, n=15, kind="video", start=1):
         items = [it for it in items if it.get("id") or it.get("url")]
         return {"ok": True, "items": items, "kind": kind, "has_more": has_more,
                 "filtered_members": filtered_members}
+    except Exception as ex:
+        return {"ok": False, "error": str(ex)}
+
+
+def related(video_id, n=20):
+    """Recommendations for a video via its YouTube autoplay Mix (watch?v=ID&list=RD<ID>), pulled
+    flat. Cheap — the same flat-playlist path search/channels use, no InnerTube. The seed video
+    (item 1 of the mix) is dropped; Shorts are filtered when hide_shorts is on."""
+    path = _ytdlp_path()
+    if not path:
+        return {"ok": False, "error": "yt-dlp not found"}
+    vid = video_id or ""
+    if "://" in vid:                     # accept a full watch URL too → pull its v= id for the RD list
+        try:
+            vid = urllib.parse.parse_qs(urllib.parse.urlparse(vid).query).get("v", [vid])[0]
+        except Exception:
+            pass
+    if not vid:
+        return {"ok": False, "error": "no video id"}
+    try:
+        n = max(1, int(n))
+        url = "https://www.youtube.com/watch?v=%s&list=RD%s" % (
+            urllib.parse.quote(vid), urllib.parse.quote(vid))
+        with _cookies_args() as cargs:
+            proc = subprocess.run(
+                [path, *_COMMON_ARGS, *cargs,
+                 "--extractor-args", "youtubetab:approximate_date",
+                 "--flat-playlist", "--playlist-items", "1:%d" % (n + 1),   # +1: seed is item 1
+                 "--dump-single-json", "--", url],
+                capture_output=True, text=True, timeout=90)
+        if proc.returncode != 0:
+            return {"ok": False, "error": (proc.stderr.strip()[:300] or "no recommendations")}
+        data = json.loads(proc.stdout)
+        entries = [e for e in (data.get("entries") or [])
+                   if e and e.get("id") and e.get("id") != vid]
+        if _hide_shorts():
+            entries = [e for e in entries if not _is_short(e)]
+        items = [it for it in (_video_entry(e) for e in entries) if it.get("id")][:n]
+        return {"ok": True, "items": items}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "recommendations timed out"}
     except Exception as ex:
         return {"ok": False, "error": str(ex)}
 

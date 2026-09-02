@@ -7,6 +7,8 @@ Page {
     id: page
     allowedOrientations: Orientation.All
 
+    property bool hideDock: true   // hide the now-playing dock / resume bar over the Channels list
+
     SilicaListView {
         id: listView
         anchors.fill: parent

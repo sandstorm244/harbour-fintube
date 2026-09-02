@@ -16,11 +16,33 @@ Page {
     property string lastQuery: ""
     property string queryText: ""          // live text of the search field (see suggestTimer)
     property var suggestions: []           // autocomplete terms while typing
+    property bool suggestBlocked: false    // true after a submit → suppress suggestions until next keystroke
     property var seenIds: ({})             // dedup set across paged results (reset per query)
+
+    // Search filters (video kind only) — values are yt `sp` codes; 0 = unset.
+    property int fSort: 0    // 0 relevance · 1 rating · 2 upload date · 3 view count
+    property int fDate: 0    // 0 any · 2 today · 3 week · 4 month · 5 year
+    property int fDur: 0     // 0 any · 1 <4min · 2 >20min · 3 4-20min
+    property bool filtersOpen: false
+    readonly property bool filtersActive: fSort > 0 || fDate > 0 || fDur > 0
+    function filterObj() { return { sort: page.fSort, date: page.fDate, dur: page.fDur } }
+    // Re-run the current query when a filter changes (video kind only; no-op before a first search).
+    function applyFilters() {
+        if (page.searchKind !== "video" || page.lastQuery.length === 0)
+            return
+        page.statusText = ""
+        page.hasMore = false
+        page.nextStart = 1
+        page.loadResults(1)
+    }
 
     function runSearch(q) {
         if (!q || q.length === 0)
             return
+        // Submitting hides autocomplete and keeps it hidden until the user types again — kill any
+        // pending debounce and block a still-in-flight suggest reply from repopulating the list.
+        suggestTimer.stop()
+        page.suggestBlocked = true
         page.suggestions = []
         page.lastQuery = q
         page.statusText = ""
@@ -38,7 +60,7 @@ Page {
         var q = page.lastQuery, kind = page.searchKind
         if (start > 1) page.loadingMore = true
         else page.loading = true
-        app.backend.searchPage(q, kind, start, function(res) {
+        app.backend.searchPage(q, kind, start, (kind === "video" ? page.filterObj() : null), function(res) {
             // Ignore a reply the user has since navigated away from.
             if (q !== page.lastQuery || kind !== page.searchKind)
                 return
@@ -98,10 +120,11 @@ Page {
         id: suggestTimer
         interval: 300
         onTriggered: {
+            if (page.suggestBlocked) return
             var q = page.queryText
             if (q.length === 0) { page.suggestions = []; return }
             app.backend.suggest(q, function(list) {
-                if (page.queryText === q) page.suggestions = list
+                if (page.queryText === q && !page.suggestBlocked) page.suggestions = list
             })
         }
     }
@@ -116,18 +139,76 @@ Page {
 
         PageHeader { title: "Search" }
 
-        SearchField {
-            id: searchField
+        Row {
             width: parent.width
-            placeholderText: page.searchKind === "channel" ? "Search channels" : "Search YouTube"
-            EnterKey.iconSource: "image://theme/icon-m-enter-accept"
-            EnterKey.onClicked: page.runSearch(text)
-            onTextChanged: {
-                page.queryText = text
-                if (text.length === 0) { page.suggestions = []; suggestTimer.stop() }
-                else suggestTimer.restart()
+            SearchField {
+                id: searchField
+                width: parent.width - (filterCog.visible ? filterCog.width : 0)
+                placeholderText: page.searchKind === "channel" ? "Search channels" : "Search YouTube"
+                EnterKey.iconSource: "image://theme/icon-m-enter-accept"
+                EnterKey.onClicked: page.runSearch(text)
+                onTextChanged: {
+                    page.queryText = text
+                    page.suggestBlocked = false   // user is typing again → allow suggestions
+                    if (text.length === 0) { page.suggestions = []; suggestTimer.stop() }
+                    else suggestTimer.restart()
+                }
+                Component.onCompleted: forceActiveFocus()   // raise the keyboard when the page opens
             }
-            Component.onCompleted: forceActiveFocus()   // raise the keyboard when the page opens
+            // Cog → toggle the filter panel (video search only; tinted when a filter is active).
+            IconButton {
+                id: filterCog
+                anchors.verticalCenter: searchField.verticalCenter
+                visible: page.searchKind === "video"
+                icon.source: "image://theme/icon-m-setting"
+                             + (page.filtersActive ? "?" + Theme.highlightColor : "")
+                onClicked: page.filtersOpen = !page.filtersOpen
+            }
+        }
+
+        // Filter panel — toggled by the cog. Each ComboBox re-runs the query on change; the indices
+        // map to the `sp` codes consumed by filterObj() → youfish._search_filter_sp().
+        Column {
+            width: parent.width
+            visible: page.filtersOpen && page.searchKind === "video"
+
+            ComboBox {
+                width: parent.width
+                label: "Sort by"
+                currentIndex: 0
+                menu: ContextMenu {
+                    MenuItem { text: "Relevance" }
+                    MenuItem { text: "Upload date" }
+                    MenuItem { text: "View count" }
+                    MenuItem { text: "Rating" }
+                }
+                onCurrentIndexChanged: { page.fSort = [0, 2, 3, 1][currentIndex]; page.applyFilters() }
+            }
+            ComboBox {
+                width: parent.width
+                label: "Uploaded"
+                currentIndex: 0
+                menu: ContextMenu {
+                    MenuItem { text: "Any time" }
+                    MenuItem { text: "Today" }
+                    MenuItem { text: "This week" }
+                    MenuItem { text: "This month" }
+                    MenuItem { text: "This year" }
+                }
+                onCurrentIndexChanged: { page.fDate = [0, 2, 3, 4, 5][currentIndex]; page.applyFilters() }
+            }
+            ComboBox {
+                width: parent.width
+                label: "Length"
+                currentIndex: 0
+                menu: ContextMenu {
+                    MenuItem { text: "Any" }
+                    MenuItem { text: "Under 4 minutes" }
+                    MenuItem { text: "4 – 20 minutes" }
+                    MenuItem { text: "Over 20 minutes" }
+                }
+                onCurrentIndexChanged: { page.fDur = [0, 1, 3, 2][currentIndex]; page.applyFilters() }
+            }
         }
     }
 
