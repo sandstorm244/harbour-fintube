@@ -82,8 +82,8 @@ Page {
         return t
     }
 
-    // Comments: fetched once on demand (tap to load), then revealed a few at a time as
-    // the info area scrolls.
+    // Comments: fetched once on demand — auto-loaded as the info area scrolls near them (or by
+    // tapping the header) — then revealed a few at a time as the info area scrolls further.
     property var comments: []
     property bool commentsLoading: false
     property bool commentsLoaded: false
@@ -395,8 +395,9 @@ Page {
         page.commentsLoading = true
         page.commentsError = ""
         // ONE fetch now brings the top comments WITH their replies (the old flow walked YouTube
-        // twice — parents, then a full re-walk for replies). Prefetched during playback, so this is
-        // usually an instant cache hit; see Backend.prefetchComments / claimNowPlaying().
+        // twice — parents, then a full re-walk for replies). Triggered on approach (the info panel
+        // scrolled near the comments) so the walk is already in flight before the user reaches the
+        // header; the Backend cache + in-flight dedup make a later tap join it rather than re-walk.
         app.backend.fetchComments(page.videoId, function(res) {
             if (!page) return              // page torn down before the (slow) comment fetch returned
             page.commentsLoading = false
@@ -566,7 +567,10 @@ Page {
         app.nowPlaying.active = true
         nowPlayingConn.target = app.nowPlaying   // listen only after we've claimed
         app.applyAudioFx()                       // route EQ / boost to the (shared) player
-        app.backend.prefetchComments(page.videoId)   // warm comments in the bg so they're instant later
+        // Comments are NOT prefetched at video-start any more: a one-shot watch (start it, never
+        // touch the info panel) would pay a wasted ~8s comment walk it never reads. They now warm
+        // on approach instead — the first time the user scrolls the info panel down toward the
+        // comments section (see infoFlick.onContentYChanged) — so the cost lands only on real intent.
         // NB: the remembered speed is primed on gplayer before play() (in onResolved) and engaged
         // by the C++ player during preroll — nothing rate-related happens here.
     }
@@ -1123,8 +1127,19 @@ Page {
         // user scrolled back up. The wide dead-zone between the two thresholds stops it from
         // thrashing, and trimming only content well below the viewport avoids a visible jump.
         onContentYChanged: {
-            if (!page.commentsLoaded)
+            if (!page.commentsLoaded) {
+                // Load-on-approach: warm comments the first time the user actually scrolls the info
+                // panel down toward them. The comments section is the LAST thing in the column, so
+                // nearing the bottom (belowFold < one screen) = nearing comments. A one-shot watch
+                // that never scrolls here never fires the ~8s walk — the waste that made a
+                // video-start prefetch a bad trade. contentY > 0 gates out the at-open case where a
+                // short panel already shows the header with nothing to scroll (tap it to load);
+                // loadComments() is idempotent, so a repeated trigger while it's in flight is a no-op.
+                if (contentY > 0 && !page.commentsLoading
+                        && contentHeight - (contentY + height) < height)
+                    page.loadComments()
                 return
+            }
             var belowFold = contentHeight - (contentY + height)
             if (page.commentsShown < page.comments.length && belowFold < height * 0.5)
                 page.commentsShown = Math.min(page.commentsShown + 5, page.comments.length)
@@ -1343,7 +1358,8 @@ Page {
                 }
             }
 
-            // ---- Comments: tap the header to load, then they reveal on scroll ----
+            // ---- Comments: auto-load as the info area scrolls near them (or tap the header),
+            //      then reveal a few at a time on further scroll ----
             Column {
                 id: commentsCol
                 width: parent.width

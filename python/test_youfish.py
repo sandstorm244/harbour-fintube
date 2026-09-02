@@ -189,7 +189,7 @@ class ResolveSmoke(unittest.TestCase):
         youfish._ytdlp_path = lambda: "/fake/yt-dlp"
         youfish._ensure_pot_server = lambda: True
         youfish._pot_ytdlp_args = lambda: []
-        youfish._yt_extractor_args = lambda client_override=None: []
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: []
         youfish._proxied = lambda url, *a, **k: url
         youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False}
 

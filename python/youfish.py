@@ -549,10 +549,12 @@ def _ytdlp_formats(video_id):
         return {}
     url = video_id if "://" in video_id else "https://www.youtube.com/watch?v=" + video_id
     _ensure_pot_server()  # a fresh URL is just as PO-gated; keep the token sidecar warm
+    if _DEBUG and _pot_active():   # gate state on the WARM (self-heal) side, to compare with resolve's
+        _tlog("reresolve gate: port=%s http=%r" % (_pot_ready_on_port(), _pot_http_ping(0.5)["ok"]))
     try:
         with _cookies_args() as cargs:
             proc = subprocess.run([path, *_COMMON_ARGS, *cargs, *_pot_ytdlp_args(),
-                                   *_yt_extractor_args(),
+                                   *_yt_extractor_args(want_pot=True),
                                    "--dump-single-json", "--", url],
                                   capture_output=True, text=True, timeout=90)
         if proc.returncode != 0:
@@ -585,6 +587,8 @@ def _reresolve(video_id, itag, failed_url):
         fresh = _ytdlp_formats(video_id)
         if not fresh:
             return None
+        if _DEBUG:   # the WARM re-resolve's token for the exact itag that 403'd — MISSING→len flip = Cause A
+            _tlog("reresolve itag=%s %s" % (itag, _pot_of(fresh.get(itag, ""))))
         _url_cache[video_id] = {"ts": time.time(), "fmts": fresh}
         if len(_url_cache) > _URL_CACHE_MAX:  # evict oldest beyond the cap
             for k, _ in sorted(_url_cache.items(),
@@ -1150,8 +1154,15 @@ def _pot_server_dir():
 
 
 def _pot_plugin_dir():
-    # Passed to yt-dlp via --plugin-dirs; must be the dir that CONTAINS yt_dlp_plugins/.
-    return os.path.join(_pot_repo_dir(), "plugin")
+    # The directory handed to yt-dlp's --plugin-dirs. yt-dlp DISCOVERS plugins by globbing one subdir
+    # level down (<dir>/*/yt_dlp_plugins — the same shape as its auto-scan of
+    # ~/.config/yt-dlp/plugins/<name>/yt_dlp_plugins), NOT <dir>/yt_dlp_plugins directly. The bgutil
+    # repo keeps the plugin at <repo>/plugin/yt_dlp_plugins, so we hand yt-dlp the REPO ROOT (it then
+    # finds <repo>/plugin/yt_dlp_plugins). Pointing straight at plugin/ (whose yt_dlp_plugins is a
+    # DIRECT child) matched the glob nothing → "Plugin directories: none", ZERO providers loaded, and
+    # the app silently ran only on a user's stray ~/.config install if any (measured on-device
+    # 2026-09-02 — our managed plugin had never loaded via --plugin-dirs).
+    return _pot_repo_dir()
 
 
 def _pot_marker():
@@ -1214,9 +1225,14 @@ def _pot_server_flags():
 
 
 def _pot_ytdlp_args():
-    """--plugin-dirs pointing at the bgutil yt-dlp plugin when the provider is active; else
-    []. Keeps yt-dlp behaving exactly as before whenever the provider isn't set up/enabled."""
-    return ["--plugin-dirs", _pot_plugin_dir()] if _pot_active() else []
+    """yt-dlp args to load ONLY the app's own bundled bgutil plugin when the provider is active; else
+    []. `--no-plugin-dirs` FIRST empties yt-dlp's plugin search list — otherwise yt-dlp ALSO scans the
+    default ~/.config/yt-dlp/plugins and ~/.local/share dirs, and a user's stray manual bgutil install
+    there SHADOWS our managed copy (namespace import is first-match-wins, no warning — measured: a
+    stray 1.3.1 silently beat our 1.3.2, and 1.3.1 wouldn't mint the web_embedded token). Then
+    `--plugin-dirs` adds only our repo. Order matters: --no-plugin-dirs MUST come first, or it also
+    wipes our dir. Keeps yt-dlp untouched whenever the provider isn't set up/enabled."""
+    return ["--no-plugin-dirs", "--plugin-dirs", _pot_plugin_dir()] if _pot_active() else []
 
 
 def _pot_bind_localhost():
@@ -1294,6 +1310,17 @@ def _pot_http_ping(timeout=1.5):
         return {"ok": True, "version": ""}   # server answered with an HTTP error → it IS alive
     except Exception:
         return {"ok": False, "version": ""}
+
+
+def _pot_of(u):
+    """DEBUG: the streaming PO-token (`pot=`) state of a googlevideo URL, WITHOUT leaking the token
+    — 'MISSING' when there's no pot= param, else its length + 8-char prefix. Used to tell a cold,
+    tokenless URL (the one that 403s at byte 0) apart from a valid one during instant-403 profiling."""
+    try:
+        p = urllib.parse.parse_qs(urllib.parse.urlparse(u or "").query).get("pot", [""])[0]
+        return ("len=%d pfx=%s" % (len(p), p[:8])) if p else "MISSING"
+    except Exception:
+        return "?"
 
 
 def _pot_server_log_tail(n=30):
@@ -1945,6 +1972,8 @@ def resolve(video_id):
     def _dump(extra):
         """Run yt-dlp --dump-single-json with extra args; return (data, error)."""
         _td = time.time()
+        if _DEBUG and _pot_active():   # was the token server actually ANSWERING when we extracted?
+            _tlog("dump gate: port=%s http=%r" % (_pot_ready_on_port(), _pot_http_ping(0.5)["ok"]))
         with _cookies_args() as cargs:
             proc = subprocess.run(
                 [path, *_COMMON_ARGS, *cargs, *_pot_ytdlp_args(), *extra,
@@ -1967,12 +1996,12 @@ def resolve(video_id):
         return bool(_pick(fs, _MUXED_ITAGS) or _hd_pair(d))
 
     try:
-        data, err = _dump(_yt_extractor_args())
+        data, err = _dump(_yt_extractor_args(want_pot=True))
         # A hard failure (data is None) is usually YouTube's "confirm you're not a bot" check
         # tripping this client — retry once with the wider set. tv/android_vr use different
         # attestation and often pass where web/web_embedded get bot-checked.
         if data is None:
-            data2, err2 = _dump(_yt_extractor_args(client_override=_RETRY_CLIENTS))
+            data2, err2 = _dump(_yt_extractor_args(client_override=_RETRY_CLIENTS, want_pot=True))
             if data2 is not None:
                 data = data2
             else:
@@ -1982,7 +2011,7 @@ def resolve(video_id):
         # hunt for a fetchable HD pair elsewhere — only switch if the result is actually
         # better (HD found, or the primary had nothing playable at all).
         elif not _hd_pair(data):
-            data2, _ = _dump(_yt_extractor_args(client_override=_RETRY_CLIENTS))
+            data2, _ = _dump(_yt_extractor_args(client_override=_RETRY_CLIENTS, want_pot=True))
             if data2 is not None and _hd_pair(data2):
                 data = data2
             elif data2 is not None and not _playable(data) and _playable(data2):
@@ -2007,6 +2036,13 @@ def resolve(video_id):
         # from one client, so a single UA covers them.
         http_ua = ((video or audio or muxed or {}).get("http_headers") or {}).get(
             "User-Agent", "") or _BROWSER_UA
+        if _DEBUG:   # instant-403 probe: does the COLD dump's URL carry a valid streaming pot= token?
+            _tlog("resolve picks: v=%s %s | a=%s %s | m=%s %s"
+                  % ((video or {}).get("format_id"), _pot_of((video or {}).get("url", "")),
+                     (audio or {}).get("format_id"), _pot_of((audio or {}).get("url", "")),
+                     (muxed or {}).get("format_id"), _pot_of((muxed or {}).get("url", ""))))
+            if _pot_active():   # a first-mint crash/OOM shows here as an exit-code line between dumps
+                _tlog("pot log: " + ((_pot_server_log_tail(6) or "(none)").replace("\n", " | ")))
         # HLS (m3u8) plays fine directly, and proxying the manifest breaks segment
         # resolution; only progressive URLs (itag 18) need the UA-injecting proxy.
         muxed_url = ""
@@ -2537,16 +2573,25 @@ def _default_client():
     return "web_embedded" if _pot_active() else ""
 
 
-def _yt_extractor_args(client_override=None):
+def _yt_extractor_args(client_override=None, want_pot=False):
     """`--extractor-args` for yt-dlp built from settings (or []).
 
     player_client picks a YouTube client. client_override lets resolve() widen the client set
-    on a retry without touching the saved preference.
+    on a retry without touching the saved preference. want_pot forces a PO-token mint (see below).
     """
     parts = []
     client = client_override if client_override is not None else _default_client()
     if client and client.lower() != "auto":
         parts.append("player_client=" + client)
+    # fetch_pot=always forces yt-dlp to actually mint a PO token even for clients it marks GVS-token
+    # OPTIONAL. web_embedded (our default) has NO GVS-token policy → yt-dlp treats it as required=False
+    # → under the default fetch_pot=auto it EARLY-RETURNS without ever contacting the provider, so no
+    # token is minted and the stream URLs 403 under YouTube's "bind GVS PO Token to video id for
+    # web_embedded" experiment (yt-dlp PR #14471). fetch_pot=always defeats that gate. Only on the
+    # paths that build/stream formats (resolve, re-resolve, download) and only when the provider is
+    # active — NOT the --flat-playlist metadata passes, where a mint is pure wasted BotGuard latency.
+    if want_pot and _pot_active():
+        parts.append("fetch_pot=always")
     return ["--extractor-args", "youtube:" + ";".join(parts)] if parts else []
 
 
@@ -4189,7 +4234,7 @@ def download(video_id, title, kind):
             _ensure_pot_server()  # a download is just as PO-gated as playback
             proc = subprocess.Popen(
                 [binp, *_COMMON_ARGS, *(["--cookies", ck] if ck else []),
-                 *_yt_extractor_args(), *_pot_ytdlp_args(), *_ffmpeg_args(),
+                 *_yt_extractor_args(want_pot=True), *_pot_ytdlp_args(), *_ffmpeg_args(),
                  "--no-playlist", "-f", fmt, *merge, "--no-part", "--newline",
                  "-o", base + ".%(ext)s", "--", url],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
