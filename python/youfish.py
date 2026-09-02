@@ -287,6 +287,51 @@ def _tlog(msg):
             pass
 
 
+def _timed_fn(label):
+    """Decorator that logs a query function's total wall time (label + seconds) under YOUFISH_DEBUG.
+    When debug is OFF it returns the function UNWRAPPED — literally zero overhead in normal use. Used
+    to profile every user-facing yt-dlp/network query on-device (grep the log for `[youfish/t] q.`).
+    Internal calls resolve to the wrapped module global too, so nested paths (feed workers) are timed.
+    """
+    def deco(fn):
+        if not _DEBUG:
+            return fn
+
+        def wrapper(*a, **kw):
+            _t0 = time.time()
+            try:
+                return fn(*a, **kw)
+            finally:
+                _tlog("%s %.2fs" % (label, time.time() - _t0))
+        wrapper.__name__ = getattr(fn, "__name__", "fn")
+        return wrapper
+    return deco
+
+
+def _spawn_tax_probe():
+    """Measure the pure yt-dlp cold-start spawn tax: `yt-dlp --version` does ~no real work, so its
+    wall time is almost entirely process launch (unpack the frozen binary + boot CPython + import the
+    yt_dlp tree). Logged once per launch under YOUFISH_DEBUG so the log shows how much of EVERY query
+    is just the spawn — the #1 number for deciding whether in-process / a daemon is worth it."""
+    if not _DEBUG:
+        return
+    path = _ytdlp_path()
+    if not path:
+        _tlog("spawn_tax: yt-dlp not found")
+        return
+    best = None
+    for _ in range(3):                       # min of a few runs → the warm-FS best case, the fair floor
+        _t0 = time.time()
+        try:
+            subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+        except Exception as ex:
+            _tlog("spawn_tax: probe failed (%s)" % ex)
+            return
+        dt = time.time() - _t0
+        best = dt if best is None else min(best, dt)
+    _tlog("spawn_tax %.2fs  (min of 3x `yt-dlp --version`; ~pure process launch)" % best)
+
+
 def _clen(url):
     """Total content length of a googlevideo stream, read straight from its URL.
 
@@ -496,6 +541,7 @@ _RERESOLVE_WINDOW = 60.0
 _RERESOLVE_BURST = 8
 
 
+@_timed_fn("q.formats")
 def _ytdlp_formats(video_id):
     """Run yt-dlp and return {itag: direct_url} for every format that has a URL."""
     path = _ytdlp_path()
@@ -1350,6 +1396,8 @@ def prewarm():
     the ~2s Deno startup on its critical path. No-op unless the provider is installed + enabled.
     Runs on its OWN daemon thread so the PyOtherSide worker (and the UI behind it) never blocks on
     the port wait — fire-and-forget from QML at startup."""
+    if _DEBUG:          # profiling: log the isolated yt-dlp spawn tax once per launch, off-thread
+        threading.Thread(target=_spawn_tax_probe, daemon=True).start()
     _pot_rotate_log()   # fresh server.log per launch (keeps the previous one as server.log.prev)
     if not _pot_active():
         return
@@ -1698,6 +1746,7 @@ def parse_youtube_url(url):
     return {"kind": "", "id": "", "url": u}
 
 
+@_timed_fn("q.search")
 def search(query, n=15, kind="video", start=1, filters=None):
     """One page of search results. `start` is the 1-based index of the first result wanted, so
     the UI can page in more as it scrolls (mirrors channel_videos). Members-only videos are
@@ -1769,6 +1818,7 @@ def search(query, n=15, kind="video", start=1, filters=None):
         return {"ok": False, "error": str(ex)}
 
 
+@_timed_fn("q.related")
 def related(video_id, n=20):
     """Recommendations for a video via its YouTube autoplay Mix (watch?v=ID&list=RD<ID>), pulled
     flat. Cheap — the same flat-playlist path search/channels use, no InnerTube. The seed video
@@ -2069,6 +2119,7 @@ def resolve(video_id):
         return {"ok": False, "error": str(ex)}
 
 
+@_timed_fn("q.video_info")
 def video_info(video_id):
     """Lightweight metadata for the info-only view (title, channel, description, chapters, stats)
     — no playback. Deliberately skips the PO-token sidecar and resolve()'s HD-pair client retries,
@@ -3459,6 +3510,7 @@ def channel_avatar(channel):
         return {"ok": False}
 
 
+@_timed_fn("q.channel_videos")
 def channel_videos(channel, start=1, n=30):
     """A page of a channel's uploads (a channel_id or any channel URL). `start` is the
     1-based index of the first video wanted, so the UI can page in more as it scrolls."""
@@ -3522,9 +3574,17 @@ def _feed_fetch_channel(path, cid, per_channel):
     RSS and the tab endpoint intermittently — mirrors how NewPipe/FreeTube cross-fall-back). Any
     total failure of both contributes nothing."""
     rows = _feed_from_ytdlp(path, cid, per_channel)
-    return rows if rows else _feed_from_rss(cid, per_channel)
+    if rows:
+        if _DEBUG:      # profiling A/B: also time the (discarded) RSS path for the SAME channel, so the
+            try:        # log shows feed.ytdlp vs feed.rss side by side — the key RSS-first data point.
+                _feed_from_rss(cid, per_channel)
+            except Exception:
+                pass
+        return rows
+    return _feed_from_rss(cid, per_channel)
 
 
+@_timed_fn("feed.ytdlp")
 def _feed_from_ytdlp(path, cid, per_channel):
     """PRIMARY: a channel's /videos tab via yt-dlp (flat). Duration/live/approximate-date inline;
     the tab excludes Shorts itself, so no separate durations or Shorts pass is needed."""
@@ -3570,6 +3630,7 @@ def _feed_from_ytdlp(path, cid, per_channel):
     return rows
 
 
+@_timed_fn("feed.rss")
 def _feed_from_rss(cid, per_channel):
     """FALLBACK: a channel's RSS feed (feeds/videos.xml). Fast + exact dates but — the fast-mode
     tradeoff NewPipe/FreeTube also live with — NO duration or live status (both come back 0). Same
@@ -3684,6 +3745,7 @@ def _feed_hydrate():
         _feed_state["loaded"] = True
 
 
+@_timed_fn("feed.TOTAL")
 def subscription_feed(limit=100, force=False, refresh_all=False):
     """Subscribed channels' recent uploads, newest first — built per channel from yt-dlp /videos
     (+ RSS fallback, see _feed_fetch_channel), cached PER CHANNEL to disk and served
@@ -3910,6 +3972,7 @@ _REPLIES_PER_THREAD = 12   # cap replies fetched from any one comment thread
 _REPLY_BUDGET = 150        # global reply cap across all threads for one comments() call
 
 
+@_timed_fn("q.comments")
 def comments(video_id, limit=50, with_replies=True):
     """Fetch up to `limit` top-level comments (top-sorted) for a video, each carrying a bounded
     set of its replies under `replies` (+ `reply_count`).
@@ -4281,6 +4344,7 @@ def remove_from_playlist(pl_id, video_id):
     return get_playlist(pl_id)
 
 
+@_timed_fn("q.playlist")
 def youtube_playlist(ref, limit=200):
     """Fetch a YouTube playlist's videos (flat). ref = a list id or any playlist URL."""
     path = _ytdlp_path()
