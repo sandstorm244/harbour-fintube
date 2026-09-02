@@ -35,6 +35,8 @@ Page {
         page.loading = true
         page.errorText = ""
         app.backend.relatedVideos(page.videoId, function(res) {
+            if (!page)          // left before the mix landed → the page (and relModel) are gone
+                return
             page.loading = false
             relModel.clear()
             if (!res || !res.ok) {

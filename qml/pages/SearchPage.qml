@@ -61,8 +61,9 @@ Page {
         if (start > 1) page.loadingMore = true
         else page.loading = true
         app.backend.searchPage(q, kind, start, (kind === "video" ? page.filterObj() : null), function(res) {
-            // Ignore a reply the user has since navigated away from.
-            if (q !== page.lastQuery || kind !== page.searchKind)
+            // Ignore a reply for a page that's since been destroyed (navigated away before it
+            // landed → `page` is null), or for a query/kind the user has since changed.
+            if (!page || q !== page.lastQuery || kind !== page.searchKind)
                 return
             page.loading = false
             page.loadingMore = false
@@ -124,7 +125,7 @@ Page {
             var q = page.queryText
             if (q.length === 0) { page.suggestions = []; return }
             app.backend.suggest(q, function(list) {
-                if (page.queryText === q && !page.suggestBlocked) page.suggestions = list
+                if (page && page.queryText === q && !page.suggestBlocked) page.suggestions = list
             })
         }
     }
@@ -143,7 +144,10 @@ Page {
             width: parent.width
             SearchField {
                 id: searchField
-                width: parent.width - (filterCog.visible ? filterCog.width : 0)
+                // Trim an extra page margin so the cog sits inset from the right edge, matching the
+                // magnifying glass's gap on the left (the cog is the Row's last item → the freed
+                // width becomes a right-edge gap).
+                width: parent.width - (filterCog.visible ? filterCog.width + Theme.horizontalPageMargin : 0)
                 placeholderText: page.searchKind === "channel" ? "Search channels" : "Search YouTube"
                 EnterKey.iconSource: "image://theme/icon-m-enter-accept"
                 EnterKey.onClicked: page.runSearch(text)
