@@ -409,22 +409,37 @@ Item {
         })
     }
 
-    // On-demand comment fetch (slow — walks YouTube continuations). Result to the caller's
-    // callback so it lands on the video page that asked. One capped batch; the UI paginates.
-    // Fast first paint: top-level comments only (no replies → no extra continuation walk). The
-    // video page then tops up replies in the background (fetchCommentReplies) and merges them in,
-    // so comments appear without waiting on the reply walk.
-    function fetchComments(videoId, limit, callback) {
-        py.call("youfish.comments", [videoId, limit || 50, false], function(res) {
-            callback(res || {})
+    // Comments (slow — walks YouTube continuations). ONE call now fetches the top comments WITH their
+    // replies (the old parents-then-reply-top-up walked YouTube TWICE). Prefetched during playback and
+    // cached by id; a page load that arrives while the prefetch is still in flight JOINS it rather than
+    // firing a duplicate ~15s walk (the fetch is slow enough that the race is the norm, not the edge).
+    property var _commentsCache: ({})     // videoId -> result (completed)
+    property var _commentsPending: ({})   // videoId -> [callbacks] awaiting an in-flight fetch
+
+    // Shared fetch: prefetch (callback null → just warms) and the page both funnel through here, so
+    // there is never more than ONE walk per video in flight. Cheap cache bound for long sessions.
+    function _commentsFetch(videoId, callback) {
+        if (!videoId) { if (callback) callback({}); return }
+        if (_commentsCache[videoId]) { if (callback) callback(_commentsCache[videoId]); return }
+        if (_commentsPending[videoId]) {                       // already fetching → attach + wait
+            if (callback) _commentsPending[videoId].push(callback)
+            return
+        }
+        _commentsPending[videoId] = callback ? [callback] : []
+        py.call("youfish.comments", [videoId, 20, true], function(res) {
+            var cbs = _commentsPending[videoId] || []
+            delete _commentsPending[videoId]
+            if (res && res.ok) {
+                if (Object.keys(_commentsCache).length > 12) _commentsCache = ({})
+                _commentsCache[videoId] = res
+            }
+            for (var i = 0; i < cbs.length; i++) cbs[i](res || {})
         })
     }
-    // Background reply top-up: the same top comments, now carrying their nested replies, to merge.
-    function fetchCommentReplies(videoId, limit, callback) {
-        py.call("youfish.comments", [videoId, limit || 50, true], function(res) {
-            callback(res || {})
-        })
-    }
+    // Fire-and-forget prefetch while a video plays (no callback → just warms the cache).
+    function prefetchComments(videoId) { _commentsFetch(videoId, null) }
+    // Comments for the page: instant on a cache hit, joins an in-flight prefetch, else fetches once.
+    function fetchComments(videoId, callback) { _commentsFetch(videoId, callback) }
 
     // --- Downloads (background, progress via pyotherside events) ---
     function download(videoId, title, kind) {

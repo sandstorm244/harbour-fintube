@@ -91,8 +91,6 @@ Page {
     property int commentsShown: 5     // client-side page size; grows on scroll
     property int commentsTotal: 0     // YouTube's real total (for the header)
     property var repliesExpanded: ({}) // comment id → its reply thread revealed?
-    property bool repliesLoading: false // background reply top-up in flight
-    property bool repliesLoaded: false  // replies merged in (or the top-up failed — fire once)
 
     // Re-evaluates whenever the saved-channel list changes, so the button stays in sync.
     property bool subscribed: {
@@ -396,55 +394,19 @@ Page {
             return
         page.commentsLoading = true
         page.commentsError = ""
-        app.backend.fetchComments(page.videoId, 50, function(res) {
+        // ONE fetch now brings the top comments WITH their replies (the old flow walked YouTube
+        // twice — parents, then a full re-walk for replies). Prefetched during playback, so this is
+        // usually an instant cache hit; see Backend.prefetchComments / claimNowPlaying().
+        app.backend.fetchComments(page.videoId, function(res) {
             if (!page) return              // page torn down before the (slow) comment fetch returned
             page.commentsLoading = false
             if (res && res.ok) {
-                page.comments = res.comments || []
+                page.comments = res.comments || []   // replies already attached (single fetch)
                 page.commentsTotal = res.total || (res.comments ? res.comments.length : 0)
                 page.commentsLoaded = true
-                page.loadReplies()         // top up reply threads in the background
             } else {
                 page.commentsError = (res && res.error) ? res.error : "couldn't load comments"
             }
-        })
-    }
-
-    // Background reply top-up: fetch the same top comments WITH their replies and merge them into
-    // the already-shown list by id, so the "View N replies" expanders appear a moment after the
-    // (fast, parents-only) comments do — without ever blocking the initial paint. Fires once.
-    function loadReplies() {
-        if (page.repliesLoading || page.repliesLoaded || page.comments.length === 0)
-            return
-        page.repliesLoading = true
-        app.backend.fetchCommentReplies(page.videoId, 50, function(res) {
-            if (!page) return
-            page.repliesLoading = false
-            page.repliesLoaded = true      // one shot: a failed/empty top-up just leaves replies off
-            if (!res || !res.ok || !res.comments || res.comments.length === 0)
-                return
-            var byId = {}
-            for (var i = 0; i < res.comments.length; i++) {
-                var rc = res.comments[i]
-                if (rc && rc.id) byId[rc.id] = rc
-            }
-            // Rebuild the list (same order/count) attaching replies where the top-up has them, so
-            // the reassignment re-evaluates the delegate bindings and the expanders light up.
-            var merged = []
-            for (var j = 0; j < page.comments.length; j++) {
-                var c = page.comments[j]
-                var withR = c && c.id ? byId[c.id] : null
-                if (withR && withR.replies && withR.replies.length > 0) {
-                    var nc = {}
-                    for (var k in c) nc[k] = c[k]
-                    nc.replies = withR.replies
-                    nc.reply_count = withR.reply_count
-                    merged.push(nc)
-                } else {
-                    merged.push(c)
-                }
-            }
-            page.comments = merged
         })
     }
 
@@ -604,6 +566,7 @@ Page {
         app.nowPlaying.active = true
         nowPlayingConn.target = app.nowPlaying   // listen only after we've claimed
         app.applyAudioFx()                       // route EQ / boost to the (shared) player
+        app.backend.prefetchComments(page.videoId)   // warm comments in the bg so they're instant later
         // NB: the remembered speed is primed on gplayer before play() (in onResolved) and engaged
         // by the C++ player during preroll — nothing rate-related happens here.
     }

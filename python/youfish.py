@@ -3973,7 +3973,7 @@ _REPLY_BUDGET = 150        # global reply cap across all threads for one comment
 
 
 @_timed_fn("q.comments")
-def comments(video_id, limit=50, with_replies=True):
+def comments(video_id, limit=20, with_replies=True):
     """Fetch up to `limit` top-level comments (top-sorted) for a video, each carrying a bounded
     set of its replies under `replies` (+ `reply_count`).
 
@@ -3999,6 +3999,10 @@ def comments(video_id, limit=50, with_replies=True):
                  % (n + _REPLY_BUDGET, n, _REPLY_BUDGET, _REPLIES_PER_THREAD))
     else:
         xargs = "youtube:max_comments=%d,%d,0,0;comment_sort=top" % (n, n)
+    # NB: comments MUST use yt-dlp's default (web) client — unlike video_info. player_client=android
+    # was MEASURED on-device to return NO comments (the mobile player response carries no comment
+    # continuation), so forcing it just burns a whole extraction before falling back to web. Don't
+    # reintroduce it; the web client's continuation walk is the only path that yields comments.
     try:
         with _cookies_args() as cargs:
             proc = subprocess.run(

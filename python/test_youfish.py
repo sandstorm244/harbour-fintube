@@ -1414,6 +1414,7 @@ class CommentsThreads(unittest.TestCase):
                          youfish._REPLIES_PER_THREAD), on)
         youfish.comments("vid", limit=50, with_replies=False)
         self.assertIn("max_comments=50,50,0,0", self._xargs())
+        self.assertNotIn("player_client=android", self._xargs())   # comments need the web client
 
     def test_error_return(self):
         def fail(cmd, **kw):
