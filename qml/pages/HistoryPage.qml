@@ -8,16 +8,42 @@ Page {
     allowedOrientations: Orientation.All
 
     property bool loading: true
+    property bool loadingMore: false
+    property bool hasMore: true
+    property int nextStart: 1
+    readonly property int pageSize: 40      // must match the n passed by Backend.watchHistory
 
     ListModel { id: histModel }
 
+    // Load the first page (newest). A large history is slow to append to a ListModel in one chunk,
+    // so the rest pages in as the list is scrolled (loadMore) instead of blocking on the whole lot.
     function reload() {
         page.loading = true
-        app.backend.watchHistory(function(list) {
+        page.hasMore = true
+        page.nextStart = 1
+        app.backend.watchHistory(1, function(list) {
+            if (!page) return   // the page was popped before this async callback returned
             histModel.clear()
             for (var i = 0; i < list.length; i++)
                 histModel.append(list[i])
             page.loading = false
+            page.hasMore = list.length >= page.pageSize
+            page.nextStart = 1 + page.pageSize
+        })
+    }
+
+    // Append the next page when the list is scrolled near the end.
+    function loadMore() {
+        if (page.loadingMore || page.loading || !page.hasMore)
+            return
+        page.loadingMore = true
+        app.backend.watchHistory(page.nextStart, function(list) {
+            if (!page) return   // the page was popped before this async callback returned
+            page.loadingMore = false
+            for (var i = 0; i < list.length; i++)
+                histModel.append(list[i])
+            page.hasMore = list.length >= page.pageSize
+            page.nextStart += page.pageSize
         })
     }
     Component.onCompleted: reload()
@@ -26,6 +52,24 @@ Page {
         id: listView
         anchors.fill: parent
         model: histModel
+
+        // Page in more history when scrolled to the end.
+        onAtYEndChanged: {
+            if (atYEnd && page.hasMore && !page.loadingMore && !page.loading
+                    && histModel.count > 0)
+                page.loadMore()
+        }
+
+        footer: Item {
+            width: listView.width
+            height: (page.loadingMore || page.hasMore) ? Theme.itemSizeLarge : 0
+            BusyIndicator {
+                anchors.centerIn: parent
+                size: BusyIndicatorSize.Medium
+                running: page.loadingMore
+                visible: running
+            }
+        }
 
         header: PageHeader { title: "History" }
 

@@ -285,8 +285,8 @@ Item {
         py.call("youfish.watch_state", [], function(m) { backend.watchMap = m || ({}) })
     }
     // Recently-watched videos (newest first) for the History page.
-    function watchHistory(callback) {
-        py.call("youfish.watch_history", [200], function(list) { callback(list || []) })
+    function watchHistory(start, callback) {
+        py.call("youfish.watch_history", [start || 1, 40], function(list) { callback(list || []) })
     }
     function clearWatchHistory(callback) {
         py.call("youfish.clear_watch_history", [], function(res) {

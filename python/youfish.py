@@ -3493,16 +3493,23 @@ def watch_state():
     return _load_watch_history()
 
 
-def watch_history(limit=200):
-    """Recently-watched videos, newest first, for the History page: [{id,title,channel,thumbnail,
-    pos,dur,frac,watched,ts}]. Thumbnail is derived from the id. Ordered by the store's insertion
-    order (record_watch reinserts each play at the end) rather than the 1s-granular ts, so replays
-    within the same second still sort most-recent-first."""
+def watch_history(start=1, n=40):
+    """One page of recently-watched videos, newest first, for the History page: [{id,title,channel,
+    thumbnail,pos,dur,frac,watched,ts}]. `start` is the 1-based index of the first row wanted, so the
+    UI pages the rest in as it scrolls (a large history is slow to append to a ListModel all at once).
+    Thumbnail is derived from the id. Ordered by the store's insertion order (record_watch reinserts
+    each play at the end) rather than the 1s-granular ts, so replays within the same second still
+    sort most-recent-first."""
     d = _load_watch_history()
     rows = list(d.items())
     rows.reverse()                 # insertion order is oldest→newest, so reverse = newest first
+    try:
+        start = max(1, int(start))
+        n = max(1, int(n))
+    except (TypeError, ValueError):
+        start, n = 1, 40
     out = []
-    for vid, e in rows[:max(1, int(limit))]:
+    for vid, e in rows[start - 1:start - 1 + n]:
         if not isinstance(e, dict):
             continue
         out.append({
