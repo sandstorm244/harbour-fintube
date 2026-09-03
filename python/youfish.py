@@ -521,12 +521,18 @@ def _reader(s, gen):
             nproc = 0                                        # bytes THIS proc has produced (D10)
             while True:
                 with s.cond:                                # read-ahead cap == backpressure
-                    s.cond.wait_for(lambda: s.state == "DEAD"
-                                    or gen != s.gen
-                                    or s.edge - s.cursor < _READAHEAD,
-                                    timeout=2.0)             # D1: a missed anchor self-heals
+                    got = s.cond.wait_for(lambda: s.state == "DEAD"
+                                          or gen != s.gen
+                                          or s.edge - s.cursor < _READAHEAD,
+                                          timeout=2.0)       # wake on DEAD/gen change or an open gate
                     if s.state == "DEAD" or gen != s.gen:
                         return
+                    if not got:              # 2s timeout with the gate STILL closed: we're already
+                        continue             # >= _READAHEAD past the play cursor (a paused / slow
+                                             # reader). Loop and keep waiting — do NOT read another
+                                             # chunk past the cap. Without this the cap was advisory:
+                                             # a paused video kept pulling ~1 chunk/2s until the whole
+                                             # file was on disk. The timeout now only re-checks DEAD/gen. (M2)
                 buf = proc.stdout.read(_SESS_CHUNK)          # blocks on the network; never spins
                 if not buf:
                     break
@@ -1540,9 +1546,11 @@ def _expected_ffmpeg_md5(ctx):
     return parts[0].strip().lower() if parts else None
 
 
-def install_ffmpeg():
-    """Download the static ffmpeg archive, verify its MD5, and unpack ffmpeg+ffprobe into our
-    bin/ (beside yt-dlp). HTTPS-only. Background thread; progress/result to QML via events."""
+def install_ffmpeg(allow_unpinned=False):
+    """Download the static ffmpeg archive and unpack ffmpeg+ffprobe into our bin/ (beside yt-dlp).
+    HTTPS-only. When a known-good SHA-256 is pinned, the extracted binary MUST match it or the
+    install is REFUSED (staged, never promoted over a working install) — `allow_unpinned=True`
+    accepts an unverified newer build after the user confirms. Background thread; events to QML."""
     import pyotherside
     import tarfile
 
@@ -1580,14 +1588,10 @@ def install_ffmpeg():
                 pyotherside.send("ffmpeg_install_done", False,
                                  "Checksum mismatch — download discarded, nothing installed", "")
                 return
-            if not _FFMPEG_SHA256 and expected and h.hexdigest().lower() != expected:
-                os.remove(tmp)
-                pyotherside.send("ffmpeg_install_done", False,
-                                 "Checksum mismatch — download discarded, nothing installed", "")
-                return
-            # Unpack just the two binaries, flattened into bin/. Write only the basename to our
-            # own directory, so a malicious path in the archive can't escape it.
-            got = []
+            # Unpack the two binaries to STAGING names first (basename only, so a malicious archive
+            # path can't escape our dir), so the pinned SHA-256 is verified BEFORE anything is promoted
+            # over an existing working install. (M12)
+            got = {}
             with tarfile.open(tmp, "r:xz") as tf:
                 for m in tf.getmembers():
                     base = os.path.basename(m.name)
@@ -1595,34 +1599,52 @@ def install_ffmpeg():
                         src = tf.extractfile(m)
                         if src is None:
                             continue
-                        outp = os.path.join(dest_dir, base)
-                        with open(outp, "wb") as out:
+                        stage = os.path.join(dest_dir, base + ".new")
+                        with open(stage, "wb") as out:
                             shutil.copyfileobj(src, out)
-                        os.chmod(outp, 0o755)
-                        got.append(base)
+                        os.chmod(stage, 0o755)
+                        got[base] = stage
             os.remove(tmp)
             tmp = None
+
+            def _discard_staged():
+                for p in got.values():
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+
             if "ffmpeg" not in got:
+                _discard_staged()
                 pyotherside.send("ffmpeg_install_done", False,
                                  "Archive didn't contain an ffmpeg binary", "")
                 return
-            # Integrity: the archive was HTTPS + companion-MD5 verified above (transfer integrity).
-            # The pinned SHA-256 of the extracted binary is a KNOWN-GOOD marker, not a gate: when it
-            # matches we say so; when it doesn't, this is simply a newer JVS build (the release URL
-            # always points at the latest, and we can't pin a hash we've never seen), so we still
-            # install it. That's what keeps "download the latest ffmpeg" working without a rebuild.
+            # Integrity GATE (not just a marker): when a known-good SHA-256 is pinned, the extracted
+            # ffmpeg MUST match it. A mismatch is either a newer upstream build (the release URL always
+            # points at the latest, which we can't have pinned) OR a tampered binary from the single
+            # host we trust on TLS alone — we can't tell which, so we do NOT install it silently. The
+            # user can retry with allow_unpinned to accept an unverified newer build. (M12)
             pinned_ok = False
             if _FFMPEG_SHA256:
-                ffbin = os.path.join(dest_dir, "ffmpeg")
-                got_sha = _sha256_file(ffbin) if os.path.exists(ffbin) else ""
+                got_sha = _sha256_file(got["ffmpeg"])
                 pinned_ok = (got_sha == _FFMPEG_SHA256.strip().lower())
+                if not pinned_ok and not allow_unpinned:
+                    _discard_staged()
+                    pyotherside.send("ffmpeg_install_done", False,
+                                     "This ffmpeg build doesn't match the known-good pinned build — it "
+                                     "may be a newer release or tampered, so it was NOT installed. Use "
+                                     "“Install unverified build” to accept it anyway.", "", True)
+                    return
+            # Accepted (pin matched, no pin set, or the user overrode) — promote the staged binaries.
+            for base, stage in got.items():
+                os.replace(stage, os.path.join(dest_dir, base))
             ver = ffmpeg_version()  # exercises the binary — confirms it actually runs
             if ver:
                 note = "Installed ffmpeg " + ver
                 if pinned_ok:
                     note += " (SHA-256 verified — pinned build)"
                 elif _FFMPEG_SHA256:
-                    note += " (newer build — transfer verified, not pinned)"
+                    note += " (unverified build — accepted by you)"
                 elif not expected:
                     note += " (checksum unavailable, not verified)"
                 pyotherside.send("ffmpeg_install_done", True, note, ver)
@@ -1641,10 +1663,11 @@ def install_ffmpeg():
     return {"ok": True}
 
 
-def update_ffmpeg():
+def update_ffmpeg(allow_unpinned=False):
     """Fetch + install the latest static ffmpeg (the release URL always points at the current
-    build; this overwrites the existing binary). Same flow + events as install_ffmpeg()."""
-    return install_ffmpeg()
+    build). Same flow + events as install_ffmpeg(); `allow_unpinned` accepts an unverified newer
+    build the pinned SHA-256 can't vouch for (the user confirms via the Providers UI)."""
+    return install_ffmpeg(allow_unpinned)
 
 
 # --------------------------------------------------------------------------- #
@@ -2304,9 +2327,10 @@ def _pot_latest_tag():
         return ""
 
 
-def install_pot_provider(tag=None):
+def install_pot_provider(tag=None, persist_tag=False):
     """Clone + set up the bgutil PO-token provider (opt-in). Background thread; progress and
-    the final result go to QML via pyotherside, mirroring install_ytdlp().
+    the final result go to QML via pyotherside, mirroring install_ytdlp(). `persist_tag` records
+    the tag as the chosen `pot_tag` ONLY once the install succeeds (set by update_pot_provider).
 
     Deps are installed WITHOUT --allow-scripts, so npm lifecycle scripts never run during
     setup (node-canvas's native binary is skipped — jsdom degrades gracefully without it,
@@ -2330,20 +2354,24 @@ def install_pot_provider(tag=None):
                 return
             os.makedirs(_pot_dir(), exist_ok=True)
             repo = _pot_repo_dir()
-            if os.path.isdir(repo):
-                shutil.rmtree(repo, ignore_errors=True)   # clean (re)install
+            # Build into a STAGING dir and swap it in only once everything succeeds, so a failure
+            # partway through (network drop, bad tag, dep-install error) leaves any EXISTING working
+            # install untouched instead of destroying it up-front. (M3)
+            staging = repo + ".new"
+            shutil.rmtree(staging, ignore_errors=True)    # clear a stale temp from a prior failed run
             pyotherside.send("pot_install_progress", "Cloning provider (" + the_tag + ")…")
             cp = subprocess.run(
                 [git, "clone", "--depth", "1", "--branch", the_tag, "--single-branch",
-                 _POT_REPO, repo],
+                 _POT_REPO, staging],
                 capture_output=True, text=True, timeout=240)
             if cp.returncode != 0:
+                shutil.rmtree(staging, ignore_errors=True)
                 _pot_last_error = "Clone failed: " + (cp.stderr.strip()[-200:] or "git error")
                 pyotherside.send("pot_install_done", False,
                                  "Clone failed: " + (cp.stderr.strip()[-200:] or "git error"))
                 return
             pyotherside.send("pot_install_progress", "Installing dependencies (Deno)…")
-            server = _pot_server_dir()
+            server = os.path.join(staging, "server")
             lock = os.path.join(server, "deno.lock")
             base = [deno, "install"]
             if get_settings().get("pot_needs_ffi"):
@@ -2353,23 +2381,42 @@ def install_pot_provider(tag=None):
             if dp.returncode != 0 and "--frozen" in cmd:   # lock mismatch? retry unlocked
                 dp = subprocess.run(base, cwd=server, capture_output=True, text=True, timeout=900)
             if dp.returncode != 0:
+                shutil.rmtree(staging, ignore_errors=True)
                 _pot_last_error = "Dependency install failed: " + (dp.stderr.strip()[-200:] or "deno error")
                 pyotherside.send("pot_install_done", False,
                                  "Dependency install failed: " + (dp.stderr.strip()[-200:] or "deno error"))
                 return
             if not os.path.isfile(os.path.join(server, "src", "main.ts")):
+                shutil.rmtree(staging, ignore_errors=True)
                 pyotherside.send("pot_install_done", False,
                                  "Setup finished but the server entry is missing.")
                 return
+            # Staging built cleanly. Stop the OLD sidecar FIRST — otherwise it keeps serving on the
+            # port and _ensure_pot_server() below would see the port open and never restart, so an
+            # UPDATE would silently keep running the old server/plugin version. (M3)
+            stop_pot_server()
+            # Swap the new tree in with two same-filesystem renames (sub-millisecond window; the
+            # previous install stays recoverable under .old until the new one is promoted).
+            old = repo + ".old"
+            shutil.rmtree(old, ignore_errors=True)
+            if os.path.isdir(repo):
+                os.rename(repo, old)
+            os.rename(staging, repo)
+            shutil.rmtree(old, ignore_errors=True)
             with open(_pot_marker(), "w") as f:
                 f.write(the_tag)
+            if persist_tag:
+                set_setting("pot_tag", the_tag)  # remember the updated tag ONLY after a clean install
             set_setting("pot_provider", True)    # installed → enabled
-            _ensure_pot_server()                 # warm it now so the first video is instant
+            _ensure_pot_server()                 # fresh start (old one stopped above) so the new
+                                                 # server + plugin version actually takes effect
             pyotherside.send("pot_install_done", True,
                              "Provider ready (" + the_tag + "). Videos now fetch a per-video token.")
         except subprocess.TimeoutExpired:
+            shutil.rmtree(_pot_repo_dir() + ".new", ignore_errors=True)
             pyotherside.send("pot_install_done", False, "Setup timed out.")
         except Exception as ex:
+            shutil.rmtree(_pot_repo_dir() + ".new", ignore_errors=True)
             pyotherside.send("pot_install_done", False, str(ex))
 
     threading.Thread(target=run, daemon=True).start()
@@ -2386,8 +2433,9 @@ def update_pot_provider():
         pyotherside.send("pot_install_done", False,
                          "Couldn't reach GitHub to find the latest provider release.")
         return {"ok": False}
-    set_setting("pot_tag", latest)
-    return install_pot_provider(latest)
+    # Persist the new tag only AFTER a successful install (inside install_pot_provider) — otherwise a
+    # failed update would leave the setting claiming a version that was never actually installed. (M3)
+    return install_pot_provider(latest, persist_tag=True)
 
 
 # YouTube search filter tokens (the results-page `sp` query param — base64 of the filter

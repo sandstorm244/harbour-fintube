@@ -223,6 +223,15 @@ Page {
                 }
             }
 
+            // Shown only when the last download was refused because its SHA-256 didn't match the
+            // pinned known-good build — an explicit opt-in to install the unverified newer build. (M12)
+            Button {
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible: app.backend.ffmpegNeedsConfirm && !app.backend.ffmpegInstalling
+                text: "Install unverified build"
+                onClicked: app.backend.installFfmpeg(true)
+            }
+
             SectionHeader { text: "PO token provider" }
 
             Label {

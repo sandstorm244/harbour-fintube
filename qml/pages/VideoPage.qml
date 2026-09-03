@@ -645,6 +645,10 @@ Page {
         // a resolve meant for a newer video page.
         target: page.resolving ? app.backend : null
         onResolved: {
+            if (page.infoOnly || forId !== page.videoId)   // not this page's video, or an info-only
+                return                                     // page (which never plays, but does listen
+                                                           // while its own videoInfo() is in flight) —
+                                                           // never consume a playback resolve here (M8)
             page.resolving = false
             page.reattaching = false
             // Prime the remembered speed while the pipeline doesn't exist yet (setRate is a no-op
@@ -694,6 +698,8 @@ Page {
             }
         }
         onResolveError: {
+            if (page.infoOnly || forId !== page.videoId)   // another page's resolve, or an info-only
+                return                                     // page — ignore (M8)
             page.resolving = false
             page.errorText = message
             transport.playbackMenuOpen = false
