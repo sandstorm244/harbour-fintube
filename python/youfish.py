@@ -4326,6 +4326,59 @@ def channel_videos(channel, start=1, n=30):
         return {"ok": False, "error": str(ex)}
 
 
+@_timed_fn("q.channel_rss")
+def channel_feed_rss(channel):
+    """Fast first paint for the channel view: the latest ~15 uploads from the channel's RSS feed
+    (spawn-free), in the same item shape channel_videos returns. Works only when `channel` resolves
+    to a UC id (RSS keys on channel_id) -- a handle/user URL returns ok:False so ChannelPage falls
+    back to channel_videos. Carries no live status and only a minimal header (name/id/url);
+    durations are filled from the persistent cache where already known, and channel_videos backfills
+    the rest (durations + avatar/subscribers/count + the uploads past ~15) in the background."""
+    ref = str(channel or "")
+    cid = ref if (ref.startswith("UC") and "/" not in ref) else ""
+    if not cid:
+        m = re.search(r"/channel/(UC[\w-]+)", ref)
+        cid = m.group(1) if m else ""
+    if not cid:
+        return {"ok": False, "items": []}
+    _force_ipv4()
+    url = "https://www.youtube.com/feeds/videos.xml?channel_id=%s" % cid
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            xml = r.read().decode("utf-8", "replace")
+    except Exception:
+        return {"ok": False, "items": []}
+    ents = _parse_feed_entries(xml)
+    m = re.search(r"<title>(.*?)</title>", xml, re.S)      # feed-level <title> = the channel name
+    chan_name = html.unescape(m.group(1)) if m else ""
+    hide_shorts = _hide_shorts()
+    items = []
+    for e in ents:
+        if hide_shorts and e.get("is_short"):
+            continue
+        vid = e["id"]
+        items.append({
+            "id": vid,
+            "title": e["title"],
+            "uploader": e["uploader"] or chan_name,
+            "duration": 0,
+            "thumbnail": _video_thumb(vid),
+            "views": e.get("views") or 0,
+            "posted": _rel_from_iso(e.get("published")),
+            "live": 0,
+        })
+    items = _feed_with_durations(items)          # show any length we already know, instantly
+    return {"ok": True, "items": items, "has_more": True, "channel": {
+        "id": cid,
+        "name": chan_name,
+        "url": "https://www.youtube.com/channel/%s" % cid,
+        "thumbnail": "",
+        "subscribers": 0,
+        "video_count": 0,
+    }}
+
+
 def _feed_fetch_channel(path, cid, per_channel):
     """One subscribed channel's recent uploads → [(sort_ts, item), ...]. The channel's RSS
     feed (feeds/videos.xml, spawn-free urllib) is the PRIMARY source: fast + exact dates, but no

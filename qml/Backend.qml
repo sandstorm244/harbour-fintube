@@ -409,6 +409,15 @@ Item {
         })
     }
 
+    // Fast first paint for the channel view: the latest ~15 uploads from the channel's RSS feed
+    // (spawn-free). Returns ok:false for a handle/user ref so ChannelPage falls back to
+    // channelVideos, which fills the header, durations and the rest in the background.
+    function channelFeedRss(channel, callback) {
+        py.call("youfish.channel_feed_rss", [channel], function(res) {
+            callback(res || {})
+        })
+    }
+
     // A page of a channel's uploads → the caller's callback (page-scoped, and drives the
     // scroll-to-load-more paging in ChannelPage). `start` is the 1-based first index.
     function channelVideos(channel, start, callback) {

@@ -23,6 +23,7 @@ Page {
     property bool hasMore: true
     property int nextStart: 1
     readonly property int pageSize: 30
+    property var seenIds: ({})   // video ids in the model, for dedup across the RSS + /videos merges
 
     property bool subscribed: {
         var subs = app.backend.subscriptions
@@ -34,21 +35,57 @@ Page {
 
     ListModel { id: videosModel }
 
-    // Fetch one page of uploads. start<=1 is the initial load (sets header + clears);
-    // later pages just append. Callback-scoped, so a stale page can't grab our results.
-    function loadPage(start) {
-        if (page.loadingMore)
-            return
-        if (start > 1)
-            page.loadingMore = true
-        app.backend.channelVideos(page.channelRef, start, function(res) {
+    // Initial load: paint the latest ~15 from the channel's RSS feed instantly (spawn-free), then
+    // fill the full header, durations and the rest of the uploads from the slower /videos fetch in
+    // the background -- deduped by id, so the RSS videos are never re-added.
+    function loadInitial() {
+        app.backend.channelFeedRss(page.channelRef, function(res) {
+            if (!page) return   // the page was popped before this async callback returned
+            if (res && res.ok && res.items && res.items.length > 0) {
+                var ch = res.channel
+                if (ch) {
+                    page.channelId = ch.id || page.channelId
+                    if (ch.name) page.channelName = ch.name
+                    if (ch.url) page.channelUrl = ch.url
+                }
+                videosModel.clear()
+                page.seenIds = ({})
+                for (var i = 0; i < res.items.length; i++)
+                    page.addOrUpdate(res.items[i])
+                page.loading = false
+                page.hasMore = true            // the /videos pass confirms + sets real paging
+                page.loadFullFirstPage(true)
+            } else {
+                page.loadFullFirstPage(false)  // no usable RSS (handle URL / empty) -> /videos only
+            }
+        })
+    }
+
+    // Insert a video, or update an already-shown one -- dedup by id so neither the background
+    // /videos pass nor a later page re-adds a video the RSS pass already displayed. Fills in the
+    // length (and live flag) once /videos supplies them.
+    function addOrUpdate(it) {
+        var idx = page.seenIds[it.id]
+        if (idx !== undefined) {
+            if (it.duration > 0) videosModel.setProperty(idx, "duration", it.duration)
+            if (it.live) videosModel.setProperty(idx, "live", it.live)
+        } else {
+            page.seenIds[it.id] = videosModel.count
+            videosModel.append(it)
+        }
+    }
+
+    // The full first page from /videos. When RSS already painted (hadRss), this backfills the
+    // header (avatar/subscribers/count) + durations and appends the uploads past the RSS window,
+    // without disturbing what is shown or the scroll. When RSS was unavailable it is the sole
+    // load, keeping the original empty-/topic-channel -> playlists behaviour.
+    function loadFullFirstPage(hadRss) {
+        app.backend.channelVideos(page.channelRef, 1, function(res) {
+            if (!page) return   // the page was popped before this async callback returned
             page.loading = false
-            page.loadingMore = false
             if (!res || !res.ok) {
-                if (start <= 1) {
+                if (!hadRss) {
                     var err = (res && res.error) ? res.error : "channel failed"
-                    // Topic/music channels have no Videos tab at all (yt-dlp errors rather than
-                    // returning empty) — jump straight to their playlists/releases instead.
                     if (/videos tab/i.test(err)) {
                         pageStack.replace(Qt.resolvedUrl("ChannelPlaylistsPage.qml"),
                             { channelRef: page.channelRef, channelName: page.channelName })
@@ -56,36 +93,57 @@ Page {
                     }
                     page.errorText = err
                 }
-                return
+                return                          // hadRss: keep the RSS list; scroll can retry /videos
             }
-            if (start <= 1) {
-                var ch = res.channel
-                if (ch) {
-                    page.channelId = ch.id || page.channelId
-                    page.channelName = ch.name || page.channelName
-                    page.channelUrl = ch.url || page.channelUrl
-                    // Keep a good avatar from the caller if this fetch lacks one.
-                    if (ch.thumbnail) page.channelThumb = ch.thumbnail
-                    page.channelSubs = ch.subscribers || 0
-                    page.videoCount = ch.video_count || 0
-                }
-                videosModel.clear()
+            var ch = res.channel
+            if (ch) {
+                page.channelId = ch.id || page.channelId
+                page.channelName = ch.name || page.channelName
+                page.channelUrl = ch.url || page.channelUrl
+                if (ch.thumbnail) page.channelThumb = ch.thumbnail
+                page.channelSubs = ch.subscribers || 0
+                page.videoCount = ch.video_count || 0
             }
             var items = res.items || []
-            if (start <= 1 && items.length === 0) {
-                // No uploads (music/topic channels, or playlist-only channels) → their playlists.
+            if (!hadRss && items.length === 0) {
                 pageStack.replace(Qt.resolvedUrl("ChannelPlaylistsPage.qml"),
                     { channelRef: page.channelRef, channelName: page.channelName })
                 return
             }
+            if (!hadRss) {
+                videosModel.clear()
+                page.seenIds = ({})
+            }
             for (var i = 0; i < items.length; i++)
-                videosModel.append(items[i])
+                page.addOrUpdate(items[i])
+            page.hasMore = !!res.has_more
+            page.nextStart = 1 + page.pageSize
+        })
+    }
+
+    // Later pages (scroll-to-load-more) -> append the next /videos page, deduped by id.
+    function loadPage(start) {
+        if (page.loadingMore || page.loading)
+            return
+        if (start <= 1) {                       // defensive: route any page-1 request through the full loader
+            page.loadFullFirstPage(false)
+            return
+        }
+        page.loadingMore = true
+        app.backend.channelVideos(page.channelRef, start, function(res) {
+            if (!page) return   // the page was popped before this async callback returned
+            page.loadingMore = false
+            if (!res || !res.ok)
+                return
+            var items = res.items || []
+            for (var i = 0; i < items.length; i++)
+                page.addOrUpdate(items[i])
             page.hasMore = !!res.has_more
             page.nextStart = start + page.pageSize
         })
     }
 
-    Component.onCompleted: loadPage(1)
+    Component.onCompleted: loadInitial()
 
     function fmtDur(sec) {
         if (!sec || sec <= 0)
