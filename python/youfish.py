@@ -3094,6 +3094,9 @@ def _parse_feed_entries(xml):
             "published": grab(r"<published>([^<]+)</published>"),
             "uploader": html.unescape(grab(r"<name>(.*?)</name>")),
             "views": int(grab(r'<media:statistics\s+views="(\d+)"') or 0),
+            # The entry's alternate link is /shorts/<id> for a Short, /watch?v=<id> for a
+            # normal video -- a free, exact Shorts classifier straight from the feed.
+            "is_short": 1 if "/shorts/" in grab(r'<link rel="alternate" href="([^"]+)"') else 0,
         })
     return out
 
@@ -3343,15 +3346,15 @@ def _feed_hide_watched(items):
 
 
 def _feed_shorts_filter(items):
-    """Drop Shorts from a feed item list when hide_shorts is on. Shorts are identified
-    DEFINITIVELY by channel /shorts-tab membership — a duration heuristic can't tell a 3-minute
-    Short from a 3-minute normal video (Shorts now run up to 3 min). The membership set is
-    discovered + cached by feed_durations; items not yet classified pass through and are pruned
-    client-side once feed_durations reports them."""
+    """Drop Shorts from a feed item list when hide_shorts is on. Shorts are identified two ways,
+    both definitive: the RSS entry's /shorts/ link (set inline by _feed_from_rss, so they drop
+    with no flash) and channel /shorts-tab membership (discovered + cached by feed_durations, the
+    fallback for rows that never came through RSS). A duration heuristic can't tell a 3-minute
+    Short from a 3-minute normal video, so it is never used."""
     if not _hide_shorts():
         return items
     shorts = _feed_durations_cache.get("shorts") or _load_saved_shorts()
-    return [it for it in items if it.get("id") not in shorts]
+    return [it for it in items if not it.get("is_short") and it.get("id") not in shorts]
 
 
 def _feed_with_durations(items):
@@ -4324,25 +4327,19 @@ def channel_videos(channel, start=1, n=30):
 
 
 def _feed_fetch_channel(path, cid, per_channel):
-    """One subscribed channel's recent uploads → [(sort_ts, item), ...]. yt-dlp's /videos tab is
-    the PRIMARY source (rich: duration + live + approximate date inline, Shorts excluded); the
-    channel's RSS feed is the automatic FALLBACK for when /videos returns nothing (YouTube breaks
-    RSS and the tab endpoint intermittently — mirrors how NewPipe/FreeTube cross-fall-back). Any
+    """One subscribed channel's recent uploads → [(sort_ts, item), ...]. The channel's RSS
+    feed (feeds/videos.xml, spawn-free urllib) is the PRIMARY source: fast + exact dates, but no
+    duration/live/Shorts flag (backfilled later by feed_durations — the NewPipe/FreeTube
+    fast-mode tradeoff). yt-dlp's /videos tab is the FALLBACK for when RSS returns nothing
+    (YouTube breaks RSS intermittently — mirrors how NewPipe/FreeTube cross-fall-back). Any
     total failure of both contributes nothing."""
-    rows = _feed_from_ytdlp(path, cid, per_channel)
-    if rows:
-        if _DEBUG:      # profiling A/B: also time the (discarded) RSS path for the SAME channel, so the
-            try:        # log shows feed.ytdlp vs feed.rss side by side — the key RSS-first data point.
-                _feed_from_rss(cid, per_channel)
-            except Exception:
-                pass
-        return rows
-    return _feed_from_rss(cid, per_channel)
+    rows = _feed_from_rss(cid, per_channel)
+    return rows if rows else _feed_from_ytdlp(path, cid, per_channel)
 
 
 @_timed_fn("feed.ytdlp")
 def _feed_from_ytdlp(path, cid, per_channel):
-    """PRIMARY: a channel's /videos tab via yt-dlp (flat). Duration/live/approximate-date inline;
+    """FALLBACK: a channel's /videos tab via yt-dlp (flat). Duration/live/approximate-date inline;
     the tab excludes Shorts itself, so no separate durations or Shorts pass is needed."""
     url = "https://www.youtube.com/channel/%s/videos" % cid
     try:
@@ -4382,13 +4379,14 @@ def _feed_from_ytdlp(path, cid, per_channel):
             "posted": _rel_date(e),
             "live": live,
             "channel_id": cid,
+            "is_short": 0,
         }))
     return rows
 
 
 @_timed_fn("feed.rss")
 def _feed_from_rss(cid, per_channel):
-    """FALLBACK: a channel's RSS feed (feeds/videos.xml). Fast + exact dates but — the fast-mode
+    """PRIMARY: a channel's RSS feed (feeds/videos.xml). Fast + exact dates but — the fast-mode
     tradeoff NewPipe/FreeTube also live with — NO duration or live status (both come back 0). Same
     item shape as the yt-dlp path so the merged feed stays uniform."""
     if not str(cid).startswith("UC"):
@@ -4414,6 +4412,7 @@ def _feed_from_rss(cid, per_channel):
             "posted": _rel_from_iso(e.get("published")),
             "live": 0,                             # …nor live status
             "channel_id": cid,
+            "is_short": e.get("is_short") or 0,
         }))
     return rows
 
@@ -4522,7 +4521,7 @@ def subscription_feed(limit=100, force=False, refresh_all=False):
     have_cache = any((_feed_cache.get(c) or {}).get("rows") for c in ids)
     if not force and have_cache:
         return {"ok": True,
-                "items": _feed_hide_watched(_merged_feed_items(ids))[:int(limit)],
+                "items": _feed_hide_watched(_feed_shorts_filter(_feed_with_durations(_merged_feed_items(ids))))[:int(limit)],
                 "cached": True,
                 "stale": any(_channel_due(c, now) for c in ids)}
     path = _ytdlp_path()
@@ -4555,7 +4554,7 @@ def subscription_feed(limit=100, force=False, refresh_all=False):
             del _feed_cache[cid]
     _save_feed_cache()
     return {"ok": True,
-            "items": _feed_hide_watched(_merged_feed_items(ids))[:int(limit)],
+            "items": _feed_hide_watched(_feed_shorts_filter(_feed_with_durations(_merged_feed_items(ids))))[:int(limit)],
             "cached": False,
             "stale": any(_channel_due(c, now) for c in ids)}
 
@@ -4640,8 +4639,19 @@ def feed_durations(limit_per_channel=30, force=False):
     shorts = _feed_durations_cache["shorts"] or _load_saved_shorts()
     _feed_durations_cache["map"], _feed_durations_cache["shorts"] = dmap, shorts
 
-    feed_items = _feed_cache.get("items") or []
+    _feed_hydrate()
+    uc_ids = [s.get("id") for s in subs if str(s.get("id") or "").startswith("UC")]
+    feed_items = _merged_feed_items(uc_ids)      # the ids actually in the feed (per-channel cache)
     feed_ids = [it.get("id") for it in feed_items if it.get("id")]
+
+    # Shorts detected straight from the RSS <link> href are classified for free: merge them
+    # into the persistent Shorts set so _feed_shorts_filter drops them with no flash AND the
+    # /shorts-tab spawn below is never spent classifying them.
+    rss_shorts = {it.get("id") for it in feed_items if it.get("is_short")}
+    if rss_shorts - shorts:
+        shorts |= rss_shorts
+        _feed_durations_cache["shorts"] = shorts
+        _save_shorts(shorts)
 
     def result():
         return {"durations": {k: dmap[k] for k in feed_ids if k in dmap},
