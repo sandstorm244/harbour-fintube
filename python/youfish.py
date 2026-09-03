@@ -2064,15 +2064,37 @@ def _ensure_pot_server():
                 logf = open(os.path.join(_pot_dir(), "server.log"), "ab", buffering=0)
             except Exception:
                 logf = subprocess.DEVNULL
-            try:
-                _pot_proc = subprocess.Popen(
-                    _pot_server_flags(), cwd=_pot_server_dir(), env=env,
-                    stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
-                    preexec_fn=_set_pdeathsig)
-            except Exception as ex:
-                _pot_last_error = "Couldn't launch the Deno server: " + str(ex)
-                return False
-            atexit.register(stop_pot_server)
+            # Spawn on a DEDICATED long-lived daemon thread that then parks on the child for its
+            # whole life. PR_SET_PDEATHSIG is armed against the THREAD that forks the child, not the
+            # process — so if the sidecar were Popen'd on a short-lived caller (the install thread, a
+            # download thread, or a reader-thread re-resolve) the kernel would SIGKILL it the instant
+            # that caller returned: the "server dies just after Provider ready" bug. Parking here
+            # keeps pdeathsig armed to fire only when the app itself exits, whoever asked to start it.
+            spawned = threading.Event()
+            def _own_pot_server():
+                global _pot_proc, _pot_last_error
+                try:
+                    proc = subprocess.Popen(
+                        _pot_server_flags(), cwd=_pot_server_dir(), env=env,
+                        stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+                        preexec_fn=_set_pdeathsig)
+                except Exception as ex:
+                    _pot_last_error = "Couldn't launch the Deno server: " + str(ex)
+                    _pot_proc = None
+                    spawned.set()
+                    return
+                _pot_proc = proc
+                atexit.register(stop_pot_server)
+                spawned.set()
+                try:
+                    proc.wait()          # park for the child's whole life (pdeathsig stays armed here)
+                except Exception:
+                    pass
+            threading.Thread(target=_own_pot_server, daemon=True,
+                             name="pot-server-owner").start()
+            spawned.wait(5)              # the Popen is near-instant; let it happen before we poll
+            if _pot_proc is None:
+                return False             # Popen failed — _pot_last_error already set by the owner
         # The server LISTENS quickly; the BotGuard VM warms on the first token request,
         # which the yt-dlp plugin waits out itself — so we only wait for the port to open.
         deadline = time.time() + 25
@@ -2080,9 +2102,10 @@ def _ensure_pot_server():
             if _pot_ready_on_port():
                 _pot_last_error = ""
                 return True
-            if _pot_proc.poll() is not None:
+            if _pot_proc is None or _pot_proc.poll() is not None:
                 _pot_last_error = ("Provider server exited (code %s) just after starting — see the "
-                                   "server log in the diagnostics below." % _pot_proc.poll())
+                                   "server log in the diagnostics below."
+                                   % (_pot_proc.poll() if _pot_proc is not None else "?"))
                 return False   # died during startup — see potprovider/server.log
             time.sleep(0.3)
         _pot_last_error = "Provider server didn't open port %d within 25s." % _POT_PORT
@@ -2117,25 +2140,12 @@ def prewarm():
     _pot_rotate_log()   # fresh server.log per launch (keeps the previous one as server.log.prev)
     if not _pot_active():
         return
-    def _bg():
-        # PR_SET_PDEATHSIG on the Deno child is armed against the THREAD that spawns it — on Linux
-        # the parent-death signal is tied to the creating task, not the process. If this short-lived
-        # thread returned right after the server came up, the kernel would SIGKILL the child the
-        # instant the thread ends. THAT is why the sidecar only stayed up when a played video or the
-        # diagnostics started it (both run on the long-lived PyOtherSide worker thread) and silently
-        # died when prewarm started it at launch. So: skip if it's already listening, otherwise start
-        # it and PARK on the child for its whole life here — keeping pdeathsig correctly armed to fire
-        # when this daemon thread is torn down at app exit.
-        try:
-            if _pot_ready_on_port():
-                return
-            _ensure_pot_server()
-            proc = _pot_proc
-            if proc is not None and proc.poll() is None:
-                proc.wait()
-        except Exception:
-            pass
-    threading.Thread(target=_bg, daemon=True).start()
+    # _ensure_pot_server() now brings the sidecar up on its OWN dedicated owner thread that parks on
+    # the child (PR_SET_PDEATHSIG is armed against the forking thread, so it must be a long-lived
+    # one) — so prewarm just has to TRIGGER it off the UI path. A throwaway daemon thread is fine: it
+    # returns as soon as the port is up (or the 25s start times out), and the owner thread it spun up
+    # keeps the sidecar alive until app exit.
+    threading.Thread(target=_ensure_pot_server, daemon=True, name="pot-prewarm").start()
 
 
 def stop_pot_server():
@@ -3143,6 +3153,26 @@ def _channel_entry(e):
 _dir_ready = False
 
 
+def _atomic_write_json(path, obj):
+    """Write obj as JSON to `path` atomically: serialise to a private (0600) temp file in the same
+    directory, then os.replace() it over the target — atomic on POSIX, so a crash / battery-pull /
+    ENOSPC mid-write can never truncate the live store (a truncated store loads as {} and the next
+    save would then persist the wipe). Mirrors ytm.py's _save_cookies. Raises on failure, leaving
+    the existing file untouched, so callers' current try/except still reports it."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=d)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
 def _data_dir():
     """Our data dir. On first use, migrate the old harbour-youfish dir over (one-time) so the
     FinTube rename keeps the user's subs, positions, downloads and installed yt-dlp binary."""
@@ -3253,8 +3283,7 @@ def set_setting(key, value):
     s[key] = value
     try:
         path = _settings_path()
-        with open(path, "w") as f:
-            json.dump(s, f)
+        _atomic_write_json(path, s)
         os.chmod(path, 0o600)     # owner-only (privacy)
     except Exception:
         pass
@@ -3449,8 +3478,7 @@ def set_position(video_id, seconds):
     if len(d) > 300:
         d = dict(list(d.items())[-300:])
     try:
-        with open(_positions_path(), "w") as f:
-            json.dump(d, f)
+        _atomic_write_json(_positions_path(), d)
     except Exception:
         pass
 
@@ -3577,8 +3605,7 @@ def record_watch(video_id, position, duration, title="", channel=""):
     if len(d) > lim:
         d = dict(list(d.items())[-lim:])
     try:
-        with open(_watch_history_path(), "w") as f:
-            json.dump(d, f)
+        _atomic_write_json(_watch_history_path(), d)
     except Exception:
         pass
 
@@ -3619,8 +3646,7 @@ def set_watched(video_id, watched=True, title="", channel=""):
     if len(d) > lim:
         d = dict(list(d.items())[-lim:])
     try:
-        with open(_watch_history_path(), "w") as f:
-            json.dump(d, f)
+        _atomic_write_json(_watch_history_path(), d)
     except Exception:
         return {"ok": False}
     return {"ok": True, "watched": 1 if watched else 0}
@@ -3731,8 +3757,7 @@ def list_subscriptions():
 
 def _save_subscriptions(subs):
     try:
-        with open(_subs_path(), "w") as fh:
-            json.dump(subs, fh)
+        _atomic_write_json(_subs_path(), subs)
     except Exception:
         pass
 
@@ -4131,8 +4156,7 @@ def _import_newpipe_db(con):
             merged = dict(list(merged.items())[-lim:])
         if hist_added:
             try:
-                with open(_watch_history_path(), "w") as f:
-                    json.dump(merged, f)
+                _atomic_write_json(_watch_history_path(), merged)
             except Exception:
                 pass
 
@@ -4151,8 +4175,7 @@ def _import_newpipe_db(con):
             if len(positions) > 300:
                 positions = dict(list(positions.items())[-300:])
             try:
-                with open(_positions_path(), "w") as f:
-                    json.dump(positions, f)
+                _atomic_write_json(_positions_path(), positions)
             except Exception:
                 pass
 
@@ -4262,8 +4285,7 @@ def _load_avatar_cache():
 
 def _save_avatar_cache():
     try:
-        with open(_avatar_cache_path(), "w") as f:
-            json.dump(_avatar_cache, f)
+        _atomic_write_json(_avatar_cache_path(), _avatar_cache)
     except Exception:
         pass
 
@@ -4591,8 +4613,7 @@ def _load_feed_cache():
 
 def _save_feed_cache():
     try:
-        with open(_feed_cache_path(), "w") as f:
-            json.dump(_feed_cache, f)
+        _atomic_write_json(_feed_cache_path(), _feed_cache)
     except Exception:
         pass
 
@@ -4701,8 +4722,7 @@ def _save_durations(d):
     try:
         if len(d) > 3000:                       # tiny + immutable; keep the file bounded (LRU tail)
             d = dict(list(d.items())[-3000:])
-        with open(_durations_path(), "w") as f:
-            json.dump(d, f)
+        _atomic_write_json(_durations_path(), d)
     except Exception:
         pass
 
@@ -4712,8 +4732,7 @@ def _save_shorts(s):
         lst = list(s)
         if len(lst) > 4000:
             lst = lst[-4000:]
-        with open(_shorts_path(), "w") as f:
-            json.dump(lst, f)
+        _atomic_write_json(_shorts_path(), lst)
     except Exception:
         pass
 
@@ -5010,8 +5029,7 @@ def list_downloads():
 
 def _save_downloads(lst):
     try:
-        with open(_downloads_path(), "w") as f:
-            json.dump(lst, f)
+        _atomic_write_json(_downloads_path(), lst)
     except Exception:
         pass
 
@@ -5140,8 +5158,7 @@ def _load_playlists():
 
 def _save_playlists(lst):
     try:
-        with open(_playlists_path(), "w") as f:
-            json.dump(lst, f)
+        _atomic_write_json(_playlists_path(), lst)
     except Exception:
         pass
 

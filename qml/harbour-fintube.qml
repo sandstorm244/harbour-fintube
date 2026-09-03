@@ -63,6 +63,10 @@ ApplicationWindow {
     // clean fresh resolve rather than adopting a dead pipeline.
     function stopBackgroundAudio() {
         gplayer.stop()
+        // Release the kept audio-only downloader + its s-*.dat temp file, which otherwise leak until
+        // app exit. Component.onDestruction releases on a normal leave, but the cover/lockscreen Stop
+        // and resume-bar ✕ route here instead — and nowPlaying.videoId is still set at this point. (M11)
+        app.backend.releasePlayback(nowPlaying.videoId, [])
         nowPlaying.active = false
         nowPlaying.videoId = ""
         nowPlaying.playing = false

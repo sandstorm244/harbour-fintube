@@ -113,12 +113,15 @@ class VideoCandidates(unittest.TestCase):
 
 
 class AudioCandidates(unittest.TestCase):
-    def test_ladder_order_matches_old_hardcoded(self):
+    def test_ladder_prefers_opus_then_bitrate(self):
+        # The ranking is opus-family-first (best on-device playback), each family then ordered by
+        # bitrate desc — NOT a single global bitrate sort. So every opus rung (251,250,249,600)
+        # precedes every AAC rung (140,139,599), each group high-bitrate first.
         fmts = [af("250", 70, "opus"), af("140", 128, "mp4a.40.2"), af("251", 160, "opus"),
                 af("599", 31, "mp4a"), af("249", 50, "opus"), af("139", 48, "mp4a.40.5"),
                 af("600", 35, "opus")]
         got = [f["format_id"] for f in youfish._audio_candidates(fmts)]
-        self.assertEqual(got, ["251", "140", "250", "249", "139", "600", "599"])
+        self.assertEqual(got, ["251", "250", "249", "600", "140", "139", "599"])
 
     def test_source_beats_same_bitrate_dub(self):
         fmts = [af("251-3", 160, "opus", lang_pref=-1),    # dub
@@ -192,6 +195,8 @@ class ResolveSmoke(unittest.TestCase):
         youfish._yt_extractor_args = lambda client_override=None, want_pot=False: []
         youfish._proxied = lambda url, *a, **k: url
         youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False}
+        youfish.invalidate_resolve_cache()   # resolve() is cache-first (keyed by video id); every
+                                             # test reuses id "vid", so isolate each test's fixture
 
     def tearDown(self):
         for name, fn in self._saved.items():
@@ -257,9 +262,9 @@ class ResolveSmoke(unittest.TestCase):
         self.assertTrue(tracks[0]["is_original"])
         self.assertEqual(tracks[1]["name"], "Portuguese")
         self.assertFalse(tracks[1]["is_original"])
-        self.assertEqual(tracks[0]["itag"], "140-en")                 # best rung (129 aac > 124 opus)
+        self.assertEqual(tracks[0]["itag"], "251-en")                 # best rung (opus preferred over AAC)
         self.assertTrue(tracks[0]["audio_url"])
-        self.assertEqual(info["audio_itag"], "140-en")               # started on the original
+        self.assertEqual(info["audio_itag"], "251-en")               # started on the original
 
     def test_untagged_original_prepended_as_original(self):
         # A dubbed video whose SOURCE audio yt-dlp left untagged: it's what plays, so it must appear
@@ -575,7 +580,7 @@ class FeedShortsAndDurations(unittest.TestCase):
         self._tmp = tempfile.mkdtemp(prefix="feeddur-")
         youfish._data_dir = lambda: self._tmp
         youfish._feed_durations_cache = {"ts": 0.0, "map": {}, "shorts": set()}
-        youfish._feed_cache = {"ts": 0.0, "items": []}
+        youfish._feed_cache = {}                             # per-channel: {cid: {"ts", "rows": [...]}}
 
     def tearDown(self):
         youfish._data_dir, youfish.get_settings, youfish.list_subscriptions = self._dd, self._gs, self._ls
@@ -605,11 +610,11 @@ class FeedShortsAndDurations(unittest.TestCase):
     def test_feed_durations_all_classified_is_instant(self):
         cid = "UC00000000000000000000AA"                      # fully-classified feed → no yt-dlp needed
         youfish.list_subscriptions = lambda: [{"id": cid, "url": "", "name": "A"}]
-        youfish._feed_cache = {"ts": 0.0, "items": [
-            {"id": "LONG", "channel_id": cid},
-            {"id": "OTHER", "channel_id": cid},
-            {"id": "SHORT", "channel_id": cid},
-        ]}
+        youfish._feed_cache = {cid: {"ts": 0.0, "rows": [
+            [3, {"id": "LONG", "channel_id": cid}],
+            [2, {"id": "OTHER", "channel_id": cid}],
+            [1, {"id": "SHORT", "channel_id": cid}],
+        ]}}
         youfish._feed_durations_cache = {"ts": 0.0, "map": {"LONG": 300, "OTHER": 42}, "shorts": {"SHORT"}}
         res = youfish.feed_durations()
         self.assertEqual(res["durations"], {"LONG": 300, "OTHER": 42})   # SHORT has no /videos duration

@@ -456,7 +456,12 @@ Page {
 
     // SponsorBlock: if the play position lands inside a skip segment, jump past it.
     function checkSponsorSkip() {
-        if (!app.backend.sponsorBlock || page.sponsorSegments.length === 0 || !page.isPlaying)
+        // Only the page that actually holds the shared player may skip. A page displaced into the
+        // back stack keeps useGst=true and reads the shared player's position/isPlaying — so without
+        // holdsPlayer, when the NEW video crosses this (old) page's segment timestamps, the hidden
+        // page would seek the new owner's playback. (C1)
+        if (!app.backend.sponsorBlock || !page.holdsPlayer
+                || page.sponsorSegments.length === 0 || !page.isPlaying)
             return
         var pos = page.positionMs / 1000
         for (var i = 0; i < page.sponsorSegments.length; i++) {
@@ -491,6 +496,12 @@ Page {
     // TransportControls, so it's for the PLAYING page only — the info-only view uses loadInfoOnly().
     function populateMetadata(info) {
         page.isLive = !!info.is_live
+        // A deep-linked video (opened from a browser link) arrives with an empty title; fill it from
+        // the resolve payload so the title label, cover + MPRIS metadata aren't blank and the first
+        // History row isn't the raw video id. A list-launched page already has its title, so only
+        // fill when empty — mirrors loadInfoOnly(). (M9)
+        if (page.title.length === 0)
+            page.title = info.title || ""
         page.channel = info.uploader || ""
         page.channelId = info.channel_id || ""
         page.channelUrl = info.channel_url || ""
@@ -588,6 +599,8 @@ Page {
             // A newer source (another video, or a downloaded file) is taking over — stop this one
             // and release the claim.
             page.persistPosition()
+            page.sponsorSegments = []       // drop this video's segments so our position ticks can't
+                                            // skip the new owner once it takes the shared player (C1)
             gplayer.stop()
             app.backend.releasePlayback(page.videoId, [])
             mediaPlayer.stop()
@@ -788,6 +801,17 @@ Page {
         interval: 250
         repeat: false
         onTriggered: if (page.useGst) gplayer.requestRepaint()
+    }
+
+    // Persist the resume point periodically while actually playing. Every other save happens only at
+    // navigation / teardown (onStopRequested, Component.onDestruction), so an OOM-kill, crash or
+    // battery-death mid-video would otherwise lose the resume point entirely. Gated on holdsPlayer so
+    // only the page that owns the shared player saves (a stacked page would read the wrong position). (M10)
+    Timer {
+        interval: 30000
+        repeat: true
+        running: page.holdsPlayer && page.isPlaying && !page.infoOnly
+        onTriggered: page.persistPosition()
     }
 
     // Keep the display awake while a video is actually playing, if the user enabled it. Isolated

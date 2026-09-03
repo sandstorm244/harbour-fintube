@@ -1,0 +1,20 @@
+name: tests
+
+# The engine test suite is pure-stdlib and fully offline (externals mocked), so it runs
+# anywhere Python 3 does — no device, no yt-dlp, no network. Running it on every push/PR is
+# what stops it rotting silently (it had drifted to 8 failures at HEAD before this was added).
+on:
+  push:
+  pull_request:
+
+jobs:
+  engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run engine test suite (offline)
+        working-directory: python
+        run: python3 test_youfish.py
