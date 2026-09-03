@@ -4230,8 +4230,49 @@ def _import_newpipe_db(con):
 
 _avatar_cache = {}         # channel -> {"ts": epoch, "res": {...}}
 _avatar_cache_lock = threading.Lock()
-_AVATAR_CACHE_TTL = 86400  # avatars rarely change; a day avoids re-running yt-dlp per view
+_AVATAR_CACHE_TTL = 7 * 86400   # avatars rarely change; a week (persisted to disk below) avoids
+                                 # re-running yt-dlp per channel-view, across restarts
 _AVATAR_CACHE_MAX = 128
+
+_avatar_state = {"loaded": False}
+
+
+def _avatar_cache_path():
+    return os.path.join(_data_dir(), "avatar_cache.json")
+
+
+def _load_avatar_cache():
+    """The persisted avatar cache, dropping entries already past the TTL — so avatars survive an
+    app restart instead of costing a fresh yt-dlp spawn per channel each session."""
+    try:
+        with open(_avatar_cache_path()) as f:
+            d = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    now = time.time()
+    out = {}
+    for k, ent in d.items():
+        if (isinstance(ent, dict) and isinstance(ent.get("res"), dict)
+                and now - float(ent.get("ts") or 0) < _AVATAR_CACHE_TTL):
+            out[k] = {"ts": float(ent["ts"]), "res": ent["res"]}
+    return out
+
+
+def _save_avatar_cache():
+    try:
+        with open(_avatar_cache_path(), "w") as f:
+            json.dump(_avatar_cache, f)
+    except Exception:
+        pass
+
+
+def _avatar_hydrate():
+    """Load the on-disk avatar cache once. Call from inside _avatar_cache_lock."""
+    if not _avatar_state["loaded"]:
+        _avatar_cache.update(_load_avatar_cache())
+        _avatar_state["loaded"] = True
 
 
 def channel_avatar(channel):
@@ -4245,6 +4286,7 @@ def channel_avatar(channel):
     if not path or not channel:
         return {"ok": False}
     with _avatar_cache_lock:
+        _avatar_hydrate()               # load the on-disk cache once (survives restarts)
         ent = _avatar_cache.get(channel)
         if ent and time.time() - ent["ts"] < _AVATAR_CACHE_TTL:
             return ent["res"]
@@ -4271,6 +4313,7 @@ def channel_avatar(channel):
                 for k, _ in sorted(_avatar_cache.items(),
                                    key=lambda kv: kv[1]["ts"])[:len(_avatar_cache) - _AVATAR_CACHE_MAX]:
                     _avatar_cache.pop(k, None)
+            _save_avatar_cache()        # persist so avatars survive an app restart
         return res
     except Exception:
         return {"ok": False}
