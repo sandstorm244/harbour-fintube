@@ -44,6 +44,7 @@ Page {
     property real videoDuration: 0    // seconds, from yt-dlp — scrubber fallback
     property var qualities: []        // [{itag,label,video_url}], highest first
     property string currentQuality: ""
+    property string currentVideoItag: ""   // itag actually playing, for switchAudio's keep-list
     property int resumeMs: 0          // saved watch position to resume from (0 = none)
     property var sponsorSegments: []  // SponsorBlock [{start,end,category}] in seconds
     property string skipHint: ""      // transient "Skipped …" overlay text
@@ -188,6 +189,8 @@ Page {
         gplayer.videoUrl = q.video_url
         gplayer.play()
         gplayer.seekWhenReady(at)         // restored at preroll, once both branches are up
+        page.currentVideoItag = q.itag || ""
+        app.backend.releasePlayback(page.videoId, [q.itag, transport.currentAudioItag])
     }
 
     // Switch audio track on a multi-language (dubbed) video: swap the audio-only source, keep the
@@ -206,6 +209,7 @@ Page {
         gplayer.audioUrl = a.audio_url
         gplayer.play()
         gplayer.seekWhenReady(at)         // restored at preroll, once both branches are up
+        app.backend.releasePlayback(page.videoId, [page.currentVideoItag, a.itag])
     }
 
     // Pick a caption track (or null = Off). `persist` records it as the cross-video preference;
@@ -503,6 +507,7 @@ Page {
                 break
             }
         }
+        page.currentVideoItag = info.video_itag || ""
         if (page.currentQuality.length === 0 && page.qualities.length > 0)
             page.currentQuality = page.qualities[0].label
         // Captions: hand the two lists to the overlay, clear any prior track, then auto-enable the
@@ -584,6 +589,7 @@ Page {
             // and release the claim.
             page.persistPosition()
             gplayer.stop()
+            app.backend.releasePlayback(page.videoId, [])
             mediaPlayer.stop()
             nowPlayingConn.target = null
             app.nowPlaying.videoId = ""
@@ -1608,11 +1614,13 @@ Page {
                    && (gplayer.playing || gplayer.position > 0)
         if (keep) {
             gplayer.setVideoActive(false)
+            app.backend.releasePlayback(page.videoId, [transport.currentAudioItag])
             app.parkPlayer()
             nowPlayingConn.target = null    // release page control → bgConn takes over
             app.bgAudioActive = true
         } else {
             gplayer.stop()
+            app.backend.releasePlayback(page.videoId, [])
             app.parkPlayer()
             nowPlayingConn.target = null
             app.nowPlaying.active = false

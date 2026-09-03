@@ -223,8 +223,14 @@ def _audio_candidates(formats):
         codec_rank = 0 if _audio_family(f.get("acodec")) == "opus" else 1
         abr = f.get("abr") or f.get("tbr") or 0
         # LANGUAGE is the primary key so the SOURCE track always beats a dub regardless of its
-        # bitrate; then highest bitrate, then codec preference.
-        return (-_audio_orig_pref(f), -abr, codec_rank)
+        # bitrate; then CODEC (opus first), then bitrate. Opus is preferred OVER bitrate because
+        # Opus/WebM audio flows through matroskademux, which PUSH-seeks over the range-seekable proxy
+        # exactly like the WebM/VP9 video — whereas AAC/M4A goes through qtdemux, whose push-mode seek
+        # returns FALSE on this SFOS/libhybris GStreamer (the "audio= 0" desync), forcing a whole-file
+        # audio downloadbuffer that grinds before every preroll. Opus keeps BOTH branches push-mode:
+        # fast preroll + A/V-synced seeks, no downloadbuffer. (Opus 251 ~160k >= AAC 140 ~128k, so
+        # this rarely costs quality; falls back to AAC when no opus track exists.)
+        return (-_audio_orig_pref(f), codec_rank, -abr)
     cands.sort(key=key)
     return cands
 
@@ -235,8 +241,45 @@ def _audio_candidates(formats):
 
 _proxy_port = None
 _proxy_lock = threading.Lock()
-_CHUNK = 1 << 20  # fetch googlevideo in 1 MiB bounded ranges; open-ended requests are flaky
 _ipv4_forced = False
+
+# --- Download-backed streaming substrate ------------------------------------- #
+# yt-dlp streams an itag into our stdin over a pipe; the reader thread pwrites it into a temp
+# file and advances an in-process `edge` counter; do_GET serves preads gated by `edge`. A pipe
+# gives free end-to-end backpressure (GStreamer buffer full -> wfile.write blocks -> cursor stops
+# advancing -> reader stops draining -> yt-dlp blocks on its pipe write -> googlevideo pauses), so
+# disk stays bounded with no SIGSTOP / --limit-rate machinery. `edge` is OUR counter (bytes we
+# actually pwrote), never getsize(), so a read can never see a byte we didn't place.
+_SESS_CHUNK   = 256 << 10    # pipe read / pwrite unit
+_READAHEAD    = 32 << 20     # download at most this far past the play cursor (the read-ahead cap)
+_SEEK_SOON    = 4  << 20     # forward seek within this of edge -> block; beyond -> restart
+_KEEPBACK     = 8  << 20     # bytes kept behind the cursor for cheap short backward seeks (D3)
+_IDLE         = 25.0         # reap a stream idle (refs==0) this long
+_REAP_EVERY   = 5.0
+_STALL        = 120.0        # _wait gives up if edge hasn't advanced this long (D8 backup watchdog);
+                             # must exceed the ~90s _ytdlp_formats re-resolve timeout — real in-download
+                             # stalls are caught by --socket-timeout 30, not by this backstop.
+_MAX_STREAMS  = 8
+_MIN_FREE     = 300 << 20
+_RESUME_TRIES = 3            # cap on CONSECUTIVE no-progress pipe deaths (reset on progress, D5/R9)
+# FALLOC_FL_* literals (Linux; not exposed as os.* names) — reclaim the consumed prefix in place (D3)
+_FALLOC_KEEP  = 0x01         # FALLOC_FL_KEEP_SIZE
+_FALLOC_PUNCH = 0x02         # FALLOC_FL_PUNCH_HOLE
+_PUNCH_OK     = True         # cleared on the first fallocate failure -> degrade to full-file
+# Range-restart resume: on-device Range test PASSED 2026-09-03 — the frozen yt-dlp FORWARDS
+# --add-header "Range: bytes=N-" on a direct-URL `-o -` download (reported total = clen - N, no 403),
+# so resuming AT s.edge is safe and gives snappy seeks/resume. This is the shipped mode: the resume
+# path spawns at s.edge and never resets edge/origin to 0, which by construction keeps disk bounded
+# by the do_GET hole-punch during resume too (eliminates R8's balloon and R9's edge-reset problem).
+# Keep the False branch as a DOCUMENTED FALLBACK ONLY: it re-downloads from 0 (offsets stay
+# corruption-proof), can grow the temp file during a deep resume, and relies on the reader's
+# free-space fail-safe to turn a would-be device-fill into a clean FAIL — never the shipped mode.
+_RANGE_RESTART = True
+_streams = {}                # (video_id, itag) -> _Stream
+_streams_lock = threading.Lock()
+_reap_pending = []           # R3/R5: Popen zombies to wait() OFF-lock, drained by _reaper + atexit
+_reap_lock = threading.Lock()
+_STREAM_DIR = None           # <data_dir>/streamcache, set in _ensure_proxy
 
 
 def _force_ipv4():
@@ -267,12 +310,18 @@ def _force_ipv4():
 _DEBUG = bool(os.environ.get("YOUFISH_DEBUG"))
 
 
+_plog_t0 = None
 def _plog(msg):
+    # DIAG: prefix every line with seconds since the first log line, so REQ->DONE gaps expose
+    # yt-dlp cold-start latency vs slow throughput (wrote / elapsed) directly.
+    global _plog_t0
     if not _DEBUG:
         return
     try:
+        if _plog_t0 is None:
+            _plog_t0 = time.monotonic()
         with open("/tmp/youfish-proxy.log", "a") as fh:
-            fh.write(msg + "\n")
+            fh.write("[%7.2f] %s\n" % (time.monotonic() - _plog_t0, msg))
     except Exception:
         pass
 
@@ -360,34 +409,410 @@ def _proxy_url_ok(url):
     return any(host == s.lstrip(".") or host.endswith(s) for s in _PROXY_ALLOW_SUFFIXES)
 
 
+# --------------------------------------------------------------------------- #
+# Per-(video_id, itag) download job. The HTTP connection is ephemeral (every seek is a fresh
+# do_GET, since we answer Connection: close); the download JOB persists here across connections,
+# so a backward / nearby-forward seek is served from disk instead of re-fetching from zero.
+# Invariant: [origin, edge) is always contiguous and fully valid; the reader only advances edge.
+# Lock order is ALWAYS _streams_lock -> s.cond. do_GET takes s.cond ALONE (never nests
+# _streams_lock under it). refs lives under s.cond. No proc.wait() ever runs under _streams_lock.
+# --------------------------------------------------------------------------- #
+class _Stream:
+    def __init__(s, vid, itag, url, ua, total):
+        s.vid, s.itag, s.url, s.ua = vid, itag, url, ua
+        s.total = total                    # _clen(url): authoritative total, known up front
+        s.path = os.path.join(_STREAM_DIR, "s-%s-%s-%d.dat"
+                              % (vid, itag, int(time.time() * 1000)))
+        s.fd = os.open(s.path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+        s.origin = 0                       # first valid byte of the live segment (advances on reclaim)
+        s.edge = 0                         # one past the last byte we've pwritten
+        s.cursor = 0                       # furthest byte any connection has served (read-ahead gate)
+        s.dl_start = 0                     # content offset the current yt-dlp proc streams FROM (D10)
+        s.state = "RUN"                    # RUN | DONE | FAIL | DEAD
+        s.refs = 0                         # R7/R10: mutated ONLY under s.cond
+        s.last_active = time.time()
+        s.edge_ts = time.time()            # last time edge advanced -> stall watchdog (D8)
+        s.cursor_at_last_death = 0         # R9: cursor at the previous pipe death -> resets tries
+        s.cond = threading.Condition()
+        s.proc = None
+        s.gen = 0                          # fences a stale reader across a restart
+
+
+def _free_bytes(path):
+    """Free bytes on the filesystem holding `path`. On error return a huge number so a statvfs
+    hiccup never wedges playback on a free-space guess (the reader's periodic re-check, D3, is the
+    real device-full guard)."""
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize
+    except Exception:
+        return 1 << 62
+
+
+def _reap_proc(proc):
+    """Best-effort wait() on an exited / killed child so it can't linger as a zombie. Called ONLY
+    off any lock: _reader's inline resume reap (holds no lock), _reader's R4 self-kill, and the
+    atexit sweep. _reap_locked NEVER calls this (R3/R5) — it queues to _reap_pending instead."""
+    if not proc:
+        return
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _spawn(s, at):
+    """Launch yt-dlp streaming the direct URL to stdout, optionally resuming at byte `at`. `s.url`
+    is an already-resolved DIRECT googlevideo URL (from _proxied / _reresolve), so no cookies /
+    PO-token / extractor args belong here. Mirrors the EXACT 6-header set the retired _fetch proved
+    on-device 2026-09-03 (a bare request 403s at byte 0, empty body = bot-check) plus --socket-timeout
+    so a stalled fetch dies into the resume path. preexec_fn makes the kernel SIGKILL the child if the
+    worker dies. With _RANGE_RESTART=True `at` is s.edge on a resume; the frozen yt-dlp forwards the
+    Range header (verified), so streamed content offset == at (pwrite offset stays correct). (D8, D10)"""
+    argv = [_ytdlp_path(), *_COMMON_ARGS, "--no-playlist",
+            "--socket-timeout", "30",
+            # googlevideo paces a single open-ended GET down to ~playback bitrate; --http-chunk-size
+            # makes yt-dlp issue BOUNDED Range GETs per chunk, each re-entering its full-speed burst
+            # window. On-device 2026-09-03: 0.58->10.09 MB/s WiFi, 0.55->1.30 MB/s 4G. Offset-safe:
+            # the injected "Range: bytes=<at>-" (below) becomes HttpFD req_start and chunking continues
+            # FROM there, so the reader's pwrite offset == content offset (D10) still holds (verified:
+            # first 64KB byte-identical to the non-chunked Range fetch, no double-offset on this build).
+            "--http-chunk-size", "10M",
+            "--user-agent", s.ua,
+            "--add-header", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "--add-header", "Accept-Language: en-us,en;q=0.5",
+            "--add-header", "Sec-Fetch-Mode: navigate",
+            "--add-header", "Accept-Encoding: identity"]
+    if at > 0:
+        argv += ["--add-header", "Range: bytes=%d-" % at]
+    argv += ["-o", "-", "--", s.url]
+    return subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                            preexec_fn=_set_pdeathsig)
+
+
+def _reader(s, gen):
+    """The SOLE writer of s.fd. Drains yt-dlp's pipe into the temp file; pwrites at the offset the
+    proc actually streamed from (dl_start + bytes-read this proc), so the offset ALWAYS equals the
+    content offset in BOTH range modes (D10). The read-ahead cap doubles as the backpressure gate.
+    On a mid-stream pipe death it re-resolves a fresh URL and resumes. In the SHIPPED mode
+    (_RANGE_RESTART=True) resume spawns at s.edge and preserves origin/edge, so the do_GET hole-punch
+    keeps disk bounded during resume just like steady playback. The False FALLBACK re-downloads from
+    0 (bytes re-pwritten idempotently at the same offsets); it can grow the temp file during a deep
+    resume, and only the per-8MiB free-space fail-safe below bounds it — a documented fallback limit."""
+    tries = 0
+    last_free_edge = 0                                       # edge at the last free-space check (D3)
+    wfd = -1
+    try:
+        with s.cond:
+            if s.state == "DEAD" or gen != s.gen:
+                return
+            try:
+                wfd = os.dup(s.fd)
+            except OSError:
+                wfd = -1
+        if wfd < 0:
+            with s.cond:
+                if s.state not in ("DONE", "DEAD"):
+                    s.state = "FAIL"; s.cond.notify_all()
+            return
+        while True:
+            proc = s.proc
+            nproc = 0                                        # bytes THIS proc has produced (D10)
+            while True:
+                with s.cond:                                # read-ahead cap == backpressure
+                    s.cond.wait_for(lambda: s.state == "DEAD"
+                                    or gen != s.gen
+                                    or s.edge - s.cursor < _READAHEAD,
+                                    timeout=2.0)             # D1: a missed anchor self-heals
+                    if s.state == "DEAD" or gen != s.gen:
+                        return
+                buf = proc.stdout.read(_SESS_CHUNK)          # blocks on the network; never spins
+                if not buf:
+                    break
+                try:
+                    os.pwrite(wfd, buf, s.dl_start + nproc) # D10: offset == content offset streamed
+                except OSError:                              # ENOSPC / bad fd -> clean FAIL
+                    with s.cond:
+                        if s.state not in ("DONE", "DEAD"):
+                            s.state = "FAIL"; s.cond.notify_all()
+                    return
+                nproc += len(buf)
+                with s.cond:
+                    if s.state == "DEAD" or gen != s.gen:
+                        return
+                    new_edge = s.dl_start + nproc
+                    if new_edge > s.edge:
+                        s.edge = new_edge
+                        s.edge_ts = time.time()              # D8: mark forward progress
+                        s.cond.notify_all()                  # wake do_GETs blocked at the edge
+                if s.edge - last_free_edge >= (8 << 20):     # D3 fail-safe: a growing stream can't
+                    last_free_edge = s.edge                  #     fill the device (fallback-mode guard)
+                    if _free_bytes(_STREAM_DIR) < _MIN_FREE:
+                        with s.cond:
+                            if s.state not in ("DONE", "DEAD"):
+                                s.state = "FAIL"; s.cond.notify_all()
+                        return
+            # pipe closed: clean finish, our own reap, or mid-stream death (expired URL / 403)
+            with s.cond:
+                if s.state == "DEAD" or gen != s.gen:
+                    return
+                if s.total is not None and s.edge >= s.total:
+                    s.state = "DONE"; s.cond.notify_all(); return
+            if s.total is None:                              # R2: length-unknown (rare no-clen/bare-200)
+                with s.cond:
+                    if nproc > 0:                            # produced bytes then clean EOF == the end
+                        s.state = "DONE"; s.cond.notify_all(); return
+                    # nproc == 0 -> a real byte-0 death; fall through to the capped resume path
+            with s.cond:
+                s.edge_ts = time.time()   # B4: recovery in progress — don't let the stall watchdog abort re-resolve
+            _reap_proc(proc)                                 # off-lock reap of the exited child
+            if s.cursor > s.cursor_at_last_death:            # R9: credit REAL playback advance (cursor
+                tries = 0                                    #     survives a False resume's edge=0),
+            s.cursor_at_last_death = s.cursor                #     cap only genuinely stuck streams
+            tries += 1
+            if tries > _RESUME_TRIES:
+                with s.cond:
+                    s.state = "FAIL"; s.cond.notify_all()
+                return
+            fresh = _reresolve(s.vid, s.itag, s.url)         # reuse the rate-limited 403 refresh
+            if fresh and _proxy_url_ok(fresh):
+                s.url = fresh
+            with s.cond:
+                if s.state == "DEAD" or gen != s.gen:
+                    return
+                if _RANGE_RESTART:                           # shipped: trust the Range, resume at edge
+                    s.dl_start = s.edge
+                else:                                        # fallback: re-download from 0; bytes
+                    s.origin = 0; s.edge = 0; s.dl_start = 0 #   re-pwritten at same offsets. cursor is
+                    s.edge_ts = time.time()                  #   preserved (serve position).
+            newproc = _spawn(s, s.dl_start)                  # R4: spawn into a local...
+            with s.cond:                                     # ...then commit under the DEAD/gen re-check
+                if s.state == "DEAD" or gen != s.gen:
+                    try: newproc.kill()
+                    except Exception: pass
+                    _reap_proc(newproc)                      # reader holds no lock -> inline wait ok
+                    return
+                s.proc = newproc                             # now a reap either kills this or we did
+    finally:
+        # ANY unhandled path terminates the stream cleanly, so blocked do_GETs wake, refs drain, and
+        # the reaper collects it — never leave state RUN behind a dead reader thread.
+        if wfd >= 0:
+            try: os.close(wfd)
+            except OSError: pass
+        with s.cond:
+            if s.state not in ("DONE", "DEAD"):
+                s.state = "FAIL"
+                s.cond.notify_all()
+
+
+def _acquire(vid, itag, url, ua, total, start):
+    """Return the _Stream that will serve bytes from `start`, creating / restarting as needed.
+    The ONLY place a seek (re)starts a yt-dlp process. Bumps refs (caller MUST drop it in a
+    finally). Returns None at capacity / low disk / no yt-dlp, so do_GET can answer 503.
+    refs is mutated under s.cond; acquire already holds _streams_lock and takes s.cond AFTER it,
+    preserving the _streams_lock -> s.cond order (no deadlock). (D1, D7, R1, R6, R7)"""
+    key = (vid, itag)
+    with _streams_lock:
+        s = _streams.get(key)
+        if s and s.state in ("RUN", "DONE") and s.origin <= start <= s.edge + _SEEK_SOON:
+            with s.cond:                                   # R1: reuse ONLY live/complete streams
+                s.refs += 1                                # R7: refs under s.cond (a FAIL stream falls
+                s.last_active = time.time()                #     through below and is rebuilt fresh)
+            return s
+        if s:                                              # DEAD/FAIL, far-forward, or below-origin
+            _reap_locked(s)
+            del _streams[key]
+        if len(_streams) >= _MAX_STREAMS:
+            _reap_one_idle_locked()
+        if len(_streams) >= _MAX_STREAMS or _free_bytes(_STREAM_DIR) < _MIN_FREE:
+            return None
+        if not _ytdlp_path():                              # D7: never build a _Stream we can't feed
+            return None
+        s = None
+        try:                                               # D7: guarded construction
+            s = _Stream(vid, itag, url, ua, total)         #     no orphaned fd / tempfile / proc
+            if _RANGE_RESTART:                             # responsive deep seek: download FROM start
+                s.origin = s.edge = s.cursor = start
+                s.dl_start = start
+                if start:
+                    os.ftruncate(s.fd, 0)                  # reclaim; [0,start) stays a free hole
+            else:                                          # fallback: download from 0, gate waits for
+                s.origin = s.edge = 0                      #   edge to reach the target. cursor=start
+                s.dl_start = 0                             #   anchors the read-ahead gate at the play
+                s.cursor = start                           #   position (D1) so the reader fills toward it
+            s.refs = 1                                     # R7: fresh object, uncontended
+            s.gen += 1
+            s.edge_ts = time.time()
+            s.proc = _spawn(s, s.dl_start)
+            threading.Thread(target=_reader, args=(s, s.gen), daemon=True).start()
+        except Exception as ex:
+            _plog("acquire failed: %r" % ex)
+            if s is not None:
+                if s.proc is not None:                     # R6: kill+queue a child spawned before the
+                    try: s.proc.kill()                     #     Thread.start() that raised (else it
+                    except Exception: pass                 #     blocks on its pipe until pdeathsig)
+                    with _reap_lock:
+                        _reap_pending.append(s.proc)       # R3/R5: wait() off-lock in the reaper
+                try: os.close(s.fd)
+                except Exception: pass
+                try: os.remove(s.path)
+                except OSError: pass
+            return None
+        _streams[key] = s
+        return s
+
+
+def _wait(s, pos):
+    """Bytes readable at `pos` right now, or None at clean EOF / failure / reap / stall. Blocks at
+    the live edge until the reader advances past `pos` (woken by its notify; 1 s liveness fallback).
+    The wait is ALWAYS timed and every terminal state returns None, so no path blocks forever (D8)."""
+    with s.cond:
+        while True:
+            if s.state == "DEAD":
+                return None
+            if s.origin <= pos < s.edge:
+                return s.edge - pos                        # on disk -> serve now
+            if s.state in ("DONE", "FAIL"):
+                return None                                # DONE: clean EOF; FAIL: short close (D11)
+            if pos < s.origin:
+                return None                                # below reclaimed origin (acquire restarts)
+            if s.state == "RUN" and pos >= s.edge and time.time() - s.edge_ts > _STALL:
+                return None                                # D8: edge stuck at the live edge -> give up
+            s.cond.wait(timeout=1.0)
+
+
+def _reap_locked(s):
+    """Tear a stream down. Caller holds _streams_lock and removes the key afterwards. state=DEAD,
+    the kill, AND the fd close all happen under s.cond, so a do_GET taking its per-connection os.dup
+    under the same cond either dups a still-valid fd or sees DEAD and bails — never dups a closed /
+    recycled fd. os.remove is immediate; POSIX keeps the inode alive for every outstanding dup.
+    NO proc.wait() here (R3/R5): the killed child is QUEUED to _reap_pending and reaped off-lock by
+    the reaper, so a wedged child never stalls the registry while _streams_lock is held. (D2, R3, R5)"""
+    with s.cond:
+        s.state = "DEAD"
+        s.cond.notify_all()                                # wake the reader + every do_GET
+        try:
+            if s.proc:
+                s.proc.kill()
+        except Exception:
+            pass
+        try:
+            os.close(s.fd)
+        except Exception:
+            pass
+        try:
+            os.remove(s.path)
+        except OSError:
+            pass
+    if s.proc:                                             # R3/R5: append is atomic; no wait() on-lock
+        with _reap_lock:
+            _reap_pending.append(s.proc)
+
+
+def _reap_one_idle_locked():
+    """Reap the least-recently-active idle (refs==0) stream to free a slot. Caller holds the lock.
+    refs / last_active are read under s.cond (R7); a stale read only delays a reap by one cycle."""
+    victim = None
+    for k, s in _streams.items():
+        with s.cond:
+            idle = s.refs <= 0
+            la = s.last_active
+        if idle and (victim is None or la < victim[2]):
+            victim = (k, s, la)
+    if victim:
+        _reap_locked(victim[1])
+        del _streams[victim[0]]
+
+
+def _reaper():
+    """Background: drain zombie children off-lock (R3/R5), then reap streams idle (no connection) past
+    _IDLE. Steady playback (foreground or background audio) always holds >=1 connection, so it is never
+    reaped; a seek drops refs to 0 for milliseconds << _IDLE. refs/last_active read under s.cond (R7)."""
+    global _reap_pending
+    while True:
+        time.sleep(_REAP_EVERY)
+        # R3/R5: reap SIGKILLed children here, holding NO lock, so a wedged child never stalls do_GET.
+        with _reap_lock:
+            pend = _reap_pending; _reap_pending = []
+        keep = []
+        for p in pend:
+            try:
+                if p.poll() is None: p.wait(timeout=1)     # brief; SIGKILL usually reaps in ms
+            except Exception: pass
+            try:
+                if p.poll() is None: keep.append(p)        # still not dead -> retry next cycle
+            except Exception: pass
+        if keep:
+            with _reap_lock:
+                _reap_pending.extend(keep)
+        now = time.time()
+        with _streams_lock:
+            for k, s in list(_streams.items()):
+                with s.cond:                               # R7: read refs/last_active under s.cond
+                    reap = s.refs <= 0 and now - s.last_active > _IDLE
+                if reap:
+                    _reap_locked(s)
+                    del _streams[k]
+
+
+def _sweep_all_streams():
+    """Kill every live stream and delete all stream-cache temp files. Run at proxy startup (mop up a
+    previous hard crash's leftovers) and via atexit (leave no orphaned yt-dlp child / temp file).
+    Drains _reap_pending with a blocking wait too — the process is exiting, so a short wait is fine
+    (R3/R5)."""
+    with _streams_lock:
+        for k, s in list(_streams.items()):
+            _reap_locked(s)
+            del _streams[k]
+    with _reap_lock:
+        pend = list(_reap_pending); _reap_pending[:] = []
+    for p in pend:
+        _reap_proc(p)
+    if not _STREAM_DIR:
+        return
+    import glob
+    for p in glob.glob(os.path.join(_STREAM_DIR, "s-*.dat")):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def release_playback(video_id, keep_itags=None):
+    """PyOtherSide entry, called from QML teardown (Component.onDestruction, nowPlaying
+    stopRequested, switchQuality / switchAudio). Reap every stream for this video whose itag is NOT
+    in keep_itags. Reaps regardless of refs — safe because each live do_GET serves from its OWN dup
+    (D2). Keyed off video_id, so it is correct even when the departing page tears down after the next
+    page's resolve()."""
+    keep = {str(i) for i in (keep_itags or [])}
+    with _streams_lock:
+        for k, s in list(_streams.items()):
+            if k[0] == video_id and k[1] not in keep:
+                _reap_locked(s)
+                del _streams[k]
+    return {"ok": True}
+
+
 class _MediaProxyHandler(http.server.BaseHTTPRequestHandler):
-    # libsoup (souphttpsrc) sends HTTP/1.1 requests; answer in kind. The body is
-    # close-delimited (Connection: close, no Content-Length), which is valid 1.1 and
-    # the framing souphttpsrc consumes most reliably.
+    # libsoup (souphttpsrc) sends HTTP/1.1 requests; answer in kind. Bytes come from a per-itag
+    # download job (_Stream): yt-dlp streams into a temp file, we serve preads gated by that file's
+    # live edge, so every seek reuses one bounded, backpressured download instead of re-fetching
+    # from zero. Body is close-delimited (Connection: close), the framing souphttpsrc accepts.
+    # do_GET NEVER takes _streams_lock: it only ever takes s.cond (alone), so the sole global lock
+    # ordering in the module stays _streams_lock -> s.cond with no hazard here (R7/R10).
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *args):
         pass  # keep the app log quiet
 
-    def _fetch(self, url, start, end, ua):
-        # Fetch [start,end] via googlevideo's DASH range QUERY parameter, NOT a Range
-        # header. A Range header gets an initial grace then 403s sustained pulling
-        # (~a minute in); the range= query param — what the web player and yt-dlp use —
-        # streams the whole file. `range` isn't signature-covered, so appending it to a
-        # signed URL is fine. Total length comes from clen= in the URL (see _clen).
-        # `ua` is the format's OWN User-Agent (android client URLs are bound to it — the
-        # proxy's old hardcoded Chrome UA got 403s once we moved off the SABR web client).
-        sep = "&" if "?" in url else "?"
-        ranged = "%s%srange=%d-%d" % (url, sep, start, end)
-        req = urllib.request.Request(ranged, headers={"User-Agent": ua})
-        return urllib.request.urlopen(req, timeout=30)
-
     def do_GET(self):
+        global _PUNCH_OK
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         target = q.get("u", [None])[0]
         video_id = q.get("v", [None])[0]
         itag = q.get("itag", [None])[0]
-        ua = q.get("ua", [None])[0] or _BROWSER_UA  # the format's client UA (see _fetch)
+        ua = q.get("ua", [None])[0] or _BROWSER_UA  # the format's client UA (googlevideo is UA-bound)
         if not target:
             self.send_error(400, "missing target")
             return
@@ -399,43 +824,47 @@ class _MediaProxyHandler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"bytes=(\d+)-", raw_range)
         if m:
             start = int(m.group(1))
-        _plog("REQ itag=%s range=%s" % (itag, raw_range or "none"))
-        written = 0
-        url = [target]  # mutable holder: swapped for a fresh URL on a mid-stream 403
+        total = _clen(target)  # googlevideo's full length, straight from the URL (authoritative)
+        _plog("REQ itag=%s range=%s total=%s" % (itag, raw_range or "none", total))
 
-        def fetch(s, e):
-            """Fetch bytes s..e, transparently refreshing the URL once on a 403."""
-            try:
-                return self._fetch(url[0], s, e, ua)
-            except urllib.error.HTTPError as ex:
-                if ex.code == 403 and video_id and itag:
-                    fresh = _reresolve(video_id, itag, url[0])
-                    if fresh and _proxy_url_ok(fresh):   # yt-dlp should return googlevideo; verify
-                        _plog("refresh itag=%s at byte %d (403)" % (itag, s))
-                        url[0] = fresh
-                        return self._fetch(fresh, s, e, ua)
-                raise
+        s = _acquire(video_id, itag, target, ua, total, start)
+        if s is None:
+            self.send_error(503, "no stream capacity")   # too many streams, low disk, or no yt-dlp
+            return
+
+        # D1 (WARM reuse): anchor the read-ahead gate at (or past) our start. A forward seek into
+        # (edge, edge+_SEEK_SOON] reuses a stream whose cursor still sits below edge; without this
+        # the reader stays pinned at its cap and we'd block forever.
+        with s.cond:
+            if start > s.cursor:
+                s.cursor = start
+                s.cond.notify_all()
+
+        # D2: take our OWN dup of the fd, under s.cond, re-checking the stream wasn't just reaped.
+        # Every os.pread / os.fallocate below uses cfd; POSIX keeps the inode alive until we close it
+        # in finally, so a concurrent _reap_locked (release_playback / seek restart) can never make
+        # us touch a recycled fd.
+        cfd = -1
+        with s.cond:
+            if s.state != "DEAD":
+                try:
+                    cfd = os.dup(s.fd)
+                except OSError:
+                    cfd = -1
+        if cfd < 0:
+            with s.cond:                     # R7/R10: refs under s.cond (do_GET never takes _streams_lock)
+                s.refs -= 1
+                s.last_active = time.time()
+            self.send_error(503, "stream gone")
+            return
 
         try:
-            total = _clen(target)  # googlevideo's full length, straight from the URL
-            first = fetch(start, start + _CHUNK - 1)
-            if total is None:  # non-googlevideo fallback: derive it from the response
-                cr = re.search(r"/(\d+)\s*$", first.headers.get("Content-Range", ""))
-                if cr:
-                    total = int(cr.group(1))
-            ctype = first.headers.get("Content-Type", "application/octet-stream")
-            _plog("GET start=%d first_status=%s total=%s ctype=%s"
-                  % (start, first.status, total, ctype))
-
-            # Close-delimited framing: no Content-Length, Connection: close, stream the
-            # whole thing then drop the socket so libsoup reads to EOF. This is the one
-            # transfer mode souphttpsrc accepts unconditionally; Content-Length responses
-            # (1.0 and 1.1, 200 and 206) all got rejected with wrote=0.
-            # Send a real Content-Length (and 206/Content-Range when the client asked for
-            # a range) so souphttpsrc knows the stream size and reports it seekable — that
-            # is what lets the demuxer honour scrubbing. Body is still terminated by
-            # Connection: close, the framing we know souphttpsrc accepts. Content-Length is
-            # exact: we stream precisely total-start bytes below.
+            # Framing: 206 + Content-Range/Content-Length when the client sent a Range and total is
+            # known; 200 + Content-Length when total known and no Range; bare close-delimited 200
+            # when total is unknown (no clen=, non-seekable). Content-Type is generic — decodebin
+            # typefinds the container. NOTE (D11): if a stream goes FAIL after these headers are sent,
+            # the body closes short (truncated 206); inherent, minimised by the D5/R9 resume logic.
+            ctype = "application/octet-stream"
             if total is not None and raw_range:
                 self.send_response(206)
                 self.send_header("Content-Type", ctype)
@@ -455,30 +884,53 @@ class _MediaProxyHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
 
             pos = start
-            data = first.read()
-            first.close()
-            self.wfile.write(data)
-            written += len(data)
-            pos += len(data)
-            while total is not None and pos < total:
-                end = min(pos + _CHUNK, total) - 1
-                nxt = fetch(pos, end)
-                data = nxt.read()
-                nxt.close()
+            written = 0
+            while total is None or pos < total:
+                n = _wait(s, pos)                # readable bytes at pos, or None at EOF/fail/reap/stall
+                if n is None:
+                    break
+                data = os.pread(cfd, min(_SESS_CHUNK, n), pos)   # D2: from our private dup
                 if not data:
                     break
                 self.wfile.write(data)
-                written += len(data)
                 pos += len(data)
+                written += len(data)
+                with s.cond:
+                    if pos > s.cursor:           # advance the read-ahead gate -> reader may fetch on
+                        s.cursor = pos
+                        s.cond.notify_all()
+                    # R7/R10: reclaim the consumed prefix in place, but ONLY when THIS is the sole
+                    # connection (s.refs == 1), checked atomically with the punch under s.cond. refs
+                    # can only rise to 2 by another thread taking s.cond, so no second reader can
+                    # appear mid-punch; with refs==1 there is exactly one reader (this do_GET) at
+                    # pos==cursor, so punching [origin, cursor-_KEEPBACK) never touches a live byte.
+                    # refs>1 (transient seek overlap) simply skips the punch until it drops back to 1:
+                    # bounded extra disk, never zeros. Best-effort on cfd (a valid dup even if s.fd
+                    # was just reaped); disabled permanently on first failure. (D3)
+                    if _PUNCH_OK and s.refs == 1 and pos - s.origin > _KEEPBACK:
+                        new_origin = pos - _KEEPBACK
+                        try:
+                            os.fallocate(cfd, _FALLOC_PUNCH | _FALLOC_KEEP,
+                                         s.origin, new_origin - s.origin)
+                            s.origin = new_origin
+                        except Exception:
+                            _PUNCH_OK = False   # degrade to full-file; never crash
+                    s.last_active = time.time()
             self.wfile.flush()
             _plog("DONE start=%d wrote=%d" % (start, written))
         except (BrokenPipeError, ConnectionResetError):
-            # player closed the connection (seek/stop) — normal. wrote=0 here means
-            # souphttpsrc rejected our response outright, which is the bug to watch for.
-            _plog("CLIENT-CLOSED start=%d wrote=%d" % (start, written))
+            _plog("CLIENT-CLOSED start=%d" % start)   # player seeked/stopped — normal; stream kept
         except Exception as ex:
-            _plog("proxy error start=%d wrote=%d: %r" % (start, written, ex))
+            _plog("proxy error start=%d: %r" % (start, ex))
             self.close_connection = True
+        finally:
+            try:
+                os.close(cfd)                   # D2: release our dup; inode freed at the last close
+            except OSError:
+                pass
+            with s.cond:                        # R7/R10: refs under s.cond, single-lock, no _streams_lock
+                s.refs -= 1
+                s.last_active = time.time()
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -486,20 +938,31 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def _ensure_proxy():
-    """Start the localhost proxy once; return its port."""
-    global _proxy_port
+    """Start the localhost proxy once; return its port. Also prepares the stream cache
+    (<data_dir>/streamcache), sweeps any temp files a prior hard crash left, starts the idle reaper,
+    and registers an atexit sweep so no yt-dlp child or temp file is ever orphaned. The _force_ipv4()
+    call is retired — the proxy no longer does urllib googlevideo fetches; yt-dlp carries -4 itself
+    (the function stays for its 9 other callers)."""
+    global _proxy_port, _STREAM_DIR
     with _proxy_lock:
         if _proxy_port:
             return _proxy_port
-        _force_ipv4()  # else every upstream fetch stalls ~30s on dead IPv6
         if _DEBUG:
             try:
                 open("/tmp/youfish-proxy.log", "w").close()  # fresh log each app run
             except Exception:
                 pass
+        _STREAM_DIR = os.path.join(_data_dir(), "streamcache")
+        try:
+            os.makedirs(_STREAM_DIR, exist_ok=True)
+        except Exception:
+            pass
+        _sweep_all_streams()  # remove s-*.dat left behind by a previous hard crash
         server = _ThreadingHTTPServer(("127.0.0.1", 0), _MediaProxyHandler)
         _proxy_port = server.server_address[1]
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=_reaper, daemon=True).start()
+        atexit.register(_sweep_all_streams)
         return _proxy_port
 
 
@@ -556,7 +1019,8 @@ def _ytdlp_formats(video_id):
             proc = subprocess.run([path, *_COMMON_ARGS, *cargs, *_pot_ytdlp_args(),
                                    *_yt_extractor_args(want_pot=True),
                                    "--dump-single-json", "--", url],
-                                  capture_output=True, text=True, timeout=90)
+                                  capture_output=True, text=True, timeout=90,
+                                  preexec_fn=_set_pdeathsig)   # D6: die with the app if abandoned
         if proc.returncode != 0:
             return {}
         data = json.loads(proc.stdout)
@@ -587,14 +1051,239 @@ def _reresolve(video_id, itag, failed_url):
         fresh = _ytdlp_formats(video_id)
         if not fresh:
             return None
-        if _DEBUG:   # the WARM re-resolve's token for the exact itag that 403'd — MISSING→len flip = Cause A
-            _tlog("reresolve itag=%s %s" % (itag, _pot_of(fresh.get(itag, ""))))
+        if _DEBUG:   # the WARM re-resolve's token + client for the exact itag that 403'd
+            _tlog("reresolve itag=%s %s client=%s"
+                  % (itag, _pot_of(fresh.get(itag, "")), _default_client() or "auto"))
         _url_cache[video_id] = {"ts": time.time(), "fmts": fresh}
         if len(_url_cache) > _URL_CACHE_MAX:  # evict oldest beyond the cap
             for k, _ in sorted(_url_cache.items(),
                                key=lambda kv: kv[1]["ts"])[:len(_url_cache) - _URL_CACHE_MAX]:
                 _url_cache.pop(k, None)
         return fresh.get(itag)
+
+
+# --------------------------------------------------------------------------- #
+# Resolve-RESULT cache + single-flight + speculative prefetch.  (REBUILD #1)
+#
+# Distinct from _url_cache (mid-stream 403 refresh). Stores the FULL {ok, info}
+# resolve() payload keyed by (video_id + every setting that changes the output),
+# stamped with a freshness deadline from the googlevideo `expire=` in the URLs.
+# prefetch_resolve() fills it on a background thread; the cache-first resolve()
+# front-door reads it (instant hit), JOINS an in-flight resolve rather than
+# double-spawning, else resolves for real and caches a usefully-fresh success.
+# --------------------------------------------------------------------------- #
+_resolve_cache = {}                        # key -> {"payload": {ok,info}, "good_until": epoch, "ts": epoch}
+_resolve_cache_lock = threading.Lock()
+_resolve_inflight = {}                     # key -> threading.Event (leader signals joiners)
+_RESOLVE_CACHE_MAX = 24
+_RESOLVE_CACHE_MAX_TTL = 20 * 60           # never trust an entry longer than this, even if expire is hours out
+_RESOLVE_SAFETY = 120                      # drop an entry this many secs BEFORE its URLs actually expire
+# D1: join ceiling. _resolve_uncached runs up to TWO subprocess.run(timeout=90) dumps
+# (primary + widen retry), so ~180s worst case. The joiner must wait PAST that, never
+# time out early and launch a second resolve. 200s covers 2x90s + margin.
+_RESOLVE_JOIN_TIMEOUT = 200
+
+_prefetch_sema = threading.BoundedSemaphore(2)   # <=2 speculative yt-dlp jobs at once (no swarm)
+_prefetch_pending = set()                  # keys queued/running as prefetch (debounce)
+_prefetch_lock = threading.Lock()
+
+_EXPIRE_RE = re.compile(r"(?:[?&]|%26|%3F|/)expire(?:=|/|%3D)(\d{9,11})", re.IGNORECASE)
+
+# D10: settings keys that change resolve()'s OUTPUT — a change to any of these drops the cache.
+_RESOLVE_OUTPUT_KEYS = ("default_quality", "audio_lang", "hw_decode",
+                        "player_client", "pot_provider")
+
+
+def _expire_ts(u):
+    """googlevideo `expire` unix-ts out of a URL — raw OR embedded/quoted in a proxied `u=`
+    param (where the real validity clock lives). 0 if none (HLS / odd shape)."""
+    if not u:
+        return 0
+    m = _EXPIRE_RE.search(u) or _EXPIRE_RE.search(urllib.parse.unquote(u))
+    return int(m.group(1)) if m else 0
+
+
+def _good_until(info):
+    """Earliest picked-URL expiry minus a safety margin, capped at a sane max. resolve() never
+    parses expire, so we do it here over muxed/video/audio URLs."""
+    now = time.time()
+    exps = [e for e in (_expire_ts(info.get("muxed_url")),
+                        _expire_ts(info.get("video_url")),
+                        _expire_ts(info.get("audio_url"))) if e]
+    if not exps:                           # HLS-only / no parseable expire -> short conservative TTL
+        return now + 5 * 60
+    return min(min(exps) - _RESOLVE_SAFETY, now + _RESOLVE_CACHE_MAX_TTL)
+
+
+def _signed_in():
+    """Coarse login state for the cache key (a login change alters extraction -> invalidates)."""
+    try:
+        import ytm
+        return bool(ytm.netscape_cookies())
+    except Exception:
+        return False
+
+
+def _resolve_key(video_id):
+    """video_id PLUS every hidden input that changes resolve()'s output. caption_lang /
+    sponsorblock / hide_* are excluded — they don't affect the returned URLs."""
+    s = get_settings()
+    return "\x1f".join((
+        str(video_id),
+        _default_client() or "auto",               # player_client (effective) — client + UA + ladder
+        "1" if _pot_active() else "0",              # PO provider active -> flips client/token path
+        str(s.get("default_quality") or 0),         # video-rung cap
+        (s.get("audio_lang") or "").lower(),        # dub language
+        "1" if s.get("hw_decode") else "0",         # VP9<->H.264 codec preference
+        "1" if _signed_in() else "0",               # login -> age/members/premium extraction
+    ))
+
+
+def _evict_resolve_cache_locked():
+    if len(_resolve_cache) <= _RESOLVE_CACHE_MAX:
+        return
+    victims = sorted(_resolve_cache.items(), key=lambda kv: kv[1]["ts"])[
+        :len(_resolve_cache) - _RESOLVE_CACHE_MAX]
+    for k, _ in victims:
+        _resolve_cache.pop(k, None)
+
+
+def _resolve_cache_get(key):
+    now = time.time()
+    with _resolve_cache_lock:
+        ent = _resolve_cache.get(key)
+        if ent and ent["good_until"] > now:
+            return ent["payload"]
+        if ent:
+            _resolve_cache.pop(key, None)          # expired -> drop
+    return None
+
+
+def invalidate_resolve_cache():
+    """Clear the whole resolve cache. Called on any output-affecting settings change and on
+    login/logout (cheap — small dict, refills on demand)."""
+    with _resolve_cache_lock:
+        _resolve_cache.clear()
+
+
+def _resolve_and_cache(video_id, key=None, speculative=False):
+    """The one place a resolve actually happens. Cache hit -> instant. An in-flight resolve for
+    the SAME key -> JOINED (waited on), never double-spawned. Else run the real _resolve_uncached
+    and cache a fresh, non-live, full-ladder success. Runs the subprocess on WHATEVER thread calls
+    it, so the prefetch path MUST call it from a background thread (never the worker).
+
+    `speculative` is threaded for triggers (b)/(c) (D9): unused in #1, behaviour identical. Later
+    it will skip the widen retry (I9) and cap good_until (I12); do NOT branch on it yet."""
+    if key is None:
+        key = _resolve_key(video_id)
+
+    hit = _resolve_cache_get(key)
+    if hit is not None:
+        return hit
+
+    with _resolve_cache_lock:
+        ev = _resolve_inflight.get(key)
+        if ev is None:
+            ev = threading.Event()
+            _resolve_inflight[key] = ev
+            leader = True
+        else:
+            leader = False
+
+    if not leader:                                 # ---- JOIN the in-flight resolve (D1) ----
+        if not ev.wait(_RESOLVE_JOIN_TIMEOUT):     # wait PAST the leader's 2x90s ceiling
+            hit = _resolve_cache_get(key)          # timed out (near-impossible): re-check cache
+            if hit is not None:
+                return hit
+            # NEVER launch a second subprocess. The leader is about to populate; a soft error
+            # lets QML retry — cheaper than a 2x resolve. (D1)
+            return {"ok": False, "error": "still resolving"}
+        hit = _resolve_cache_get(key)
+        if hit is not None:
+            return hit
+        # Leader finished but cached nothing (failure / live / degraded / stale key). Rare
+        # single double-spawn on the non-cacheable path only — acknowledged, not a swarm leak.
+        return _resolve_uncached(video_id)
+
+    try:                                            # ---- LEADER ----
+        payload = _resolve_uncached(video_id)
+        if payload.get("ok"):
+            info = payload.get("info") or {}
+            key2 = _resolve_key(video_id)                       # D2: recompute AFTER the resolve
+            full_ladder = bool((info.get("video_url") and info.get("audio_url"))
+                               or info.get("qualities"))         # D4: HD pair or a real ladder
+            cacheable = (key2 == key                             # D2: world didn't move under us
+                         and not info.get("is_live")             # D3: never cache live
+                         and full_ladder)                        # D4: never cache muxed-only
+            if cacheable:
+                gu = _good_until(info)
+                if gu > time.time() + 5:                         # only store something worth serving
+                    with _resolve_cache_lock:
+                        _resolve_cache[key] = {"payload": payload,
+                                               "good_until": gu, "ts": time.time()}
+                        _evict_resolve_cache_locked()
+        # Failure / live / degraded / stale-key: returned to the immediate caller, NOT cached
+        # (a transient bot-wall or SABR-thin window must re-resolve fresh on the next tap).
+        return payload
+    finally:
+        with _resolve_cache_lock:
+            _resolve_inflight.pop(key, None)
+        ev.set()
+
+
+def prefetch_resolve(video_id, speculative=False):
+    """PyOtherSide entry: kick a speculative resolve on a BACKGROUND thread, return instantly.
+    Deduped (one per key), capped at 2 concurrent spawns. A key already fresh in cache, already
+    in flight, or over the cap is a fast no-op. `speculative` is the (b)/(c) seam (D9)."""
+    if not video_id:
+        return {"ok": True, "queued": False}
+    key = _resolve_key(video_id)
+
+    if _resolve_cache_get(key) is not None:
+        return {"ok": True, "queued": False, "cached": True}
+
+    with _prefetch_lock:
+        if key in _prefetch_pending:
+            return {"ok": True, "queued": False, "inflight": True}
+        _prefetch_pending.add(key)
+
+    def _bg():
+        # D7: a throwaway prefetch thread must NEVER be the one to START/restart the POT sidecar
+        # — PR_SET_PDEATHSIG arms against THIS short-lived thread, so the kernel would SIGKILL the
+        # sidecar the instant _bg returns, sabotaging the worker's token source. Defer to prewarm's
+        # parked, correctly-armed thread and skip this speculative attempt (it warms on the next
+        # prefetch or the real foreground tap).
+        if _pot_active() and not _pot_ready_on_port():
+            try:
+                prewarm()
+            except Exception:
+                pass
+            with _prefetch_lock:
+                _prefetch_pending.discard(key)
+            return
+        # Non-blocking acquire = DROP at the 2-spawn ceiling (don't queue a swarm).
+        if not _prefetch_sema.acquire(blocking=False):
+            with _prefetch_lock:
+                _prefetch_pending.discard(key)
+            return
+        try:
+            _resolve_and_cache(video_id, key, speculative=speculative)
+        except Exception:
+            pass
+        finally:
+            _prefetch_sema.release()
+            with _prefetch_lock:
+                _prefetch_pending.discard(key)
+
+    try:
+        threading.Thread(target=_bg, daemon=True).start()
+    except Exception:
+        # D5: thread/FD exhaustion under a scroll burst — discard the key so a failed start can't
+        # wedge this video as permanently "pending" (mirrors _bg's finally).
+        with _prefetch_lock:
+            _prefetch_pending.discard(key)
+        return {"ok": False, "queued": False, "error": "spawn failed"}
+    return {"ok": True, "queued": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -1955,6 +2644,13 @@ def _caption_tracks(data):
 
 
 def resolve(video_id):
+    """Cache-first resolve. Returns a fresh cached result instantly; joins an in-flight prefetch
+    for the SAME key instead of spawning a second yt-dlp; else resolves and caches. Same
+    {ok, info|error} shape — every caller (Backend.resolve) is unchanged."""
+    return _resolve_and_cache(video_id)
+
+
+def _resolve_uncached(video_id):
     """Resolve a video to playable stream URLs.
 
     `muxed_url` (single stream, routed through the local proxy) feeds the prototype
@@ -1978,7 +2674,8 @@ def resolve(video_id):
             proc = subprocess.run(
                 [path, *_COMMON_ARGS, *cargs, *_pot_ytdlp_args(), *extra,
                  "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=90)
+                capture_output=True, text=True, timeout=90,
+                preexec_fn=_set_pdeathsig)   # D6: SIGKILL an orphaned prefetch child with the app
         _tlog("dump %.2fs rc=%d" % (time.time() - _td, proc.returncode))
         if proc.returncode != 0:
             return None, (proc.stderr.strip()[:300] or "resolve failed")
@@ -1996,6 +2693,7 @@ def resolve(video_id):
         return bool(_pick(fs, _MUXED_ITAGS) or _hd_pair(d))
 
     try:
+        _client_used = _default_client() or "auto"   # which client actually produced the URLs (debug)
         data, err = _dump(_yt_extractor_args(want_pot=True))
         # A hard failure (data is None) is usually YouTube's "confirm you're not a bot" check
         # tripping this client — retry once with the wider set. tv/android_vr use different
@@ -2003,19 +2701,19 @@ def resolve(video_id):
         if data is None:
             data2, err2 = _dump(_yt_extractor_args(client_override=_RETRY_CLIENTS, want_pot=True))
             if data2 is not None:
-                data = data2
+                data = data2; _client_used = _RETRY_CLIENTS + "(widen)"
             else:
                 err = err or err2
-        # The primary (web_embedded) usually returns the full fetchable ladder. If SABR
+        # The primary (mweb) usually returns the full fetchable ladder. If SABR
         # degraded it to muxed-only (no HD dual-source pair), widen the client net once to
         # hunt for a fetchable HD pair elsewhere — only switch if the result is actually
         # better (HD found, or the primary had nothing playable at all).
         elif not _hd_pair(data):
             data2, _ = _dump(_yt_extractor_args(client_override=_RETRY_CLIENTS, want_pot=True))
             if data2 is not None and _hd_pair(data2):
-                data = data2
+                data = data2; _client_used = _RETRY_CLIENTS + "(widen)"
             elif data2 is not None and not _playable(data) and _playable(data2):
-                data = data2
+                data = data2; _client_used = _RETRY_CLIENTS + "(widen)"
         if data is None:
             return {"ok": False, "error": err}
         formats = data.get("formats", [])
@@ -2036,9 +2734,10 @@ def resolve(video_id):
         # from one client, so a single UA covers them.
         http_ua = ((video or audio or muxed or {}).get("http_headers") or {}).get(
             "User-Agent", "") or _BROWSER_UA
-        if _DEBUG:   # instant-403 probe: does the COLD dump's URL carry a valid streaming pot= token?
-            _tlog("resolve picks: v=%s %s | a=%s %s | m=%s %s"
-                  % ((video or {}).get("format_id"), _pot_of((video or {}).get("url", "")),
+        if _DEBUG:   # instant-403 probe: which client, and does the COLD dump carry a valid pot= token?
+            _tlog("resolve picks [client=%s]: v=%s %s | a=%s %s | m=%s %s"
+                  % (_client_used,
+                     (video or {}).get("format_id"), _pot_of((video or {}).get("url", "")),
                      (audio or {}).get("format_id"), _pot_of((audio or {}).get("url", "")),
                      (muxed or {}).get("format_id"), _pot_of((muxed or {}).get("url", ""))))
             if _pot_active():   # a first-mint crash/OOM shows here as an exit-code line between dumps
@@ -2519,7 +3218,7 @@ _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
                       # (jsdom degrades gracefully without it).
                       "pot_provider": False, "pot_needs_ffi": False}
 
-# Widened client net, tried in ONE extra yt-dlp pass when the primary (web_embedded) comes
+# Widened client net, tried in ONE extra yt-dlp pass when the primary (mweb) comes
 # back SABR-thin (no fetchable HD pair). yt-dlp queries them all and merges formats; the
 # url-presence filter in _pick keeps only the ones a SABR client can't serve. Unknown names
 # are skipped with a warning, never a hard error, so a broad net here is safe.
@@ -2556,21 +3255,27 @@ def set_setting(key, value):
         os.chmod(path, 0o600)     # owner-only (privacy)
     except Exception:
         pass
+    if key in _RESOLVE_OUTPUT_KEYS:      # D10: an output-affecting change drops cached resolves
+        invalidate_resolve_cache()
     return get_settings()
 
 
 def _default_client():
     """Which YouTube client resolve() uses by default.
 
-    A user-set player_client always wins. Otherwise, when the PO-token provider is active we
-    use `web_embedded`: it dodges YouTube's SABR experiment (which strips the adaptive DASH
-    URLs from the web/web_safari clients yt-dlp auto-picks) and returns the full, actually
-    range-fetchable HD ladder once the token unlocks it. With no provider we leave yt-dlp on
-    its own auto pick. resolve() widens to _RETRY_CLIENTS if this comes back SABR-thin."""
+    A user-set player_client always wins. Otherwise, when the PO-token provider is active we use
+    `mweb`: it returns the full range-fetchable HD ladder (no SABR), natively requires a GVS PO token
+    (so our fetch_pot=always mint is honoured), AND — unlike `web_embedded` — it is NOT in YouTube's
+    "bind GVS PO Token to video id" experiment. web_embedded WAS the default, but measured on-device
+    (2026-09-02): a whole class of videos (those served DRC audio) had every freshly-minted valid
+    web_embedded token REJECTED at byte 0, forcing 3-4 re-extractions (~17s) before one stuck; the
+    identical videos play clean first-try in HD on mweb. With no provider mweb would 403 (it needs the
+    token), so we fall back to yt-dlp's own auto pick. resolve() widens to _RETRY_CLIENTS if this comes
+    back SABR-thin (that set still carries tv/android/android_vr + web_embedded's cousins)."""
     c = (get_settings().get("player_client") or "").strip()
     if c and c.lower() != "auto":
         return c
-    return "web_embedded" if _pot_active() else ""
+    return "mweb" if _pot_active() else ""
 
 
 def _yt_extractor_args(client_override=None, want_pot=False):
@@ -2584,12 +3289,14 @@ def _yt_extractor_args(client_override=None, want_pot=False):
     if client and client.lower() != "auto":
         parts.append("player_client=" + client)
     # fetch_pot=always forces yt-dlp to actually mint a PO token even for clients it marks GVS-token
-    # OPTIONAL. web_embedded (our default) has NO GVS-token policy → yt-dlp treats it as required=False
-    # → under the default fetch_pot=auto it EARLY-RETURNS without ever contacting the provider, so no
-    # token is minted and the stream URLs 403 under YouTube's "bind GVS PO Token to video id for
-    # web_embedded" experiment (yt-dlp PR #14471). fetch_pot=always defeats that gate. Only on the
-    # paths that build/stream formats (resolve, re-resolve, download) and only when the provider is
-    # active — NOT the --flat-playlist metadata passes, where a mint is pure wasted BotGuard latency.
+    # OPTIONAL. Our default (mweb) marks it required=True and would fetch anyway, but this is kept as a
+    # belt-and-braces safety net: a client with NO GVS-token policy (e.g. web_embedded — the former
+    # default) defaults to required=False, and under fetch_pot=auto yt-dlp EARLY-RETURNS without ever
+    # contacting the provider → no token → the URLs 403 under YouTube's "bind GVS PO Token to video id"
+    # experiment (yt-dlp PR #14471). fetch_pot=always defeats that gate for any such client (incl. the
+    # _RETRY_CLIENTS widen). Only on the paths that build/stream formats (resolve, re-resolve, download)
+    # and only when the provider is active — NOT the --flat-playlist metadata passes, where a mint is
+    # pure wasted BotGuard latency.
     if want_pot and _pot_active():
         parts.append("fetch_pot=always")
     return ["--extractor-args", "youtube:" + ";".join(parts)] if parts else []
@@ -3204,17 +3911,21 @@ def youtube_import_login():
     """Import the signed-in session from the Sailfish Browser cookie jar (see ytm)."""
     try:
         import ytm
-        return ytm.import_browser_login()
+        res = ytm.import_browser_login()
     except Exception as ex:
         return {"ok": False, "count": 0, "error": str(ex)}
+    invalidate_resolve_cache()    # D10: login changes extraction (age/members/premium)
+    return res
 
 
 def youtube_logout():
     try:
         import ytm
-        return ytm.logout()
+        res = ytm.logout()
     except Exception:
-        return {"logged_in": False}
+        res = {"logged_in": False}
+    invalidate_resolve_cache()    # D10: logout changes extraction
+    return res
 
 
 def _np_query(con, sql):

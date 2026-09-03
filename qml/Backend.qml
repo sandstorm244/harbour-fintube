@@ -107,6 +107,22 @@ Item {
         })
     }
 
+    // Speculative resolve: warm the resolve-result cache on a background Python thread so a later
+    // resolve(videoId) returns instantly (or joins the in-flight prefetch). Fire-and-forget — never
+    // blocks, safe to spam (Python dedupes + caps concurrency). resolve() itself is unchanged.
+    function prefetchResolve(videoId) {
+        if (!videoId) return
+        py.call("youfish.prefetch_resolve", [videoId], function() {})
+    }
+
+    // Tell the engine a video's playback is being torn down (or a track swapped) so it can kill the
+    // backing yt-dlp download(s) and delete the temp file(s). keepItags stay alive (the still-playing
+    // tracks after a quality/audio switch, or the audio itag when backgrounding).
+    function releasePlayback(videoId, keepItags) {
+        if (!videoId) return
+        py.call("youfish.release_playback", [videoId, keepItags || []], function() {})
+    }
+
     // Lightweight metadata for the info-only view (no playback) — title, channel, description,
     // chapters, stats. Result {ok, info|error} straight to the caller's callback. Works even when
     // the video isn't playable here (geo-blocked / bot-walled), unlike resolve().
@@ -443,6 +459,13 @@ Item {
 
     // --- Downloads (background, progress via pyotherside events) ---
     function download(videoId, title, kind) {
+        // Guard + log: a silent no-op download (e.g. a context-menu item passing an empty id) is
+        // otherwise invisible — this makes it obvious in the log, for us and for user bug reports.
+        if (!videoId) {
+            console.log("FinTube: download() IGNORED — empty videoId (kind=" + kind + ", title=" + (title || "") + ")")
+            return
+        }
+        console.log("FinTube: download start id=" + videoId + " kind=" + kind)
         py.call("youfish.download", [videoId, title || "", kind], function() {})
     }
     function loadDownloads() {

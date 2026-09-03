@@ -266,14 +266,15 @@ void VideoPlayer::sendSeek(qint64 positionMs)
     // own uridecodebin. A single pipeline-level seek only reaches one branch and returns
     // FALSE, so send the flush-seek to BOTH sinks — each carries it up its own branch to
     // that branch's source, keeping the two tracks aligned.
-    // ACCURATE, *not* KEY_UNIT: the branches seek independently, so KEY_UNIT would snap the
-    // video-only stream to its nearest keyframe (YouTube DASH GOPs are seconds apart) while
-    // the audio stream lands ~exactly on t — leaving lip-sync off by up to a GOP after every
-    // scrub. ACCURATE makes both land on the identical timestamp (the video decoder decodes
-    // and discards up to t), so they stay aligned. The extra decode is trivial: both streams
-    // are already downloadbuffered to disk, so it's a local seek + a few frames.
-    // Carry m_rate on the seek so scrubbing keeps the chosen playback speed instead of
-    // snapping back to 1.0. scaletempo on the audio branch keeps pitch natural.
+    // Both branches are WebM/matroskademux now (VP9 video + Opus audio, see _audio_candidates in
+    // youfish.py), each fed by its own uridecodebin — so send the flush-seek to BOTH sinks; each
+    // carries it up its own branch to that branch's source. FLUSH|ACCURATE lands both on the IDENTICAL
+    // timestamp t (matroskademux decodes-and-discards to the exact sample), keeping lip-sync tight.
+    // matroskademux push-seeks accurately over the range-seekable proxy, so neither branch needs a
+    // downloadbuffer. (History: audio used KEY_UNIT while it was AAC/qtdemux — qtdemux won't push-seek
+    // on this platform at all; and on WebM, KEY_UNIT snapped audio to its nearest CLUSTER, seconds
+    // before t, desyncing despite "audio= 1". ACCURATE fixes that.)
+    // Carry m_rate so scrubbing keeps the chosen speed; scaletempo on the audio branch keeps pitch.
     const GstSeekFlags dflags =
         (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE);
     gboolean vok = FALSE, aok = FALSE;
@@ -433,17 +434,14 @@ void VideoPlayer::buildPipeline()
         if (m_audioBin)
             g_object_set(m_audioBin, "buffer-duration", (gint64)(3 * GST_SECOND), nullptr);
 
-        // Buffer the network stream to a temp file (downloadbuffer) rather than a memory
-        // ring. That gives the demuxer random access, so qtdemux activates in PULL mode and
-        // can actually seek — in push mode it flatly "ignores seek in push mode".
-        if (g_object_class_find_property(G_OBJECT_GET_CLASS(m_videoBin), "download")) {
-            g_object_set(m_videoBin, "download", TRUE, nullptr);
-            if (m_audioBin)
-                g_object_set(m_audioBin, "download", TRUE, nullptr);
-            YLOG << "[youfish] download buffering enabled (for seek)";
-        } else {
-            YLOG << "[youfish] no download property — seek may stay push-mode";
-        }
+        // BOTH bins seek in PUSH mode over the range-seekable proxy: no downloadbuffer, no eager
+        // whole-file pull (the audio downloadbuffer used to greedily fetch the entire track before
+        // preroll). Video uses an ACCURATE seek (lands exactly on t); AUDIO uses a KEY_UNIT seek
+        // (see sendSeek) which qtdemux's push-mode path accepts where it rejects ACCURATE -> audio no
+        // longer needs a downloadbuffer. SELF-DIAGNOSING: if a build's qtdemux still returns "audio= 0"
+        // on the KEY_UNIT push-seek (watch the sendSeek log), revert this patch to restore download=TRUE
+        // on m_audioBin (the whole-audio greedy prefetch is the price of reliable audio seeking there).
+        YLOG << "[youfish] push-mode seek both bins (audio KEY_UNIT); no downloadbuffer";
     } else {
         YLOG << "[youfish] local file — skipping network buffering (native pull-mode seek)";
     }
