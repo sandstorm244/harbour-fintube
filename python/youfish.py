@@ -4086,6 +4086,18 @@ def _subs_path():
 # Settings (a small JSON file the app owns) + Shorts filtering.
 # --------------------------------------------------------------------------- #
 _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
+                      # Per-category SponsorBlock action: "skip" (auto-skip), "manual" (show a
+                      # tap-to-skip button), or absent/"off" (ignore). Historically only these three
+                      # were auto-skipped; every other fetched category stays off until the user
+                      # opts in on the SponsorBlock page. Applied client-side (see VideoPage), so it
+                      # is NOT a resolve-output key.
+                      "sponsorblock_actions": {"sponsor": "skip", "selfpromo": "skip",
+                                               "interaction": "skip"},
+                      # Which signed-in Google LOGIN yt-dlp acts as for account-scoped imports
+                      # (subscriptions / playlists). Applied as ?authuser=N on those URLs; 0 = the
+                      # first/default account. yt-dlp derives session index + channel from the page
+                      # it gets back, so this only switches between separate Google LOGINS — not
+                      # brand-account channels within one login (yt-dlp exposes no hook for those).
                       # Hide already-watched videos from the subscription feed + channel lists.
                       "hide_watched": False,
                       # Max watch-history entries kept; the oldest are dropped past this. User-set.
@@ -4544,8 +4556,12 @@ def set_watched(video_id, watched=True, title="", channel=""):
     return {"ok": True, "watched": 1 if watched else 0}
 
 
-# Categories we skip. selfpromo + interaction (subscribe/like reminders) go with sponsors.
-_SB_CATEGORIES = '["sponsor","selfpromo","interaction"]'
+# SponsorBlock categories we ASK the API for. What actually happens to each segment (auto-skip,
+# show a manual skip button, or ignore) is a per-category CLIENT setting (`sponsorblock_actions`,
+# applied by the player) — so we fetch the whole skippable set here and let the UI decide. Widening
+# this list only changes what's *available* to configure; unconfigured categories default to off.
+_SB_CATEGORIES = ('["sponsor","selfpromo","interaction","intro","outro","preview",'
+                  '"filler","music_offtopic"]')
 
 
 def sponsor_segments(video_id):
@@ -4678,14 +4694,77 @@ def toggle_subscription(channel_id, name="", url="", thumbnail=""):
     return {"ok": True, "subscribed": subscribed, "subscriptions": subs}
 
 
-def import_youtube_subscriptions():
-    """Import the signed-in account's YouTube subscriptions via yt-dlp's feed/channels tab (needs
-    an imported browser login — see the ytm cookie module). New channels are added to the local
-    subscription store, deduped by id; returns an import summary shaped like import_newpipe."""
+def _account_slot():
+    """The chosen Google-login index for the yt-dlp FALLBACK path, taken from the account selector
+    (ytm.selected_account). 0 = default account. The primary InnerTube path uses the full identity
+    (login + channel) directly; this only covers the case where InnerTube is unavailable."""
+    try:
+        import ytm
+        return max(0, int(ytm.selected_account().get("authuser", 0) or 0))
+    except Exception:
+        return 0
+
+
+def _with_authuser(url):
+    """Append ?authuser=N (or &authuser=N) for the selected login on the yt-dlp fallback path. No-op
+    for slot 0. Switches between separate Google LOGINS only — brand-account channels can't be
+    selected this way (yt-dlp has no override); the InnerTube path handles those."""
+    n = _account_slot()
+    if n <= 0:
+        return url
+    return url + ("&" if "?" in url else "?") + "authuser=" + str(n)
+
+
+def _subscription_channels():
+    """This account's subscribed channels as [{id,name,url,thumbnail}]. Prefers the InnerTube path
+    (respects the selected login/channel, incl. brand accounts); falls back to yt-dlp's feed/channels
+    (default account only) when InnerTube is unavailable or empty. Raises on a hard fetch failure."""
+    import ytm
+    # Preferred: InnerTube, per the selected identity.
+    if hasattr(ytm, "subscriptions_innertube"):
+        try:
+            r = ytm.subscriptions_innertube()
+            if r.get("ok") and r.get("channels"):
+                _tlog("subscriptions via InnerTube: %d" % len(r["channels"]))
+                return r["channels"]
+            _tlog("subscriptions InnerTube empty/nok (%s) → yt-dlp" % (r.get("error") or "empty"))
+        except Exception as ex:
+            _tlog("subscriptions InnerTube error → yt-dlp: %s" % str(ex)[:120])
+    # Fallback: yt-dlp feed/channels.
     path = _ytdlp_path()
     if not path:
-        return {"ok": False, "error": "yt-dlp not found"}
-    # feed/channels is empty / errors when signed out, so fail early with a clear hint.
+        raise RuntimeError("yt-dlp not found")
+    url = _with_authuser("https://www.youtube.com/feed/channels")
+    with _cookies_args() as cargs:
+        proc = subprocess.run(
+            [path, *_COMMON_ARGS, *cargs, "--flat-playlist", "--dump-single-json", "--", url],
+            capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip()[:300] or "subscription fetch failed")
+    data = json.loads(proc.stdout)
+    out = []
+    for e in (data.get("entries") or []):
+        if not e:
+            continue
+        cid = e.get("id") or e.get("channel_id") or ""
+        curl = e.get("url") or e.get("channel_url") or ""
+        if not (cid or "").startswith("UC"):
+            m = re.search(r"/channel/(UC[\w-]+)", curl or "")   # some entries carry only a URL
+            cid = m.group(1) if m else ""
+        if not cid:
+            continue
+        thumb = ""
+        thumbs = e.get("thumbnails")
+        if isinstance(thumbs, list) and thumbs and isinstance(thumbs[-1], dict):
+            thumb = thumbs[-1].get("url", "") or ""
+        out.append({"id": cid, "name": e.get("title") or e.get("channel") or e.get("uploader") or cid,
+                    "url": curl or ("https://www.youtube.com/channel/" + cid), "thumbnail": thumb})
+    return out
+
+
+def import_youtube_subscriptions():
+    """Import the signed-in account's YouTube subscriptions (InnerTube per selected identity, yt-dlp
+    fallback). New channels are added to the local store, deduped by id; import-summary shaped."""
     try:
         import ytm
         signed_in = bool(ytm.netscape_cookies())
@@ -4694,45 +4773,26 @@ def import_youtube_subscriptions():
     if not signed_in:
         return {"ok": False, "error": "Not signed in — import your YouTube login from the browser "
                                       "first (More → Providers → YouTube account)."}
-    url = "https://www.youtube.com/feed/channels"
     try:
-        with _cookies_args() as cargs:
-            proc = subprocess.run(
-                [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
-                 "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=120)
-        if proc.returncode != 0:
-            return {"ok": False,
-                    "error": (proc.stderr.strip()[:300] or "subscription fetch failed")}
-        data = json.loads(proc.stdout)
+        channels = _subscription_channels()
     except Exception as ex:
         return {"ok": False, "error": str(ex)}
-    entries = [e for e in (data.get("entries") or []) if e]
     subs = list_subscriptions()
     have = set(s.get("id") for s in subs if s.get("id"))
     added = 0
-    for e in entries:
-        cid = e.get("id") or e.get("channel_id") or ""
-        curl = e.get("url") or e.get("channel_url") or ""
-        if not (cid or "").startswith("UC"):
-            m = re.search(r"/channel/(UC[\w-]+)", curl or "")   # some entries carry only a URL
-            cid = m.group(1) if m else ""
-        if not cid or cid in have:
+    for ch in channels:
+        cid = ch.get("id") or ""
+        if not cid.startswith("UC") or cid in have:
             continue
-        name = e.get("title") or e.get("channel") or e.get("uploader") or cid
-        if not curl:
-            curl = "https://www.youtube.com/channel/" + cid
-        thumb = ""
-        thumbs = e.get("thumbnails")
-        if isinstance(thumbs, list) and thumbs and isinstance(thumbs[-1], dict):
-            thumb = thumbs[-1].get("url", "") or ""
-        subs.append({"id": cid, "name": name, "url": curl, "thumbnail": thumb})
+        subs.append({"id": cid, "name": ch.get("name") or cid,
+                     "url": ch.get("url") or ("https://www.youtube.com/channel/" + cid),
+                     "thumbnail": ch.get("thumbnail") or ""})
         have.add(cid)
         added += 1
     if added:
         _save_subscriptions(subs)
         _feed_durations_cache["ts"] = 0.0   # a fresh channel is due on the next feed refresh
-    total = len(entries)
+    total = len(channels)
     if total:
         summary = ("Imported %d new channel%s (%d already subscribed)."
                    % (added, "" if added == 1 else "s", total - added))
@@ -4742,14 +4802,48 @@ def import_youtube_subscriptions():
             "count": len(subs), "summary": summary}
 
 
-def import_youtube_playlists():
-    """Import the signed-in account's YouTube playlists via yt-dlp's feed/playlists tab (needs an
-    imported login). Each becomes a kind="youtube" library entry with EMPTY items — opening or
-    refreshing it fetches the videos, exactly like a NewPipe-imported saved playlist. Deduped by
-    list id; returns an import summary."""
+def _library_playlists():
+    """This account's playlists as [{yt_id,title}]. Prefers InnerTube (per selected identity), falls
+    back to yt-dlp feed/playlists. Raises on a hard fetch failure."""
+    import ytm
+    if hasattr(ytm, "playlists_innertube"):
+        try:
+            r = ytm.playlists_innertube()
+            if r.get("ok") and r.get("playlists"):
+                _tlog("playlists via InnerTube: %d" % len(r["playlists"]))
+                return r["playlists"]
+            _tlog("playlists InnerTube empty/nok (%s) → yt-dlp" % (r.get("error") or "empty"))
+        except Exception as ex:
+            _tlog("playlists InnerTube error → yt-dlp: %s" % str(ex)[:120])
     path = _ytdlp_path()
     if not path:
-        return {"ok": False, "error": "yt-dlp not found"}
+        raise RuntimeError("yt-dlp not found")
+    url = _with_authuser("https://www.youtube.com/feed/playlists")
+    with _cookies_args() as cargs:
+        proc = subprocess.run(
+            [path, *_COMMON_ARGS, *cargs, "--flat-playlist", "--dump-single-json", "--", url],
+            capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip()[:300] or "playlist fetch failed")
+    data = json.loads(proc.stdout)
+    list_re = re.compile(r"[?&]list=([0-9A-Za-z_-]+)")
+    out = []
+    for e in (data.get("entries") or []):
+        if not e:
+            continue
+        yt_id = e.get("id") or ""
+        if not yt_id:
+            m = list_re.search(e.get("url") or "")
+            yt_id = m.group(1) if m else ""
+        if yt_id:
+            out.append({"yt_id": yt_id, "title": e.get("title") or e.get("channel") or "Playlist"})
+    return out
+
+
+def import_youtube_playlists():
+    """Import the signed-in account's YouTube playlists (InnerTube per selected identity, yt-dlp
+    fallback). Each becomes a kind="youtube" library entry with EMPTY items — opening or refreshing
+    it fetches the videos, like a NewPipe-imported saved playlist. Deduped by list id."""
     try:
         import ytm
         signed_in = bool(ytm.netscape_cookies())
@@ -4758,41 +4852,27 @@ def import_youtube_playlists():
     if not signed_in:
         return {"ok": False, "error": "Not signed in — import your YouTube login from the browser "
                                       "first (More → Providers → YouTube account)."}
-    url = "https://www.youtube.com/feed/playlists"
     try:
-        with _cookies_args() as cargs:
-            proc = subprocess.run(
-                [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
-                 "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=120)
-        if proc.returncode != 0:
-            return {"ok": False, "error": (proc.stderr.strip()[:300] or "playlist fetch failed")}
-        data = json.loads(proc.stdout)
+        playlists = _library_playlists()
     except Exception as ex:
         return {"ok": False, "error": str(ex)}
-    entries = [e for e in (data.get("entries") or []) if e]
     lst = _load_playlists()
     have_yt = set(p.get("yt_id") for p in lst if p.get("yt_id"))
-    list_re = re.compile(r"[?&]list=([0-9A-Za-z_-]+)")
     added = 0
-    for e in entries:
-        yt_id = e.get("id") or ""
-        if not yt_id:
-            m = list_re.search(e.get("url") or "")
-            yt_id = m.group(1) if m else ""
-        # Skip empties, dupes, and any channel-id row (UC…) that isn't a real playlist — the
-        # uploads playlist is UU…, liked is LL, watch-later WL, user playlists PL…, so only UC is
-        # excluded. (Symmetric with the UC-check the subscription import relies on.)
+    for pl in playlists:
+        yt_id = (pl.get("yt_id") or "").strip()
+        # Skip empties, dupes, and any channel-id row (UC…) that isn't a real playlist — uploads is
+        # UU…, liked LL, watch-later WL, user playlists PL…, so only UC is excluded.
         if not yt_id or yt_id.startswith("UC") or yt_id in have_yt:
             continue
-        title = (e.get("title") or e.get("channel") or "Playlist").strip()[:100] or "Playlist"
+        title = (pl.get("title") or "Playlist").strip()[:100] or "Playlist"
         lst.insert(0, {"id": uuid.uuid4().hex[:12], "title": title,
                        "kind": "youtube", "yt_id": yt_id, "items": []})
         have_yt.add(yt_id)
         added += 1
     if added:
         _save_playlists(lst)
-    total = len(entries)
+    total = len(playlists)
     if total:
         summary = ("Imported %d new playlist%s (%d already saved)."
                    % (added, "" if added == 1 else "s", total - added))
@@ -4853,6 +4933,34 @@ def youtube_logout():
         res = {"logged_in": False}
     invalidate_resolve_cache()    # D10: logout changes extraction
     return res
+
+
+def youtube_list_accounts():
+    """Enumerate the signed-in Google logins + channels for the account picker (see ytm)."""
+    try:
+        import ytm
+        return ytm.list_accounts()
+    except Exception as ex:
+        return {"ok": False, "accounts": [], "error": str(ex)}
+
+
+def youtube_select_account(authuser="0", page_id="", datasync_id="", name=""):
+    """Switch the active account/channel for account-scoped fetches (see ytm)."""
+    try:
+        import ytm
+        res = ytm.select_account(authuser, page_id, datasync_id, name)
+    except Exception as ex:
+        return {"ok": False, "error": str(ex)}
+    invalidate_resolve_cache()    # a different account can change extraction (members/premium)
+    return res
+
+
+def youtube_selected_account():
+    try:
+        import ytm
+        return ytm.selected_account()
+    except Exception:
+        return {"authuser": "0", "page_id": "", "name": ""}
 
 
 def _np_query(con, sql):

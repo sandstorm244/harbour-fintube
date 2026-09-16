@@ -44,9 +44,11 @@ DISTFILES += \
     qml/pages/SubscriptionsPage.qml \
     qml/pages/ChannelPage.qml \
     qml/pages/SettingsPage.qml \
+    qml/pages/SponsorBlockPage.qml \
     qml/pages/DownloadsPage.qml \
     qml/pages/MorePage.qml \
     qml/pages/ProvidersPage.qml \
+    qml/pages/YtAccountsPage.qml \
     qml/pages/LocalPlayerPage.qml \
     qml/pages/PlaylistsPage.qml \
     qml/pages/PlaylistPage.qml \

@@ -170,6 +170,29 @@ Page {
             }
         }
 
+        // Search kind (Videos/Channels). Kept in the always-visible top area — NOT in the list
+        // header — so it can't scroll up and vanish behind the search field. Switching kind re-runs
+        // the current query so results update immediately.
+        ComboBox {
+            id: kindCombo
+            width: parent.width
+            label: "Search for"
+            currentIndex: 0
+            menu: ContextMenu {
+                MenuItem { text: "Videos" }
+                MenuItem { text: "Channels" }
+            }
+            onCurrentIndexChanged: {
+                page.searchKind = currentIndex === 1 ? "channel" : "video"
+                if (page.lastQuery.length > 0) {
+                    page.statusText = ""
+                    page.hasMore = false
+                    page.nextStart = 1
+                    page.loadResults(1)
+                }
+            }
+        }
+
         // Filter panel — toggled by the cog. Each ComboBox re-runs the query on change; the indices
         // map to the `sp` codes consumed by filterObj() → youfish._search_filter_sp().
         Column {
@@ -214,6 +237,61 @@ Page {
                 onCurrentIndexChanged: { page.fDur = [0, 1, 3, 2][currentIndex]; page.applyFilters() }
             }
         }
+
+        // Status / error line — kept in the top area so a search error stays visible regardless of
+        // how far the results list is scrolled.
+        Label {
+            visible: page.statusText.length > 0
+            x: Theme.horizontalPageMargin
+            width: parent.width - 2 * Theme.horizontalPageMargin
+            wrapMode: Text.Wrap
+            color: page.statusError ? Theme.errorColor : Theme.secondaryHighlightColor
+            font.pixelSize: Theme.fontSizeSmall
+            text: page.statusText
+        }
+    }
+
+    // Autocomplete overlay. Sits above the results (z:3) and anchors to the fixed top area, so the
+    // suggestions "slot in" below the search field instead of rendering inside — and scrolling with —
+    // the results list (which pushed them off-screen / made them appear to open upwards). The results
+    // list is hidden while this is visible so it reads as a clean suggestion view.
+    SilicaListView {
+        id: suggestList
+        anchors { top: topArea.bottom; bottom: parent.bottom
+                  left: parent.left; right: parent.right }
+        z: 3
+        visible: page.suggestions.length > 0
+        model: page.suggestions
+        clip: true
+        delegate: BackgroundItem {
+            width: suggestList.width
+            height: Theme.itemSizeSmall
+            Image {
+                id: sIcon
+                anchors {
+                    left: parent.left; leftMargin: Theme.horizontalPageMargin
+                    verticalCenter: parent.verticalCenter
+                }
+                source: "image://theme/icon-m-search"
+                width: Theme.iconSizeSmall; height: width
+                opacity: 0.5
+            }
+            Label {
+                anchors {
+                    left: sIcon.right; leftMargin: Theme.paddingMedium
+                    right: parent.right; rightMargin: Theme.horizontalPageMargin
+                    verticalCenter: parent.verticalCenter
+                }
+                text: modelData
+                truncationMode: TruncationMode.Fade
+                color: highlighted ? Theme.highlightColor : Theme.primaryColor
+            }
+            onClicked: {
+                searchField.text = modelData
+                page.runSearch(modelData)
+            }
+        }
+        VerticalScrollDecorator { }
     }
 
     SilicaListView {
@@ -221,6 +299,16 @@ Page {
         anchors { top: topArea.bottom; bottom: parent.bottom
                   left: parent.left; right: parent.right }
         model: resultsModel
+        // Hide the results while suggestions are up so they don't show through underneath.
+        visible: page.suggestions.length === 0
+        // Clip to bounds: the search controls live in the fixed `topArea` above (with no opaque
+        // background), so without clipping the rows render up into that area — you'd see thumbnails/
+        // titles ghosting behind the search field + kind combo, and rows would "pop" in/out as they
+        // were culled at the top edge instead of sliding cleanly under it.
+        clip: true
+        // Keep a screen's worth of delegates realised above/below the viewport so rows don't blank
+        // out the instant they cross the edge while scrolling (bug: videos "disappeared right away").
+        cacheBuffer: Math.round(height * 2)
 
         // Page in more results when scrolled to the end (mirrors ChannelPage).
         onAtYEndChanged: {
@@ -237,78 +325,6 @@ Page {
                 anchors.centerIn: parent
                 size: BusyIndicatorSize.Medium
                 running: page.loadingMore
-            }
-        }
-
-        header: Column {
-            width: listView.width
-
-            // Autocomplete suggestions (tap to search that term).
-            Column {
-                width: parent.width
-                visible: page.suggestions.length > 0
-                Repeater {
-                    model: page.suggestions
-                    BackgroundItem {
-                        width: parent.width
-                        height: Theme.itemSizeSmall
-                        Image {
-                            id: sIcon
-                            anchors {
-                                left: parent.left; leftMargin: Theme.horizontalPageMargin
-                                verticalCenter: parent.verticalCenter
-                            }
-                            source: "image://theme/icon-m-search"
-                            width: Theme.iconSizeSmall; height: width
-                            opacity: 0.5
-                        }
-                        Label {
-                            anchors {
-                                left: sIcon.right; leftMargin: Theme.paddingMedium
-                                right: parent.right; rightMargin: Theme.horizontalPageMargin
-                                verticalCenter: parent.verticalCenter
-                            }
-                            text: modelData
-                            truncationMode: TruncationMode.Fade
-                            color: highlighted ? Theme.highlightColor : Theme.primaryColor
-                        }
-                        onClicked: {
-                            searchField.text = modelData
-                            page.runSearch(modelData)
-                        }
-                    }
-                }
-            }
-
-            ComboBox {
-                id: kindCombo
-                width: parent.width
-                label: "Search for"
-                currentIndex: 0
-                menu: ContextMenu {
-                    MenuItem { text: "Videos" }
-                    MenuItem { text: "Channels" }
-                }
-                // Switching kind re-runs the current query so results update immediately.
-                onCurrentIndexChanged: {
-                    page.searchKind = currentIndex === 1 ? "channel" : "video"
-                    if (page.lastQuery.length > 0) {
-                        page.statusText = ""
-                        page.hasMore = false
-                        page.nextStart = 1
-                        page.loadResults(1)
-                    }
-                }
-            }
-
-            Label {
-                visible: page.statusText.length > 0
-                x: Theme.horizontalPageMargin
-                width: parent.width - 2 * Theme.horizontalPageMargin
-                wrapMode: Text.Wrap
-                color: page.statusError ? Theme.errorColor : Theme.secondaryHighlightColor
-                font.pixelSize: Theme.fontSizeSmall
-                text: page.statusText
             }
         }
 
@@ -383,6 +399,7 @@ Page {
                         anchors.fill: parent
                         fillMode: Image.PreserveAspectCrop
                         asynchronous: true
+                        sourceSize: Qt.size(parent.width, parent.height)   // #9: decode to the display box, not full res
                         source: item.isChannel ? "" : (model.thumbnail || "")
                     }
                     WatchOverlay {
@@ -464,6 +481,7 @@ Page {
                     fillMode: Image.PreserveAspectCrop
                     asynchronous: true
                     smooth: true
+                    sourceSize: Qt.size(width, height)   // #9: decode to avatar size, not full res
                     source: item.isChannel ? (model.thumbnail || "") : ""
                 }
                 Column {

@@ -166,6 +166,7 @@ Page {
                     anchors.fill: parent
                     fillMode: Image.PreserveAspectCrop
                     asynchronous: true
+                    sourceSize: Qt.size(parent.width, parent.height)   // #9: decode to the display box, not full res
                     source: model.thumbnail || ""
                 }
                 WatchOverlay { anchors.fill: parent; videoId: model.id || ""; live: !!model.live }

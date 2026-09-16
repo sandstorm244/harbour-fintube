@@ -41,7 +41,13 @@ Item {
     property int  youtubeCookieCount: 0
     property bool hideShorts: true       // filter Shorts out of results (persisted by Python)
     property bool hideWatched: false     // hide watched videos from the feed + channel lists
-    property bool sponsorBlock: true     // auto-skip SponsorBlock segments during playback
+    // Account/channel selector (InnerTube): the signed-in logins + channels, and the one in use.
+    property var ytAccounts: []           // [{name,handle,thumb,authuser,page_id,datasync_id,selected}]
+    property string ytSelectedName: ""    // display name of the active identity ("" = default)
+    property bool sponsorBlock: true     // master SponsorBlock switch (fetch + act on segments)
+    // Per-category action: {category: "skip"|"manual"|"off"}. A missing category = "off". Read by
+    // VideoPage to decide auto-skip vs. show-a-skip-button vs. ignore for each segment.
+    property var sbActions: ({"sponsor": "skip", "selfpromo": "skip", "interaction": "skip"})
     property string playerClient: ""     // yt-dlp youtube player_client ("" = auto)
     property string ytdlpChannel: "stable" // yt-dlp update channel: "stable" | "nightly"
     property string defaultQuality: "720" // baseline video height cap ("1080"/"720"/…/"0"=best)
@@ -175,6 +181,8 @@ Item {
             backend.hideWatched = !!s.hide_watched
             backend.portraitFullscreen = !!s.portrait_fullscreen
             backend.sponsorBlock = !!s.sponsorblock
+            if (s.sponsorblock_actions && typeof s.sponsorblock_actions === "object")
+                backend.sbActions = s.sponsorblock_actions
             backend.playbackRate = s.playback_rate || 1.0
             backend.playerClient = s.player_client || ""
             backend.ytdlpChannel = s.ytdlp_channel || "stable"
@@ -271,6 +279,22 @@ Item {
     function setSponsorBlock(on) {
         py.call("youfish.set_setting", ["sponsorblock", !!on], function(s) {
             if (s) backend.sponsorBlock = !!s.sponsorblock
+        })
+    }
+
+    // Set one category's action ("skip"|"manual"|"off") and persist the whole map. Writing the full
+    // dict (set_setting replaces a key wholesale) keeps it in one atomic write.
+    function setSponsorAction(category, action) {
+        if (!category) return
+        var m = {}
+        var cur = backend.sbActions || {}
+        for (var k in cur) m[k] = cur[k]     // shallow copy so the property change is observed
+        if (action === "skip" || action === "manual") m[category] = action
+        else delete m[category]              // "off" = simply absent
+        backend.sbActions = m                // optimistic; mirrored back below
+        py.call("youfish.set_setting", ["sponsorblock_actions", m], function(s) {
+            if (s && s.sponsorblock_actions && typeof s.sponsorblock_actions === "object")
+                backend.sbActions = s.sponsorblock_actions
         })
     }
 
@@ -400,11 +424,15 @@ Item {
         py.call("youfish.youtube_login_status", [], function(s) {
             backend.youtubeLoggedIn = !!(s && s.logged_in)
             backend.youtubeCookieCount = (s && s.count) || 0
+            if (backend.youtubeLoggedIn) backend.loadSelectedAccount()
+            else { backend.ytAccounts = []; backend.ytSelectedName = "" }
         })
     }
     // Import the signed-in session from the Sailfish Browser's cookie jar. res = {ok, count, error?}.
     function importBrowserLogin(callback) {
         py.call("youfish.youtube_import_login", [], function(res) {
+            backend.ytAccounts = []           // fresh session → re-enumerate on demand
+            backend.ytSelectedName = ""       // and back to the default identity
             backend.loadLoginStatus()
             if (callback) callback(res || {})
         })
@@ -413,6 +441,8 @@ Item {
         py.call("youfish.youtube_logout", [], function(res) {
             backend.youtubeLoggedIn = false
             backend.youtubeCookieCount = 0
+            backend.ytAccounts = []
+            backend.ytSelectedName = ""
             if (callback) callback(res || {})
         })
     }
@@ -423,6 +453,29 @@ Item {
         py.call("youfish.import_youtube_account", [], function(res) {
             if (res && res.subs_added > 0) backend.loadSubscriptions()
             if (res && res.playlists_added > 0) backend.loadPlaylists()
+            if (callback) callback(res || {})
+        })
+    }
+
+    // --- Account / channel selector (multiple Google logins + brand accounts, via InnerTube) ---
+    function ytmListAccounts(callback) {
+        py.call("youfish.youtube_list_accounts", [], function(res) {
+            backend.ytAccounts = (res && res.ok && res.accounts) ? res.accounts : []
+            if (callback) callback(res || {})
+        })
+    }
+    function ytmSelectAccount(a, callback) {
+        if (!a) { if (callback) callback({}); return }
+        py.call("youfish.youtube_select_account",
+                [a.authuser || "0", a.page_id || "", a.datasync_id || "", a.name || ""],
+                function(res) {
+            if (res && res.ok) backend.ytSelectedName = res.name || ""
+            if (callback) callback(res || {})
+        })
+    }
+    function loadSelectedAccount(callback) {
+        py.call("youfish.youtube_selected_account", [], function(res) {
+            if (res) backend.ytSelectedName = res.name || ""
             if (callback) callback(res || {})
         })
     }
@@ -481,7 +534,10 @@ Item {
             return
         }
         _commentsPending[videoId] = callback ? [callback] : []
-        py.call("youfish.comments", [videoId, 20, true], function(res) {
+        // 50 top-level comments per video. This is a NETWORK cap: yt-dlp's max_parents stops the
+        // continuation walk once it has this many (it does not fetch the rest), so it also bounds the
+        // walk's latency. The UI still reveals them a few at a time (VideoPage reveal window).
+        py.call("youfish.comments", [videoId, 50, true], function(res) {
             var cbs = _commentsPending[videoId] || []
             delete _commentsPending[videoId]
             if (res && res.ok) {

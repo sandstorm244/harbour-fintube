@@ -460,6 +460,19 @@ Page {
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
 
+            // Account picker: when several Google accounts are signed in to the Sailfish Browser,
+            // choose WHICH one the subscription/playlist import reads (?authuser=N). Switches between
+            // separate Google logins only — brand-account channels within one login can't be picked
+            // here (a yt-dlp limitation). Only worth touching with more than one account signed in.
+            ValueButton {
+                visible: app.backend.youtubeLoggedIn
+                label: "Account"
+                value: app.backend.ytSelectedName || "Default account"
+                description: "Which account/channel (incl. brand accounts) to import from. Re-run "
+                            + "the import after changing it."
+                onClicked: pageStack.push(Qt.resolvedUrl("YtAccountsPage.qml"))
+            }
+
             Button {
                 visible: app.backend.youtubeLoggedIn
                 anchors.horizontalCenter: parent.horizontalCenter

@@ -48,6 +48,9 @@ Page {
     property int resumeMs: 0          // saved watch position to resume from (0 = none)
     property var sponsorSegments: []  // SponsorBlock [{start,end,category}] in seconds
     property string skipHint: ""      // transient "Skipped …" overlay text
+    // The segment the play position is currently inside whose action is "manual" — drives the
+    // tap-to-skip button. null when not inside such a segment. Recomputed on each position tick.
+    property var manualSeg: null
 
     // Captions. captionCues = [{start,dur,text}] for the active track; currentCaption = the line
     // showing right now, recomputed from positionMs on each tick (same loop SponsorBlock rides).
@@ -474,26 +477,66 @@ Page {
             page.allowedOrientations = Orientation.LandscapeMask   // classic: rotate to landscape
     }
 
-    // SponsorBlock: if the play position lands inside a skip segment, jump past it.
+    // Per-category action ("skip" | "manual" | "off"), from the SponsorBlock settings page. A
+    // category with no saved action is off (never touched).
+    function sbAction(cat) {
+        var m = app.backend.sbActions
+        var v = m ? m[cat] : undefined
+        return (v === "skip" || v === "manual") ? v : "off"
+    }
+    // Human label for a category, used in the skip button and the "Skipped …" pill.
+    function sbLabel(cat) {
+        switch (cat) {
+        case "selfpromo":      return "self-promo"
+        case "interaction":    return "reminder"
+        case "intro":          return "intro"
+        case "outro":          return "endcards"
+        case "preview":        return "recap"
+        case "filler":         return "filler"
+        case "music_offtopic": return "non-music"
+        default:               return "sponsor"
+        }
+    }
+
+    // SponsorBlock: auto-skip "skip" segments; surface a tap-to-skip button for "manual" ones.
     function checkSponsorSkip() {
-        // Only the page that actually holds the shared player may skip. A page displaced into the
+        // Only the page that actually holds the shared player may act. A page displaced into the
         // back stack keeps useGst=true and reads the shared player's position/isPlaying — so without
         // holdsPlayer, when the NEW video crosses this (old) page's segment timestamps, the hidden
         // page would seek the new owner's playback. (C1)
-        if (!app.backend.sponsorBlock || !page.holdsPlayer
-                || page.sponsorSegments.length === 0 || !page.isPlaying)
+        if (!app.backend.sponsorBlock || !page.holdsPlayer || page.sponsorSegments.length === 0) {
+            page.manualSeg = null
             return
+        }
         var pos = page.positionMs / 1000
+        var pending = null
         for (var i = 0; i < page.sponsorSegments.length; i++) {
             var s = page.sponsorSegments[i]
-            if (pos >= s.start && pos < s.end - 0.5) {
-                page.seekTo(Math.round(s.end * 1000))
-                page.showSkipHint(s.category === "selfpromo" ? "Skipped self-promo"
-                                  : s.category === "interaction" ? "Skipped reminder"
-                                  : "Skipped sponsor")
-                return
+            if (pos < s.start || pos >= s.end - 0.5)
+                continue
+            var act = page.sbAction(s.category)
+            if (act === "skip") {
+                // Auto-skip only while actually playing — a paused user parked in a segment
+                // shouldn't be dragged forward.
+                if (page.isPlaying) {
+                    page.manualSeg = null
+                    page.seekTo(Math.round(s.end * 1000))
+                    page.showSkipHint("Skipped " + page.sbLabel(s.category))
+                    return
+                }
+            } else if (act === "manual" && pending === null) {
+                pending = s     // show the button; keep scanning in case a "skip" also overlaps
             }
         }
+        page.manualSeg = pending
+    }
+    // User tapped the manual skip button: jump past the segment and confirm with the pill.
+    function skipManualSeg() {
+        var s = page.manualSeg
+        if (!s) return
+        page.manualSeg = null
+        page.seekTo(Math.round(s.end * 1000))
+        page.showSkipHint("Skipped " + page.sbLabel(s.category))
     }
     function showSkipHint(t) {
         page.skipHint = t
@@ -621,6 +664,7 @@ Page {
             page.persistPosition()
             page.sponsorSegments = []       // drop this video's segments so our position ticks can't
                                             // skip the new owner once it takes the shared player (C1)
+            page.manualSeg = null           // and hide any pending manual-skip button
             gplayer.stop()
             app.backend.releasePlayback(page.videoId, [])
             mediaPlayer.stop()
@@ -995,6 +1039,7 @@ Page {
             visible: page.infoOnly && page.infoThumbnail.length > 0
             fillMode: Image.PreserveAspectFit
             asynchronous: true
+            sourceSize: Qt.size(parent.width, parent.height)   // #9: decode to the display box, not full res
             source: page.infoOnly ? page.infoThumbnail : ""
         }
         BackgroundItem {
@@ -1067,6 +1112,35 @@ Page {
                 text: page.skipHint
                 color: "white"
                 font.pixelSize: Theme.fontSizeExtraSmall
+            }
+        }
+
+        // Manual SponsorBlock skip button — shown while the position is inside a segment whose
+        // action is "Show skip button". Bottom-right, lifted above the scrubber when controls are up.
+        // Its own MouseArea consumes the tap so it doesn't toggle the controls underneath.
+        Rectangle {
+            id: manualSkipBtn
+            visible: page.manualSeg !== null && page.holdsPlayer && page.errorText.length === 0
+            anchors {
+                right: parent.right; rightMargin: Theme.horizontalPageMargin
+                bottom: parent.bottom
+                bottomMargin: page.controlsShown ? Theme.itemSizeMedium + Theme.paddingLarge
+                                                 : Theme.paddingLarge
+            }
+            radius: Theme.paddingSmall
+            color: "#C8000000"
+            width: manualSkipLabel.width + 2 * Theme.paddingMedium
+            height: manualSkipLabel.height + Theme.paddingMedium
+            Label {
+                id: manualSkipLabel
+                anchors.centerIn: parent
+                text: page.manualSeg ? ("Skip " + page.sbLabel(page.manualSeg.category) + "  »") : ""
+                color: Theme.highlightColor
+                font.pixelSize: Theme.fontSizeSmall
+            }
+            MouseArea {
+                anchors.fill: parent
+                onClicked: page.skipManualSeg()
             }
         }
 
@@ -1203,10 +1277,15 @@ Page {
         contentHeight: infoColumn.height + 2 * Theme.paddingMedium
         clip: true
 
-        // A moving window over the fetched batch (no network): reveal more as we near the
-        // bottom, and unload the tail again once a lot of it sits below the fold — i.e. the
-        // user scrolled back up. The wide dead-zone between the two thresholds stops it from
-        // thrashing, and trimming only content well below the viewport avoids a visible jump.
+        // A reveal-only window over the fetched batch (no network): show more as we near the
+        // bottom, and never un-reveal. The batch is only ~20 top-level comments, so keeping the
+        // whole tail realised is cheap and there's nothing to gain by trimming it.
+        //
+        // The old logic ALSO unloaded the tail once it sat far below the fold. With tall comments
+        // (long text / expanded reply threads) a single ±5 could change contentHeight by more than
+        // the grow/shrink dead-zone, so the two thresholds ping-ponged and the Repeater destroyed +
+        // recreated delegates every frame — the "scrollbar resizes constantly, comments flash near
+        // the end, normalises on scroll-up" report. Growing monotonically removes that feedback loop.
         onContentYChanged: {
             if (!page.commentsLoaded) {
                 // Load-on-approach: warm comments the first time the user actually scrolls the info
@@ -1223,10 +1302,8 @@ Page {
                 return
             }
             var belowFold = contentHeight - (contentY + height)
-            if (page.commentsShown < page.comments.length && belowFold < height * 0.5)
+            if (page.commentsShown < page.comments.length && belowFold < height)
                 page.commentsShown = Math.min(page.commentsShown + 5, page.comments.length)
-            else if (page.commentsShown > 5 && belowFold > height * 2.0)
-                page.commentsShown = Math.max(5, page.commentsShown - 5)
         }
 
         PullDownMenu {
@@ -1313,6 +1390,7 @@ Page {
                     fillMode: Image.PreserveAspectCrop
                     asynchronous: true
                     smooth: true
+                    sourceSize: Qt.size(width, height)   // #9: decode to avatar size, not full res
                     source: page.channelAvatar
                 }
 
@@ -1509,6 +1587,7 @@ Page {
                             fillMode: Image.PreserveAspectCrop
                             asynchronous: true
                             smooth: true
+                            sourceSize: Qt.size(width, height)   // #9: decode to avatar size, not full res
                             source: (c && c.thumbnail) ? c.thumbnail : ""
                         }
                         Column {
@@ -1580,6 +1659,7 @@ Page {
                                             fillMode: Image.PreserveAspectCrop
                                             asynchronous: true
                                             smooth: true
+                                            sourceSize: Qt.size(width, height)   // #9: decode to avatar size, not full res
                                             source: (r && r.thumbnail) ? r.thumbnail : ""
                                         }
                                         Column {

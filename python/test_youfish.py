@@ -2626,5 +2626,133 @@ class PotEnsureBudget(unittest.TestCase):
             youfish._pot_active, youfish._pot_ready_on_port = saved
 
 
+class AccountSlotAuthUser(unittest.TestCase):
+    """_with_authuser -> ?authuser=N on the yt-dlp fallback URLs, driven by the selected identity's
+    authuser index (ytm.selected_account)."""
+
+    def setUp(self):
+        self._as = youfish._account_slot
+
+    def tearDown(self):
+        youfish._account_slot = self._as
+
+    def test_slot_zero_is_noop(self):
+        youfish._account_slot = lambda: 0
+        self.assertEqual(youfish._with_authuser("https://www.youtube.com/feed/channels"),
+                         "https://www.youtube.com/feed/channels")
+
+    def test_slot_appends_authuser(self):
+        youfish._account_slot = lambda: 2
+        self.assertEqual(youfish._with_authuser("https://www.youtube.com/feed/channels"),
+                         "https://www.youtube.com/feed/channels?authuser=2")
+
+    def test_slot_uses_ampersand_when_query_present(self):
+        youfish._account_slot = lambda: 1
+        self.assertEqual(youfish._with_authuser("https://x/y?a=b"), "https://x/y?a=b&authuser=1")
+
+
+class YtmInnerTube(unittest.TestCase):
+    """FinTube's InnerTube layer (ytm.py): enumerate accounts, apply the identity, and parse the
+    subscriptions/playlists browses — all off a mocked _innertube so it stays offline."""
+
+    def setUp(self):
+        import ytm
+        self._saved = {n: getattr(ytm, n) for n in
+                       ("_innertube", "is_logged_in", "_load_cookies", "_save_cookies")}
+        ytm.is_logged_in = lambda: True
+
+    def tearDown(self):
+        import ytm
+        for n, v in self._saved.items():
+            setattr(ytm, n, v)
+
+    @staticmethod
+    def _switcher_for(authuser):
+        # account/accounts_list returns only the account(s) for the probed authuser.
+        if authuser == 0:
+            return {"contents": [{"accountItemSectionRenderer": {"contents": [
+                {"accountItem": {"accountName": {"simpleText": "Personal Me"},
+                                 "channelHandle": {"simpleText": "@me"}, "isSelected": True,
+                                 "serviceEndpoint": {"selectActiveIdentityEndpoint": {
+                                     "supportedTokens": [
+                                         {"accountStateToken": {"obfuscatedGaiaId": "gaia0"}}]}}}}]}}]}
+        if authuser == 1:                    # second login: personal + a brand channel
+            return {"contents": [{"accountItemSectionRenderer": {"contents": [
+                {"accountItem": {"accountName": {"simpleText": "Second Me"},
+                                 "serviceEndpoint": {"selectActiveIdentityEndpoint": {
+                                     "supportedTokens": [
+                                         {"accountStateToken": {"obfuscatedGaiaId": "gaia1"}}]}}}},
+                {"accountItem": {"accountName": {"simpleText": "Brand A"},
+                                 "serviceEndpoint": {"selectActiveIdentityEndpoint": {
+                                     "supportedTokens": [
+                                         {"pageIdToken": {"pageId": "UCbrandA"}},
+                                         {"accountStateToken": {"obfuscatedGaiaId": "gaia1b"}}]}}}}]}}]}
+        return {"responseContext": {"mainAppWebResponseContext": {"loggedOut": True}}}
+
+    def test_list_accounts_probes_logins_and_brand_channels(self):
+        import ytm
+        ytm._innertube = lambda ep, body, **k: self._switcher_for(k.get("authuser", 0))
+        ytm._load_cookies = lambda: {"authuser": "0", "page_id": ""}
+        res = ytm.list_accounts()
+        self.assertTrue(res["ok"])
+        a = res["accounts"]
+        self.assertEqual(len(a), 3)          # probed authuser 0 (1) + 1 (2), then 2 = logged out
+        self.assertEqual((a[0]["authuser"], a[0]["page_id"], a[0]["name"]), ("0", "", "Personal Me"))
+        self.assertEqual((a[1]["authuser"], a[1]["page_id"], a[1]["name"]), ("1", "", "Second Me"))
+        self.assertEqual((a[2]["authuser"], a[2]["page_id"]), ("1", "UCbrandA"))
+
+    def test_list_accounts_logged_out(self):
+        import ytm
+        ytm._innertube = lambda ep, body, **k: {
+            "responseContext": {"mainAppWebResponseContext": {"loggedOut": True}}}
+        res = ytm.list_accounts()
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["accounts"], [])
+
+    def test_selected_identity_feeds_headers(self):
+        import ytm
+        # _innertube reads _selected_identity() for the X-Goog-AuthUser / X-Goog-PageId headers.
+        ytm._load_cookies = lambda: {"authuser": "3", "page_id": "UCxyz", "selected_name": "Brand"}
+        ident = ytm._selected_identity()
+        self.assertEqual((ident["authuser"], ident["page_id"]), ("3", "UCxyz"))
+
+    def test_subscriptions_parse(self):
+        import ytm
+        resp = {"contents": {"x": [
+            {"channelRenderer": {"channelId": "UC111", "title": {"simpleText": "Chan One"},
+                                 "thumbnail": {"thumbnails": [{"url": "//img/1.jpg"}]}}},
+            {"gridChannelRenderer": {"channelId": "UC222",
+                                     "title": {"runs": [{"text": "Chan Two"}]}}}]}}
+        ytm._innertube = lambda ep, body, **k: dict(resp)
+        r = ytm.subscriptions_innertube()
+        self.assertTrue(r["ok"])
+        ids = [c["id"] for c in r["channels"]]
+        self.assertEqual(ids, ["UC111", "UC222"])
+        self.assertEqual(r["channels"][0]["thumbnail"], "https://img/1.jpg")
+
+    def test_playlists_parse_skips_channels(self):
+        import ytm
+        resp = {"contents": {"x": [
+            {"gridPlaylistRenderer": {"playlistId": "PLaaa", "title": {"simpleText": "Mix"}}},
+            {"playlistRenderer": {"playlistId": "UCnope", "title": {"simpleText": "not a playlist"}}},
+            {"lockupViewModel": {"contentId": "PLbbb",
+                "metadata": {"lockupMetadataViewModel": {"title": {"content": "Faves"}}}}}]}}
+        ytm._innertube = lambda ep, body, **k: dict(resp)
+        r = ytm.playlists_innertube()
+        self.assertTrue(r["ok"])
+        self.assertEqual(sorted(p["yt_id"] for p in r["playlists"]), ["PLaaa", "PLbbb"])
+
+    def test_select_and_selected_roundtrip(self):
+        import ytm
+        store = {"sapisid": "abc"}
+        ytm._load_cookies = lambda: dict(store)
+        ytm._save_cookies = lambda c: (store.clear(), store.update(c))
+        res = ytm.select_account("2", "UCz", "ds", "Brand Z")
+        self.assertTrue(res["ok"])
+        self.assertEqual(store["authuser"], "2")
+        self.assertEqual(ytm.selected_account(),
+                         {"authuser": "2", "page_id": "UCz", "name": "Brand Z"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

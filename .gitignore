@@ -28,3 +28,4 @@ __pycache__/
 *.swp
 *.orig
 .DS_Store
+.claude/settings.local.json

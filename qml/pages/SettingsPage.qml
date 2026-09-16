@@ -33,15 +33,6 @@ Page {
             }
 
             TextSwitch {
-                text: "Skip sponsors"
-                description: "Auto-skip SponsorBlock segments (sponsors, self-promo, reminders). "
-                             + "Sends the video ID to sponsor.ajay.app."
-                automaticCheck: false
-                checked: app.backend.sponsorBlock
-                onClicked: app.backend.setSponsorBlock(!app.backend.sponsorBlock)
-            }
-
-            TextSwitch {
                 text: "Hide watched videos"
                 description: "Hide videos you've already watched from the subscription feed and "
                              + "channel video lists."

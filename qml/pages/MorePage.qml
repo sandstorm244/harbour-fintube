@@ -49,6 +49,7 @@ Page {
                     width: Theme.iconSizeMedium
                     height: width
                     fillMode: Image.PreserveAspectFit
+                    sourceSize: Qt.size(width, height)   // #9: decode custom glyphs to icon size
                     source: modelData.icon
                             ? (modelData.icon.indexOf("icon-") === 0
                                ? "image://theme/" + modelData.icon + (row.highlighted ? "?" + Theme.highlightColor : "")

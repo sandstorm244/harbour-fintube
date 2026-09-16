@@ -214,6 +214,7 @@ Page {
                     fillMode: Image.PreserveAspectCrop
                     smooth: true
                     asynchronous: true
+                    sourceSize: Qt.size(width, height)   // #9: decode to avatar size, not full res
                     source: page.channelThumb
                 }
                 Label {
@@ -345,6 +346,7 @@ Page {
                     anchors.fill: parent
                     fillMode: Image.PreserveAspectCrop
                     asynchronous: true
+                    sourceSize: Qt.size(parent.width, parent.height)   // #9: decode to the display box, not full res
                     source: model.thumbnail || ""
                 }
                 WatchOverlay { anchors.fill: parent; videoId: model.id || ""; live: !!model.live }

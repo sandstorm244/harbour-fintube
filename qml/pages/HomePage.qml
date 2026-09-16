@@ -9,6 +9,10 @@ Page {
     allowedOrientations: Orientation.All
 
     property bool loading: true
+    // A network revalidation is in flight (explicit Refresh OR a stale-while-revalidate background
+    // refresh). Drives the pulsing pulley indicator so the user can see the feed is updating even
+    // when the list is already populated (page.loading only covers the empty first-load case).
+    property bool refreshing: false
     property int lastSubsCount: -1
 
     ListModel { id: feedModel }
@@ -32,10 +36,14 @@ Page {
     function loadFeed(force) {
         if (feedModel.count === 0)
             page.loading = true
+        if (force)                       // an explicit Refresh — pulse the pulley while it runs
+            page.refreshing = true
         // A user-driven load (pull-to-refresh) forces EVERY channel; the initial load just reads
         // the cache (stale-while-revalidate) and lets the background refresh handle due channels.
         app.backend.subscriptionFeed(force, force, function(res) {
             page.loading = false
+            if (force)
+                page.refreshing = false
             page.lastSubsCount = app.backend.subscriptions.length
             feedModel.clear()
             var items = (res && res.items) ? res.items : []
@@ -57,7 +65,9 @@ Page {
     // Background refresh (no spinner). Repopulates only when the feed actually changed up top, so
     // an unchanged feed doesn't reset the user's scroll position out from under them.
     function refreshFeedInBackground() {
+        page.refreshing = true
         app.backend.subscriptionFeed(true, false, function(res) {   // DUE channels only (adaptive TTL)
+            page.refreshing = false     // clear first — the early returns below must not leave it set
             var items = (res && res.items) ? res.items : []
             if (items.length === 0)
                 return
@@ -116,6 +126,7 @@ Page {
                     { title: "Channels", desc: "Manage subscriptions", page: "SubscriptionsPage.qml" },
                     { title: "Settings", desc: "Playback + content", page: "SettingsPage.qml" },
                     { title: "Providers", desc: "yt-dlp, ffmpeg, PO-token provider", page: "ProvidersPage.qml" },
+                    { title: "SponsorBlock", desc: "Skip sponsors and other segments", page: "SponsorBlockPage.qml" },
                     { title: "Import from NewPipe", desc: "Subs, history & playlists from a backup",
                       action: "import-newpipe" },
                     { title: "Import from YouTube", desc: "Your subscriptions & playlists (needs sign-in)",
@@ -158,12 +169,30 @@ Page {
                 onClicked: pageStack.push(Qt.resolvedUrl("SearchPage.qml"))
             }
             MenuItem {
-                text: "Refresh"
+                text: page.refreshing ? "Refreshing…" : "Refresh"
+                enabled: !page.refreshing        // don't stack a second forced walk over a live one
                 onClicked: page.loadFeed(true)
             }
         }
 
-        header: PageHeader { title: "Subscriptions" }
+        // A small spinner on the left of the title row makes an in-progress feed refresh obvious
+        // (the title is right-aligned, so the left side is free). Driven by page.refreshing, same as
+        // the Refresh menu item.
+        header: Item {
+            width: listView.width
+            height: subsHeader.height
+            PageHeader { id: subsHeader; title: "Subscriptions" }
+            BusyIndicator {
+                anchors {
+                    left: parent.left; leftMargin: Theme.horizontalPageMargin
+                    bottom: subsHeader.bottom
+                    bottomMargin: (Theme.itemSizeLarge - height) / 2   // centre in the title band
+                }
+                size: BusyIndicatorSize.Small
+                running: page.refreshing
+                visible: running
+            }
+        }
 
         delegate: ListItem {
             id: item
@@ -227,6 +256,7 @@ Page {
                     anchors.fill: parent
                     fillMode: Image.PreserveAspectCrop
                     asynchronous: true
+                    sourceSize: Qt.size(parent.width, parent.height)   // #9: decode to the display box, not full res
                     source: model.thumbnail || ""
                 }
                 WatchOverlay { anchors.fill: parent; videoId: model.id || ""; live: !!model.live }
