@@ -1,7 +1,7 @@
 Name:       harbour-fintube
 Summary:    A YouTube client for Sailfish OS
 Version:    1.4.2
-Release:    1
+Release:    2
 License:    GPLv3
 URL:        https://github.com/sandstorm244/harbour-fintube
 Source0:    %{name}-%{version}.tar.bz2

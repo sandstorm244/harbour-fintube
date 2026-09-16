@@ -2709,6 +2709,29 @@ class YtmInnerTube(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(res["accounts"], [])
 
+    def test_selected_follows_stored_choice_not_browser(self):
+        # The browser's active channel (isSelected) must NOT mark an account selected — only OUR
+        # stored choice does. Here the personal channel is browser-active but we've chosen the brand.
+        import ytm
+
+        def sw(authuser):
+            if authuser == 0:
+                return {"contents": [{"accountItemSectionRenderer": {"contents": [
+                    {"accountItem": {"accountName": {"simpleText": "Personal"}, "isSelected": True,
+                        "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
+                            {"accountStateToken": {"obfuscatedGaiaId": "g0"}}]}}}},
+                    {"accountItem": {"accountName": {"simpleText": "Brand"},
+                        "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
+                            {"pageIdToken": {"pageId": "UCb"}}]}}}}]}}]}
+            return {"responseContext": {"mainAppWebResponseContext": {"loggedOut": True}}}
+
+        ytm._innertube = lambda ep, body, **k: sw(k.get("authuser", 0))
+        ytm._load_cookies = lambda: {"authuser": "0", "page_id": "UCb"}   # chose the brand channel
+        res = ytm.list_accounts()
+        sel = {x["name"]: x["selected"] for x in res["accounts"]}
+        self.assertFalse(sel["Personal"])   # browser-active, but not our choice
+        self.assertTrue(sel["Brand"])       # our stored choice
+
     def test_selected_identity_feeds_headers(self):
         import ytm
         # _innertube reads _selected_identity() for the X-Goog-AuthUser / X-Goog-PageId headers.

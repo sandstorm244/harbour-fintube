@@ -527,8 +527,10 @@ def _parse_account_item(item, authuser, sel):
         gaia = gaia or tok.get("obfuscatedGaiaId", "")
     if not (name or page_id):
         return None
-    selected = bool(item.get("isSelected")) or (
-        str(authuser) == sel["authuser"] and (page_id or "") == sel["page_id"])
+    # Selection is driven solely by OUR stored identity (select_account), NOT the browser's active
+    # channel (item.isSelected) — otherwise the browser-active channel and our chosen one both light
+    # up. With nothing stored, sel defaults to authuser 0 / no page id, i.e. the default channel.
+    selected = str(authuser) == sel["authuser"] and (page_id or "") == sel["page_id"]
     return {"name": name or "Channel", "handle": handle or "", "thumb": thumb or "",
             "authuser": str(authuser), "page_id": page_id or "", "datasync_id": datasync or "",
             "gaia": gaia or "", "selected": selected}
@@ -560,6 +562,10 @@ def list_accounts():
             data = _innertube("account/accounts_list", {}, authuser=n, page_id="")
         except Exception as ex:
             _log("accounts_list authuser=%d failed: %s" % (n, ex))
+            if n == 0 and not uniq:      # first-probe failure is transient/network, not signed-out
+                return {"ok": False, "accounts": [],
+                        "error": "Couldn't reach YouTube to list accounts. Check your connection "
+                                 "and try again."}
             break
         if first_data is None:
             first_data = data
@@ -573,7 +579,7 @@ def list_accounts():
             a = _parse_account_item(it, n, sel)
             if not a:
                 continue
-            key = (a["gaia"] or a["name"], a["page_id"])
+            key = (a["gaia"] or a["datasync_id"] or a["name"], a["page_id"])
             if key in seen:
                 continue                           # authuser didn't switch (same account) → dedupe
             seen.add(key)
