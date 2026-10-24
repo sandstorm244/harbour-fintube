@@ -166,6 +166,10 @@ Page {
                 onClicked: pageStack.push(Qt.resolvedUrl("SearchPage.qml"))
             }
             MenuItem {
+                text: qsTr("Go to URL")
+                onClicked: pageStack.push(Qt.resolvedUrl("UrlPage.qml"))
+            }
+            MenuItem {
                 text: page.refreshing ? qsTr("Refreshing…") : qsTr("Refresh")
                 enabled: !page.refreshing        // don't stack a second forced walk over a live one
                 onClicked: page.loadFeed(true)
