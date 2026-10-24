@@ -427,76 +427,81 @@
     </message>
     <message>
         <location filename="../qml/pages/HomePage.qml" line="169"/>
+        <source>Go to URL</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../qml/pages/HomePage.qml" line="173"/>
         <source>Refreshing…</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="169"/>
+        <location filename="../qml/pages/HomePage.qml" line="173"/>
         <source>Refresh</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="181"/>
+        <location filename="../qml/pages/HomePage.qml" line="185"/>
         <source>Subscriptions</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="205"/>
+        <location filename="../qml/pages/HomePage.qml" line="209"/>
         <source>Mark as unwatched</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="205"/>
+        <location filename="../qml/pages/HomePage.qml" line="209"/>
         <source>Mark as watched</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="212"/>
+        <location filename="../qml/pages/HomePage.qml" line="216"/>
         <source>Video details</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="218"/>
+        <location filename="../qml/pages/HomePage.qml" line="222"/>
         <source>Add to playlist</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="224"/>
+        <location filename="../qml/pages/HomePage.qml" line="228"/>
         <source>Download audio</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="227"/>
+        <location filename="../qml/pages/HomePage.qml" line="231"/>
         <source>Downloading audio</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="232"/>
+        <location filename="../qml/pages/HomePage.qml" line="236"/>
         <source>Download video</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="235"/>
+        <location filename="../qml/pages/HomePage.qml" line="239"/>
         <source>Downloading video</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="307"/>
+        <location filename="../qml/pages/HomePage.qml" line="311"/>
         <source>%1 views</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="323"/>
+        <location filename="../qml/pages/HomePage.qml" line="327"/>
         <source>No subscriptions yet</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="323"/>
+        <location filename="../qml/pages/HomePage.qml" line="327"/>
         <source>No recent uploads</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/HomePage.qml" line="325"/>
+        <location filename="../qml/pages/HomePage.qml" line="329"/>
         <source>Pull down → Search to find channels to subscribe to</source>
         <translation type="unfinished"></translation>
     </message>
@@ -1715,6 +1720,44 @@ Cookies stay on this device (owner-only) and are never uploaded. The session eve
     </message>
 </context>
 <context>
+    <name>UrlPage</name>
+    <message>
+        <location filename="../qml/pages/UrlPage.qml" line="34"/>
+        <source>Checking link…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../qml/pages/UrlPage.qml" line="40"/>
+        <source>Opens a video.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../qml/pages/UrlPage.qml" line="42"/>
+        <source>Opens a channel.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../qml/pages/UrlPage.qml" line="44"/>
+        <source>Opens a playlist.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../qml/pages/UrlPage.qml" line="46"/>
+        <source>That link doesn&apos;t point to a video, channel or playlist.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../qml/pages/UrlPage.qml" line="58"/>
+        <source>Couldn&apos;t open this link</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../qml/pages/UrlPage.qml" line="67"/>
+        <source>Go to URL</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
     <name>VideoPage</name>
     <message>
         <location filename="../qml/pages/VideoPage.qml" line="274"/>
@@ -2033,12 +2076,12 @@ Cookies stay on this device (owner-only) and are never uploaded. The session eve
         </translation>
     </message>
     <message>
-        <location filename="../qml/harbour-fintube.qml" line="256"/>
+        <location filename="../qml/harbour-fintube.qml" line="258"/>
         <source>Couldn&apos;t save playlist</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/harbour-fintube.qml" line="339"/>
+        <location filename="../qml/harbour-fintube.qml" line="342"/>
         <source>Continue watching</source>
         <translation type="unfinished"></translation>
     </message>
