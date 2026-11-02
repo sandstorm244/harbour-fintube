@@ -40,6 +40,7 @@ DISTFILES += \
     qml/MprisControls.qml \
     qml/pages/HomePage.qml \
     qml/pages/SearchPage.qml \
+    qml/pages/UrlPage.qml \
     qml/pages/VideoPage.qml \
     qml/pages/TransportControls.qml \
     qml/pages/SubscriptionsPage.qml \
