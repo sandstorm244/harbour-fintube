@@ -7,6 +7,8 @@ import "../logic.js" as Logic
 
 Page {
     id: page
+    
+    showNavigationIndicator: false   // hide the back-swipe edge glow
     // Details-only view has no video, so keep it upright; the player view rotates freely.
     allowedOrientations: page.infoOnly ? Orientation.Portrait : Orientation.All
 
