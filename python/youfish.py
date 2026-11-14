@@ -5032,10 +5032,6 @@ _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
                       # Volume boost (linear gain, 1.0 = none) above system max; a soft limiter in
                       # the player keeps the extra gain from hard-clipping. For quiet BT output.
                       "boost_gain": 1.0,
-                      # keep_display_on: hold the display awake while a video is actually playing
-                      # (off by default — costs battery). Also sidesteps the display-off/on GL
-                      # corruption during playback since the screen never blanks.
-                      "keep_display_on": False,
                       # download_dir: where completed downloads are written. "" = the app's own
                       # downloads folder (default); a picked folder (e.g. ~/Videos, an SD card)
                       # overrides it, validated writable before use (see _downloads_dir).
@@ -5049,6 +5045,8 @@ _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
 # importable copy exists (installed with the binary, refreshed by Update, backfilled at
 # launch by _autofetch_zipapp); the binary stays the fallback for every failure. A stale
 # "fast_resolve" key from older builds may linger in settings.json — it is simply ignored.
+# Same for "keep_display_on": holding the display awake while a video plays is not a setting
+# either (qml/pages/KeepAwake.qml always does it, and lets go when playback stops or stalls).
 
 # Widened client net, tried in ONE extra yt-dlp pass when the primary (token-free client, or
 # yt-dlp's auto pick when no provider is set up) hard-fails on a bot-wall or comes back

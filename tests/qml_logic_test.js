@@ -155,6 +155,19 @@ test("keepPlayerOnLeave", function () {
     eq(L.keepPlayerOnLeave(false, true, true, 5000), false);  // background audio off
     eq(L.keepPlayerOnLeave(true, false, true, 5000), false);  // HLS page player
 });
+test("keepAwake: only a visibly playing video holds the display", function () {
+    eq(L.keepAwake(true, true, true, false), true);
+    eq(L.keepAwake(false, true, true, false), false);   // paused or ended
+    eq(L.keepAwake(true, false, true, false), false);   // another page on top
+    eq(L.keepAwake(true, true, false, false), false);   // app in the background
+    eq(L.keepAwake(true, true, true, true), false);     // "playing" but the position stopped
+});
+test("awakeStalled: a frozen position lets go after the cap, never before", function () {
+    eq(L.awakeStalled(0), false);
+    eq(L.awakeStalled(L.AWAKE_STALL_MS - 1), false);
+    eq(L.awakeStalled(L.AWAKE_STALL_MS), true);
+    eq(L.awakeStalled(8 * 3600 * 1000), true);           // a whole night
+});
 test("nextQueueIndex", function () {
     var q = [{ id: "a" }, { id: "b" }, {}];
     eq(L.nextQueueIndex(q, 0), 1);

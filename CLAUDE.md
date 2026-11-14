@@ -59,7 +59,8 @@ node tests/qml_logic_test.js     # qml/logic.js — the pages' pure decisions
   checklist line there and, where it has logic, a test.
 - **Page decisions live in `qml/logic.js`** (`.pragma library`, ES5 only, no QML types, no qsTr):
   caption choice and what gets remembered, SponsorBlock skip, seek stepping, the dual/muxed/HLS
-  play plan, queue advance, error recovery, reattach/reclaim of the shared player, link routing,
+  play plan, queue advance, the display hold (`keepAwake`: only while a video visibly plays; not a
+  setting), error recovery, reattach/reclaim of the shared player, link routing,
   feed change detection and Shorts removal, search dedup and paging, the channel→playlists
   redirect (engine `reason: "no_videos_tab"`), the quality/SponsorBlock/equalizer settings maps,
   the PO-token status line, and every number/time formatter (`fmtDur`, `fmtClock`, `fmtCount`,
@@ -300,7 +301,7 @@ render thread, everything else under the lock.
   `fast path strike`, `fast player off`, `resolve picks <id> [client=innertube:…]`, `resolve urls:`,
   `direct-fetch itag=… died after N bytes`, `search innertube`, `watch_next`, `video_info
   innertube`,
-  `comments innertube`, `yt-dlp in-process`.
+  `comments innertube`, `yt-dlp in-process`. Always printed (QML): `FinTube: display hold on/off`.
 - **Download video ids are sanitised** to `[\w-]{≤64}` before hitting the `-o` template to block
   path traversal / output-template injection (`youfish.py:7077`).
 - **Video downloads require ffmpeg** — YouTube retired the muxed 22/18 fallback; audio (`m4a`,

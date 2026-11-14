@@ -147,15 +147,12 @@ Page {
         onTriggered: page.controlsShown = false
     }
 
-    // Keep the display awake while a downloaded VIDEO plays, if the user enabled it — same
-    // guard as VideoPage. Downloaded audio is excluded: there is nothing to watch, and the
-    // screen blanking doesn't stop the sound. Isolated in a Loader so a device without the
-    // Nemo.KeepAlive plugin degrades quietly (toggle inert).
-    Loader {
-        active: app.backend.keepDisplayOn && page.isPlaying && page.kind !== "audio"
-        source: Qt.resolvedUrl("KeepDisplayOn.qml")
-        onStatusChanged: if (status === Loader.Error)
-            console.log("FinTube: Nemo.KeepAlive unavailable — keep-display-on is inert")
+    // Keep the display awake while a downloaded VIDEO visibly plays, same as VideoPage.
+    // Downloaded audio is excluded: there is nothing to watch, and blanking doesn't stop the sound.
+    KeepAwake {
+        playing: page.isPlaying && page.kind !== "audio"
+        onScreen: page.status === PageStatus.Active
+        positionMs: page.positionMs
     }
 
     SilicaFlickable {

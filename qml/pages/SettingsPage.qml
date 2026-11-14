@@ -103,16 +103,6 @@ Page {
             }
 
             TextSwitch {
-                text: qsTr("Keep display on while playing")
-                description: qsTr("Stop the screen from dimming/blanking while a video is playing. "
-                             + "Uses more battery, but also avoids the black-frame / garbled-text "
-                             + "glitch some devices show when the display wakes mid-playback.")
-                automaticCheck: false
-                checked: app.backend.keepDisplayOn
-                onClicked: app.backend.setKeepDisplayOn(!app.backend.keepDisplayOn)
-            }
-
-            TextSwitch {
                 text: qsTr("Background audio")
                 description: qsTr("Keep audio playing when you leave the video to browse elsewhere in "
                              + "the app. Control it from the cover and the lockscreen; reopen the "

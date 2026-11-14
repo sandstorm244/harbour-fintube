@@ -862,13 +862,13 @@ Page {
         onTriggered: page.persistPosition()
     }
 
-    // Keep the display awake while a video is actually playing, if the user enabled it. Isolated
-    // in a Loader so a device without the Nemo.KeepAlive plugin degrades quietly (toggle inert).
-    Loader {
-        active: app.backend.keepDisplayOn && page.isPlaying
-        source: Qt.resolvedUrl("KeepDisplayOn.qml")
-        onStatusChanged: if (status === Loader.Error)
-            console.log("FinTube: Nemo.KeepAlive unavailable — keep-display-on is inert")
+    // Keep the display awake while this page's video visibly plays. Only the owning page on top:
+    // a stacked or info-only page reads the shared player's state too, and must not hold the
+    // screen for background audio while the user browses elsewhere.
+    KeepAwake {
+        playing: page.isPlaying && page.holdsPlayer
+        onScreen: page.status === PageStatus.Active
+        positionMs: page.positionMs
     }
 
     // Native SFOS share sheet — the "unified menu" (Bluetooth, email, accounts, …). API matches

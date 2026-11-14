@@ -59,6 +59,7 @@ DISTFILES += \
     qml/pages/EqualizerPage.qml \
     qml/pages/HistoryPage.qml \
     qml/pages/KeepDisplayOn.qml \
+    qml/pages/KeepAwake.qml \
     qml/cover/CoverPage.qml \
     python/youfish.py \
     python/innertube.py \

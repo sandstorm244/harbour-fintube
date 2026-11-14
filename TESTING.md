@@ -156,7 +156,9 @@ result reaches the screen. Lines without it are only checked here.
 - [ ] Open video A, then from it video B, then go back to A: A takes the player back and B stops.
       (Auto: `needsReclaim`.)
 - [ ] Screen off during playback and back on: no frozen or corrupted picture.
-- [ ] "Keep display on" keeps the screen awake while playing only.
+- [ ] A playing video keeps the screen on. Paused, ended, or the app in the background: the
+      screen dims and blanks on the system's own timeout. Same for a downloaded video; downloaded
+      audio never holds it. (Auto: `keepAwake`, `awakeStalled`.)
 - [ ] Closing the app stops all audio and the PO-token helper.
 
 ### Audio effects

@@ -117,6 +117,19 @@ function keepPlayerOnLeave(backgroundAudio, useGst, playing, positionMs) {
     return !!(backgroundAudio && useGst && (playing || positionMs > 0))
 }
 
+// Holding the display awake while a video plays (not a setting: every video player does it). Only
+// while the video is visibly playing: on screen, app in front, position still moving. Anything else
+// (paused, ended, failed, stalled, backgrounded) hands the screen back to the system's own timeout.
+// The stall cap is the safety net: a player can keep reporting "playing" after an error or a stream
+// that died without an end, and that must never hold the screen on all night.
+var AWAKE_STALL_MS = 30000
+function awakeStalled(sinceMoveMs) {
+    return sinceMoveMs >= AWAKE_STALL_MS
+}
+function keepAwake(playing, onScreen, appActive, stalled) {
+    return !!(playing && onScreen && appActive && !stalled)
+}
+
 // The queue entry after `index`, or -1 at the end. Autoplay and the next-video prefetch both use
 // it, so the video that gets warmed is the one that plays.
 function nextQueueIndex(queue, index) {

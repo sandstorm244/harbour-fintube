@@ -53,7 +53,6 @@ Item {
     property string ytdlpChannel: "stable" // yt-dlp update channel: "stable" | "nightly"
     property string defaultQuality: "720" // baseline video height cap ("1080"/"720"/…/"0"=best)
     property bool hwDecode: false        // hardware video decode (droidvdec); experimental
-    property bool keepDisplayOn: false   // hold the display awake while a video plays
     property bool backgroundAudio: true  // keep audio playing when you leave the video page
     property bool portraitFullscreen: false  // fullscreen without rotating to landscape
     property bool eqEnabled: false       // 10-band equalizer on/off
@@ -192,7 +191,6 @@ Item {
             backend.ytdlpChannel = s.ytdlp_channel || "stable"
             backend.defaultQuality = s.default_quality || "720"
             backend.hwDecode = !!s.hw_decode
-            backend.keepDisplayOn = !!s.keep_display_on
             backend.backgroundAudio = (s.background_audio === undefined) ? true : !!s.background_audio
             backend.eqEnabled = !!s.eq_enabled
             if (s.eq_bands && s.eq_bands.length === 10)
@@ -234,12 +232,6 @@ Item {
     function setHwDecode(on) {
         py.call("youfish.set_setting", ["hw_decode", !!on], function(s) {
             if (s) backend.hwDecode = !!s.hw_decode
-        })
-    }
-
-    function setKeepDisplayOn(on) {
-        py.call("youfish.set_setting", ["keep_display_on", !!on], function(s) {
-            if (s) backend.keepDisplayOn = !!s.keep_display_on
         })
     }
 

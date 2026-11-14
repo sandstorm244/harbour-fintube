@@ -42,27 +42,27 @@
 <context>
     <name>Backend</name>
     <message>
-        <location filename="../qml/Backend.qml" line="138"/>
+        <location filename="../qml/Backend.qml" line="137"/>
         <source>resolve failed</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/Backend.qml" line="692"/>
+        <location filename="../qml/Backend.qml" line="684"/>
         <source>update failed</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/Backend.qml" line="737"/>
+        <location filename="../qml/Backend.qml" line="729"/>
         <source>Downloading the importable yt-dlp…</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/Backend.qml" line="775"/>
+        <location filename="../qml/Backend.qml" line="767"/>
         <source>Starting…</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/Backend.qml" line="783"/>
+        <location filename="../qml/Backend.qml" line="775"/>
         <source>Checking for the latest provider…</source>
         <translation type="unfinished"></translation>
     </message>
@@ -509,12 +509,12 @@
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/LocalPlayerPage.qml" line="175"/>
+        <location filename="../qml/pages/LocalPlayerPage.qml" line="172"/>
         <source>Downloaded audio</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/LocalPlayerPage.qml" line="175"/>
+        <location filename="../qml/pages/LocalPlayerPage.qml" line="172"/>
         <source>Downloaded video</source>
         <translation type="unfinished"></translation>
     </message>
@@ -1405,91 +1405,81 @@ Cookies stay on this device (owner-only) and are never uploaded. The session eve
     </message>
     <message>
         <location filename="../qml/pages/SettingsPage.qml" line="106"/>
-        <source>Keep display on while playing</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="107"/>
-        <source>Stop the screen from dimming/blanking while a video is playing. Uses more battery, but also avoids the black-frame / garbled-text glitch some devices show when the display wakes mid-playback.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="116"/>
         <source>Background audio</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="117"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="107"/>
         <source>Keep audio playing when you leave the video to browse elsewhere in the app. Control it from the cover and the lockscreen; reopen the video to pick playback back up where it is.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="126"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="116"/>
         <source>Portrait fullscreen</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="127"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="117"/>
         <source>Let the fullscreen button fill the screen while staying in portrait, instead of rotating to landscape. Tap the video&apos;s fullscreen control to toggle.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="136"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="126"/>
         <source>Equalizer</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="137"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="127"/>
         <source>On</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="137"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="127"/>
         <source>Off</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="148"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="138"/>
         <source>Volume boost</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="161"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="151"/>
         <source>Pushes playback above the system maximum for quiet outputs (e.g. Bluetooth). A limiter tames the peaks so the extra loudness doesn&apos;t distort the way raising the system volume past 100% does. 100% = off.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="168"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="158"/>
         <source>Downloads</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="171"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="161"/>
         <source>Folder</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="172"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="162"/>
         <source>App folder (default)</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="183"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="173"/>
         <source>Videos are saved here. Tap Folder to change it.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="184"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="174"/>
         <source>Videos are saved in the app&apos;s own private folder by default — pick a folder like Videos or an SD card to find them in the file manager.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="193"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="183"/>
         <source>Reset to app folder</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../qml/pages/SettingsPage.qml" line="206"/>
+        <location filename="../qml/pages/SettingsPage.qml" line="196"/>
         <source>Couldn&apos;t use that folder.</source>
         <translation type="unfinished"></translation>
     </message>
