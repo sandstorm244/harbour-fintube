@@ -233,7 +233,7 @@ ApplicationWindow {
     // Open incoming youtube.com / youtu.be links (from the browser or another app). The URL
     // dispatcher calls this D-Bus method (see the .desktop X-Maemo-Service); Python classifies
     // the link and we route to the right page. Videos + channels now; playlists land in Batch C.
-    function routeUrl(url) {
+    function routeUrl(url, onResult) {
         if (!url)
             return
         if (!backend.pyReady) {   // module still importing (cold launch) — buffer, flush on ready
@@ -242,8 +242,10 @@ ApplicationWindow {
         }
         backend.parseUrl(url, function(res) {
             var r0 = Logic.routeFor(res)
-            if (!r0)
+            if (!r0) {
+                if (onResult) onResult(res)
                 return
+            }
             if (r0.page === "video")
                 pageStack.push(Qt.resolvedUrl("pages/VideoPage.qml"), { videoId: r0.id, title: "" })
             else if (r0.page === "channel")
@@ -257,6 +259,7 @@ ApplicationWindow {
                 })
                 pageStack.push(Qt.resolvedUrl("pages/PlaylistsPage.qml"))
             }
+            if (onResult) onResult(res)
         })
     }
 
